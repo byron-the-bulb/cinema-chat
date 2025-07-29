@@ -6,15 +6,20 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"goodclips-server/internal/database"
 	"goodclips-server/internal/models"
+	"goodclips-server/internal/queue"
+	"goodclips-server/internal/processor"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
 var db *database.DB
+var jobQueue *queue.Queue
+var videoProcessor *processor.VideoProcessor
 
 func main() {
 	// Load environment variables
@@ -24,7 +29,7 @@ func main() {
 
 	// Check command line arguments
 	if len(os.Args) > 1 && os.Args[1] == "worker" {
-		log.Fatal("Worker mode not yet implemented")
+		runWorker()
 		return
 	}
 
@@ -42,6 +47,29 @@ func main() {
 		log.Fatalf("Database health check failed: %v", err)
 	}
 	log.Println("✅ Database connection established")
+
+	// Initialize job queue
+	redisURL := getEnvOrDefault("REDIS_URL", "localhost:6379")
+	// Extract host:port from redis://host:port format
+	if strings.HasPrefix(redisURL, "redis://") {
+		redisURL = strings.TrimPrefix(redisURL, "redis://")
+	}
+	
+	queueConfig := queue.Config{
+		Addr:     redisURL,
+		Password: "",
+		DB:       0,
+	}
+	jobQueue, err = queue.NewQueue(queueConfig)
+	if err != nil {
+		log.Fatalf("Failed to connect to job queue: %v", err)
+	}
+	defer jobQueue.Close()
+	log.Println("✅ Job queue connection established")
+
+	// Initialize video processor
+	videoProcessor = processor.NewVideoProcessor()
+	log.Println("✅ Video processor initialized")
 
 	// Run auto-migration (optional - comment out in production)
 	// if err := db.AutoMigrate(); err != nil {
@@ -79,6 +107,7 @@ func main() {
 		// Processing jobs
 		v1.GET("/jobs", listJobs)
 		v1.GET("/jobs/:id", getJob)
+		v1.POST("/jobs", createJob)
 	}
 
 	// Get port from environment or default to 8080
@@ -89,6 +118,110 @@ func main() {
 
 	fmt.Printf("🚀 GoodCLIPS Server starting on port %s\n", port)
 	log.Fatal(r.Run(":" + port))
+}
+
+// Worker function to process jobs
+func runWorker() {
+	log.Println("🔧 Starting GoodCLIPS worker...")
+
+	// Initialize database connection
+	config := database.GetDefaultConfig()
+	var err error
+	db, err = database.NewConnection(config)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize job queue
+	redisURL := getEnvOrDefault("REDIS_URL", "localhost:6379")
+	// Extract host:port from redis://host:port format
+	if strings.HasPrefix(redisURL, "redis://") {
+		redisURL = strings.TrimPrefix(redisURL, "redis://")
+	}
+	
+	queueConfig := queue.Config{
+		Addr:     redisURL,
+		Password: "",
+		DB:       0,
+	}
+	jobQueue, err = queue.NewQueue(queueConfig)
+	if err != nil {
+		log.Fatalf("Failed to connect to job queue: %v", err)
+	}
+	defer jobQueue.Close()
+
+	// Initialize video processor
+	videoProcessor = processor.NewVideoProcessor()
+
+	log.Println("✅ Worker initialized, waiting for jobs...")
+
+	// Worker loop
+	for {
+		// Try to dequeue a job
+		job, err := jobQueue.Dequeue("")
+		if err != nil {
+			log.Printf("Error dequeuing job: %v", err)
+			continue
+		}
+
+		if job == nil {
+			// No jobs available, continue loop
+			continue
+		}
+
+		log.Printf("📥 Processing job %s of type %s", job.ID, job.Type)
+
+		// Update job status to running
+		err = jobQueue.UpdateJobStatus(job.ID, queue.JobStatusRunning, 0, nil)
+		if err != nil {
+			log.Printf("Error updating job status: %v", err)
+			continue
+		}
+
+		// Process the job based on its type
+		switch job.Type {
+		case queue.JobTypeVideoIngestion:
+			err = processVideoIngestionJob(job)
+		case queue.JobTypeSceneDetection:
+			err = processSceneDetectionJob(job)
+		case queue.JobTypeCaptionExtraction:
+			err = processCaptionExtractionJob(job)
+		case queue.JobTypeEmbeddingGeneration:
+			err = processEmbeddingGenerationJob(job)
+		default:
+			errMsg := fmt.Sprintf("Unknown job type: %s", job.Type)
+			jobQueue.UpdateJobStatus(job.ID, queue.JobStatusFailed, 0, &errMsg)
+			continue
+		}
+
+		// Update job status based on processing result
+		if err != nil {
+			errMsg := err.Error()
+			jobQueue.UpdateJobStatus(job.ID, queue.JobStatusFailed, 0, &errMsg)
+			log.Printf("❌ Job %s failed: %v", job.ID, err)
+		} else {
+			jobQueue.UpdateJobStatus(job.ID, queue.JobStatusCompleted, 100, nil)
+			log.Printf("✅ Job %s completed successfully", job.ID)
+		}
+	}
+}
+
+// Job processing functions
+func processVideoIngestionJob(job *queue.Job) error {
+	return videoProcessor.ProcessVideoIngestion(job.Payload)
+}
+
+func processSceneDetectionJob(job *queue.Job) error {
+	return videoProcessor.ProcessSceneDetection(job.Payload)
+}
+
+func processCaptionExtractionJob(job *queue.Job) error {
+	return videoProcessor.ProcessCaptionExtraction(job.Payload)
+}
+
+func processEmbeddingGenerationJob(job *queue.Job) error {
+	return videoProcessor.ProcessEmbeddingGeneration(job.Payload)
 }
 
 // Middleware
@@ -117,6 +250,12 @@ func healthCheck(c *gin.Context) {
 		dbHealth = "error: " + err.Error()
 	}
 
+	// Check job queue health
+	queueHealth := "ok"
+	if err := jobQueue.UpdateJobStatus("test", queue.JobStatusPending, 0, nil); err != nil {
+		queueHealth = "error: " + err.Error()
+	}
+
 	// Get basic stats
 	stats, statsErr := db.GetStats()
 	
@@ -125,6 +264,7 @@ func healthCheck(c *gin.Context) {
 		"service":   "goodclips-server",
 		"version":   "0.1.0",
 		"database":  dbHealth,
+		"queue":     queueHealth,
 		"timestamp": "now",
 	}
 
@@ -206,8 +346,21 @@ func createVideo(c *gin.Context) {
 		return
 	}
 
+	// Create a job to process this video
+	jobPayload := map[string]interface{}{
+		"video_id": video.ID,
+		"filename": video.Filename,
+		"filepath": video.Filepath,
+	}
+	
+	job, err := jobQueue.Enqueue(queue.JobTypeVideoIngestion, jobPayload)
+	if err != nil {
+		log.Printf("Warning: Failed to create processing job for video %d: %v", video.ID, err)
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
 		"video": video,
+		"processing_job": job,
 		"message": "Video created successfully",
 	})
 }
@@ -317,22 +470,83 @@ func getStats(c *gin.Context) {
 }
 
 func listJobs(c *gin.Context) {
-	// TODO: Implement job listing
+	// Parse query parameters
+	limitStr := c.DefaultQuery("limit", "20")
+	jobType := c.DefaultQuery("type", "")
+	
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100 // Cap at 100
+	}
+
+	// Convert jobType to JobType enum
+	var jobTypeEnum queue.JobType
+	if jobType != "" {
+		jobTypeEnum = queue.JobType(jobType)
+	}
+
+	// Get jobs from queue
+	jobs, err := jobQueue.ListJobs(jobTypeEnum, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to fetch jobs",
+			"details": err.Error(),
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"jobs": []map[string]interface{}{},
-		"message": "Job listing not yet implemented",
-		"status": "coming_soon",
+		"jobs": jobs,
+		"count": len(jobs),
 	})
 }
 
 func getJob(c *gin.Context) {
 	jobID := c.Param("id")
 	
-	// TODO: Implement job retrieval
+	job, err := jobQueue.GetJob(jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "Job not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"job_id": jobID,
-		"message": "Job retrieval not yet implemented",
-		"status": "coming_soon",
+		"job": job,
+	})
+}
+
+func createJob(c *gin.Context) {
+	var req struct {
+		Type    string                 `json:"type" binding:"required"`
+		Payload map[string]interface{} `json:"payload"`
+	}
+	
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid request",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	job, err := jobQueue.Enqueue(queue.JobType(req.Type), req.Payload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to create job",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"job": job,
+		"message": "Job created successfully",
 	})
 }
 
