@@ -93,27 +93,28 @@ const (
 	VideoStatusPending    VideoStatus = "pending"
 	VideoStatusProcessing VideoStatus = "processing"
 	VideoStatusCompleted  VideoStatus = "completed"
-	VideoStatusError      VideoStatus = "error"
 	VideoStatusDeleted    VideoStatus = "deleted"
 )
 
 // Scene represents a video scene with embeddings
 type Scene struct {
-	ID         uint      `json:"id" gorm:"primaryKey"`
-	UUID       string    `json:"uuid" gorm:"type:uuid;default:uuid_generate_v4();unique;not null"`
-	VideoID    uint      `json:"video_id" gorm:"not null;index"`
-	SceneIndex int       `json:"scene_index" gorm:"not null"`
-	StartTime  float64   `json:"start_time" gorm:"not null"`
-	EndTime    float64   `json:"end_time" gorm:"not null"`
-	Duration   float64   `json:"duration" gorm:"<-:false;computed:end_time - start_time"`
+    ID         uint      `json:"id" gorm:"primaryKey"`
+    UUID       string    `json:"uuid" gorm:"type:uuid;default:uuid_generate_v4();unique;not null"`
+    VideoID    uint      `json:"video_id" gorm:"not null;uniqueIndex:idx_scene_video_index"`
+    SceneIndex int       `json:"scene_index" gorm:"not null;uniqueIndex:idx_scene_video_index"`
+    StartTime  float64   `json:"start_time" gorm:"not null"`
+    EndTime    float64   `json:"end_time" gorm:"not null"`
+    Duration   float64   `json:"duration" gorm:"<-:false;computed:end_time - start_time"`
 	
 	HasCaptions   bool `json:"has_captions" gorm:"default:false"`
 	CaptionCount  int  `json:"caption_count" gorm:"default:0"`
 	
 	// Vector embeddings (768 dimensions for CLIP-large, 512 for base)
-	VisualEmbedding   pgvector.Vector `json:"visual_embedding,omitempty" gorm:"type:vector(768)"`
-	TextEmbedding     pgvector.Vector `json:"text_embedding,omitempty" gorm:"type:vector(768)"`
-	CombinedEmbedding pgvector.Vector `json:"combined_embedding,omitempty" gorm:"type:vector(768)"`
+	VisualEmbedding       *pgvector.Vector `json:"visual_embedding,omitempty" gorm:"type:vector(1024)"`
+	TextEmbedding         *pgvector.Vector `json:"text_embedding,omitempty" gorm:"type:vector(768)"`
+	AudioEmbedding        *pgvector.Vector `json:"audio_embedding,omitempty" gorm:"type:vector(512)"`
+	VisualClipEmbedding   *pgvector.Vector `json:"visual_clip_embedding,omitempty" gorm:"type:vector(512)"`
+	CombinedEmbedding     *pgvector.Vector `json:"combined_embedding,omitempty" gorm:"type:vector(768)"`
 	
 	CreatedAt time.Time `json:"created_at"`
 	

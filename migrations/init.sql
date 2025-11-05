@@ -40,9 +40,11 @@ CREATE TABLE scenes (
     has_captions BOOLEAN DEFAULT FALSE,
     caption_count INTEGER DEFAULT 0,
     
-    -- Vector embeddings (768 dimensions for CLIP-large, 512 for base)
-    visual_embedding vector(768),
-    text_embedding vector(768), 
+    -- Visual embedding dimension updated to 1024 for InternVL3.5 backend
+    visual_embedding vector(1024),
+    text_embedding vector(768),
+    audio_embedding vector(512),
+    visual_clip_embedding vector(512),
     combined_embedding vector(768),
     
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

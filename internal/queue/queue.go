@@ -95,57 +95,95 @@ func (q *Queue) Enqueue(jobType JobType, payload map[string]interface{}) (*Job, 
 		return nil, fmt.Errorf("failed to marshal job: %w", err)
 	}
 
-	// Add job to the queue
-	queueName := fmt.Sprintf("jobs:%s", jobType)
-	err = q.client.LPush(q.ctx, queueName, jobBytes).Err()
-	if err != nil {
-		return nil, fmt.Errorf("failed to enqueue job: %w", err)
-	}
-
-	// Add job to the job hash for tracking
+	// Store job data BEFORE enqueuing to avoid race with worker UpdateJobStatus
 	jobKey := fmt.Sprintf("job:%s", job.ID)
-	err = q.client.HSet(q.ctx, jobKey, "data", jobBytes).Err()
-	if err != nil {
+	if err := q.client.HSet(q.ctx, jobKey, "data", jobBytes).Err(); err != nil {
 		return nil, fmt.Errorf("failed to store job data: %w", err)
 	}
 
+	// Add job to the queue (visible to worker only after data is stored)
+	queueName := fmt.Sprintf("jobs:%s", jobType)
+	if err := q.client.LPush(q.ctx, queueName, jobBytes).Err(); err != nil {
+		return nil, fmt.Errorf("failed to enqueue job: %w", err)
+	}
 	return job, nil
 }
 
 // Dequeue retrieves a job from the queue
 func (q *Queue) Dequeue(jobType JobType) (*Job, error) {
-	queueName := fmt.Sprintf("jobs:%s", jobType)
-	result, err := q.client.BRPop(q.ctx, 5*time.Second, queueName).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil // No jobs available
-		}
-		return nil, fmt.Errorf("failed to dequeue job: %w", err)
-	}
+    queueName := fmt.Sprintf("jobs:%s", jobType)
+    result, err := q.client.BRPop(q.ctx, 5*time.Second, queueName).Result()
+    if err != nil {
+        if err == redis.Nil {
+            return nil, nil // No jobs available
+        }
+        return nil, fmt.Errorf("failed to dequeue job: %w", err)
+    }
 
-	if len(result) < 2 {
-		return nil, fmt.Errorf("invalid dequeue result")
-	}
+    if len(result) < 2 {
+        return nil, fmt.Errorf("invalid dequeue result")
+    }
 
-	var job Job
-	err = json.Unmarshal([]byte(result[1]), &job)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal job: %w", err)
-	}
+    var job Job
+    err = json.Unmarshal([]byte(result[1]), &job)
+    if err != nil {
+        return nil, fmt.Errorf("failed to unmarshal job: %w", err)
+    }
 
-	return &job, nil
+    return &job, nil
+}
+
+// DequeueAny retrieves a job from any of the provided job type queues (blocks with timeout)
+func (q *Queue) DequeueAny(jobTypes []JobType) (*Job, error) {
+    // Build list keys for BRPOP (right pop from any)
+    var keys []string
+    for _, jt := range jobTypes {
+        keys = append(keys, fmt.Sprintf("jobs:%s", jt))
+    }
+    if len(keys) == 0 {
+        // default to all known queues
+        keys = []string{
+            fmt.Sprintf("jobs:%s", JobTypeVideoIngestion),
+            fmt.Sprintf("jobs:%s", JobTypeSceneDetection),
+            fmt.Sprintf("jobs:%s", JobTypeCaptionExtraction),
+            fmt.Sprintf("jobs:%s", JobTypeEmbeddingGeneration),
+            fmt.Sprintf("jobs:%s", JobTypeVideoAnalysis),
+        }
+    }
+
+    result, err := q.client.BRPop(q.ctx, 5*time.Second, keys...).Result()
+    if err != nil {
+        if err == redis.Nil {
+            return nil, nil // timeout/no jobs
+        }
+        return nil, fmt.Errorf("failed to dequeue job from any: %w", err)
+    }
+
+    if len(result) < 2 {
+        return nil, fmt.Errorf("invalid dequeue result")
+    }
+
+    var job Job
+    if err := json.Unmarshal([]byte(result[1]), &job); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal job: %w", err)
+    }
+    return &job, nil
+}
+
+// Ping checks connectivity to Redis
+func (q *Queue) Ping() error {
+    _, err := q.client.Ping(q.ctx).Result()
+    return err
 }
 
 // UpdateJobStatus updates the status of a job
 func (q *Queue) UpdateJobStatus(jobID string, status JobStatus, progress int, errorMessage *string) error {
 	jobKey := fmt.Sprintf("job:%s", jobID)
-	
 	// Get current job data
 	jobData, err := q.client.HGet(q.ctx, jobKey, "data").Result()
 	if err != nil {
 		return fmt.Errorf("failed to get job data: %w", err)
 	}
-
 	var job Job
 	err = json.Unmarshal([]byte(jobData), &job)
 	if err != nil {

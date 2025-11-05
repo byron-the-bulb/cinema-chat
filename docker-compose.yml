@@ -16,6 +16,8 @@ services:
       - DB_SSLMODE=disable
       - REDIS_URL=redis://redis:6379
       - PORT=8080
+      - SCENEDETECT_TIMEOUT_SECS=300
+      - KEYFRAME_TIMEOUT_SECS=60
     depends_on:
       postgres:
         condition: service_healthy
@@ -24,6 +26,49 @@ services:
     restart: unless-stopped
     networks:
       - default
+    volumes:
+      - ./data/videos:/data/videos
+      - ./models:/models:ro
+
+  # GoodCLIPS Worker Service
+  goodclips-worker:
+    build:
+      context: .
+      target: runtime-gpu
+    container_name: goodclips-worker
+    runtime: nvidia
+    command: ["./goodclips", "worker"]
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=goodclips
+      - DB_PASSWORD=goodclips_dev_password
+      - DB_NAME=goodclips
+      - DB_SSLMODE=disable
+      - REDIS_URL=redis://redis:6379
+      - SCENEDETECT_TIMEOUT_SECS=300
+      - KEYFRAME_TIMEOUT_SECS=60
+      - EMBEDDING_BACKEND=internvl35
+      - IV2_MODEL_ID=OpenGVLab/InternVL3_5-2B
+      - IV2_FRAMES=8
+      - IV2_STRIDE=4
+      - IV2_DEVICE=cuda:0
+      - CLIP_MODEL_ID=openai/clip-vit-base-patch32
+      - CLIP_DEVICE=cuda:0
+      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - IV2_RES=448
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - default
+    volumes:
+      - ./data/videos:/data/videos
 
   # PostgreSQL Database with pgvector extension
   postgres:
