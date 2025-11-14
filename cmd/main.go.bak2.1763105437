@@ -732,10 +732,10 @@ func embedCLAPTextQuery(query string) ([]float32, error) {
 // and fuses scores via weighted sum. Weights default to 1.0 for text/clip and 0.5 for audio.
 func searchMultiModal(c *gin.Context) {
     var req struct {
-        Query    string             `json:"query"`
-        VideoIDs []uint             `json:"video_ids"`
-        Limit    int                `json:"limit"`
-        Weights  map[string]float64 `json:"weights"`
+        Query    string             
+        VideoIDs []uint             
+        Limit    int                
+        Weights  map[string]float64 
     }
     if err := c.ShouldBindJSON(&req); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid search request", "details": err.Error()})
