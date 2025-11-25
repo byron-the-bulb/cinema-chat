@@ -26,9 +26,9 @@ VIDEO_SERVICE_URL = os.getenv("VIDEO_SERVICE_URL", "http://localhost:5000")
 DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
 DAILY_TOKEN = os.getenv("DAILY_TOKEN", "")
 
-# Setup logging
+# Setup logging with DEBUG level to see all message details
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -106,58 +106,77 @@ class CinemaRTVIClient(EventHandler):
         logger.info("🎤 Streaming phone audio to bot")
         logger.info("📺 Listening for video commands...")
 
-    def on_participant_joined(self, data, error=None):
-        """Called when bot joins"""
-        if error:
-            return
-
-        participant = data.get("participant", {})
+    def on_participant_joined(self, participant):
+        """Called when bot joins - Daily.co SDK passes participant dict directly"""
         username = participant.get("user_name", participant.get("id", 'Unknown'))
         logger.info(f"🤖 Bot joined: {username}")
 
-    def on_participant_left(self, data, error=None):
-        """Called when bot leaves"""
-        if error:
-            return
-
-        participant = data.get("participant", {})
+    def on_participant_left(self, participant, reason=None):
+        """Called when bot leaves - Daily.co SDK passes participant dict directly"""
         username = participant.get("user_name", participant.get("id", 'Unknown'))
         logger.info(f"Bot left: {username}")
 
-    def on_app_message(self, data, error):
+    def on_app_message(self, message, sender):
         """
         Handles app messages from the bot.
+        Daily.co SDK signature: (self, message, sender)
 
         This replicates the browser's handling of:
         - Video playback commands
         - Status updates
         - Any custom messages
         """
-        if error:
-            logger.error(f"Error receiving app message: {error}")
-            return
+        logger.info(f"📨 Received message from {sender}")
+        logger.debug(f"🔍 RAW MESSAGE: {message}")
+        logger.debug(f"🔍 MESSAGE TYPE: {type(message)}")
 
         try:
-            message = data.get("message")
-            sender = data.get("fromId", "unknown")
-
-            logger.info(f"📨 Received message from {sender}")
-
             # Parse message
             if isinstance(message, str):
                 msg_data = json.loads(message)
+                logger.debug(f"🔍 PARSED FROM STRING: {msg_data}")
             else:
                 msg_data = message
+                logger.debug(f"🔍 DIRECT OBJECT: {msg_data}")
+
+            logger.info(f"🔍 MESSAGE DATA TYPE: {msg_data.get('type')}")
+            logger.debug(f"🔍 FULL MSG_DATA: {json.dumps(msg_data, indent=2)}")
+
+            # Unwrap server-message envelopes
+            if msg_data.get("type") == "server-message" and "data" in msg_data:
+                logger.info(f"🔓 Unwrapping server-message envelope")
+                msg_data = msg_data["data"]
+                logger.info(f"🔍 UNWRAPPED TYPE: {msg_data.get('type')}")
+                logger.debug(f"🔍 UNWRAPPED DATA: {json.dumps(msg_data, indent=2)}")
 
             # Handle video playback commands (same as simple client)
             if msg_data.get("type") == "video-playback-command":
+                logger.info(f"✅ MATCHED video-playback-command!")
                 if msg_data.get("action") == "play":
-                    asyncio.create_task(self.play_video(
-                        video_path=msg_data.get("video_path"),
-                        start=msg_data.get("start", 0),
-                        end=msg_data.get("end", 10),
-                        fullscreen=msg_data.get("fullscreen", True)
-                    ))
+                    logger.info(f"✅ MATCHED action=play, calling play_video()")
+                    # Call video service directly (synchronous HTTP call)
+                    # Can't use async in Daily.co callback thread
+                    import httpx
+                    try:
+                        response = httpx.post(
+                            f"{self.video_service_url}/play",
+                            json={
+                                "video_path": msg_data.get("video_path"),
+                                "start": msg_data.get("start", 0),
+                                "end": msg_data.get("end", 10),
+                                "fullscreen": msg_data.get("fullscreen", True)
+                            },
+                            timeout=5.0
+                        )
+                        if response.status_code == 200:
+                            result = response.json()
+                            logger.info(f"✅ Video started: PID {result.get('pid')}")
+                        else:
+                            logger.error(f"❌ Video playback failed: {response.text}")
+                    except Exception as e:
+                        logger.error(f"❌ Error calling video service: {e}")
+                else:
+                    logger.warning(f"⚠️  video-playback-command but action={msg_data.get('action')}, not 'play'")
 
             # Handle other message types (status, config, etc.)
             elif msg_data.get("type") == "status":
@@ -166,8 +185,13 @@ class CinemaRTVIClient(EventHandler):
             elif msg_data.get("type") == "config":
                 logger.info(f"⚙️  Config update: {msg_data}")
 
+            else:
+                logger.warning(f"⚠️  Unknown message type: {msg_data.get('type')}")
+
         except Exception as e:
             logger.error(f"Error handling app message: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def play_video(self, video_path, start, end, fullscreen=True):
         """Call the local video playback service"""
@@ -195,13 +219,12 @@ class CinemaRTVIClient(EventHandler):
         except Exception as e:
             logger.error(f"❌ Error calling video service: {e}")
 
-    def on_transcription_message(self, data, error):
-        """Handle transcription updates (user speech-to-text)"""
-        if error:
-            return
-
-        text = data.get("text", "")
-        is_final = data.get("is_final", False)
+    def on_transcription_message(self, message):
+        """Handle transcription updates (user speech-to-text)
+        Daily.co SDK signature: (self, message)
+        """
+        text = message.get("text", "")
+        is_final = message.get("is_final", False)
 
         if is_final:
             logger.info(f"👤 User said: {text}")

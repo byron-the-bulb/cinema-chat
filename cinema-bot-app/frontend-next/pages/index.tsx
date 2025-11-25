@@ -5,6 +5,7 @@ import styles from '@/styles/Home.module.css';
 // Import components
 import ChatLog, { ChatMessage, MessageType } from '@/components/ChatLog';
 import LoadingSpinner from '@/components/LoadingSpinner';
+// import PiAudioDeviceSelector from '@/components/PiAudioDeviceSelector'; // Disabled - endpoint not available
 
 // Generate a truly unique ID for messages
 function generateUniqueId() {
@@ -25,6 +26,7 @@ export default function Home() {
   const [sessionIdentifier, setSessionIdentifier] = useState<string | null>(null);
   const [lastSeenMessageCount, setLastSeenMessageCount] = useState(0);
   const lastSeenStatusCountRef = useRef(0);
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
 
   // Handle server URL change
   const handleServerUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -142,6 +144,7 @@ export default function Home() {
       setSessionIdentifier(null);
       setLastSeenMessageCount(0);
       lastSeenStatusCountRef.current = 0;
+      setIsUserSpeaking(false);
       setStatusText('Session ended');
       addChatMessage('Session stopped', 'system');
     } catch (error: any) {
@@ -184,6 +187,11 @@ export default function Home() {
         // Update conversation status text if available
         if (data.status) {
           setConversationStatus(data.status);
+        }
+
+        // Update user speaking state if available
+        if (typeof data.user_speaking === 'boolean') {
+          setIsUserSpeaking(data.user_speaking);
         }
 
         // Process messages from the context
@@ -272,6 +280,11 @@ export default function Home() {
           />
         </div>
 
+        {/* Pi Audio Device Selection - Disabled until endpoint is restored */}
+        {/* <div className={styles.stationNameContainer}>
+          <PiAudioDeviceSelector backendUrl={serverUrl.replace(/\/api$/, '')} />
+        </div> */}
+
         {isConnected && currentRoomUrl && (
           <div className={styles.sessionInfo}>
             <strong>Active Session</strong>
@@ -301,7 +314,7 @@ export default function Home() {
         <ChatLog
           messages={chatMessages}
           isWaitingForUser={false}
-          isUserSpeaking={false}
+          isUserSpeaking={isUserSpeaking}
           uiOverride={null}
         />
 
