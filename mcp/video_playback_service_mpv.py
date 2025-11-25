@@ -47,11 +47,14 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     global current_process
 
     # Resolve video path
-    if not os.path.isabs(video_path):
+    # Check if it's a URL (http:// or https://)
+    is_url = video_path.startswith('http://') or video_path.startswith('https://')
+
+    if not is_url and not os.path.isabs(video_path):
         video_path = os.path.join(VIDEO_BASE, video_path)
 
-    # Validate file exists
-    if not os.path.exists(video_path):
+    # Validate file exists (skip for URLs)
+    if not is_url and not os.path.exists(video_path):
         return False, f"Video file not found: {video_path}", None
 
     # Stop any current playback
@@ -75,9 +78,8 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     # Let mpv auto-detect the correct connector on card1
     log_file = f'/home/twistedtv/mpv_{int(time.time())}.log'
     cmd = [
-        "sudo",
         "bash", "-c",
-        f"mpv --drm-device=/dev/dri/card1 --no-osc --no-osd-bar --start={start_time} --end={end_time} --fullscreen {video_path} > {log_file} 2>&1"
+        f"mpv --drm-device=/dev/dri/card1 --audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0 --no-osc --no-osd-bar --force-seekable=yes --start={start_time} --end={end_time} --fullscreen {video_path} > {log_file} 2>&1"
     ]
 
     try:
