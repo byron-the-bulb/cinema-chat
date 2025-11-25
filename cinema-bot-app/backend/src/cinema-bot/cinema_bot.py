@@ -301,11 +301,13 @@ async def run_bot(room_url, token, identifier, data=None):
     flow_manager = CustomFlowManager(
         task=task,
         llm=llm,
-        context_aggregator=context_aggregator, 
+        context_aggregator=context_aggregator,
         tts=tts
     )
 
-    #rtvi.set_flow_manager(flow_manager)
+    # FlowManager is a FrameProcessor and needs to be in the pipeline, not attached to RTVI
+    # RTVIProcessor.set_flow_manager() doesn't exist in Pipecat 0.0.95
+    # FlowManager will handle function calls and flow state management through the pipeline
 
     async def handle_uioverride_response(processor, service, arguments):
         """Handler for UI override response action"""

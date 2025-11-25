@@ -213,6 +213,20 @@ async def play_video_by_params_handler(args: FlowArgs, flow_manager: FlowManager
 
             logger.info(f"[Frontend] Sent video message: {video_message}")
 
+            # 2b. Send RTVI video playback command to Pi Daily client
+            from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
+            playback_command = {
+                "type": "video-playback-command",
+                "action": "play",
+                "video_path": video_data['file'],
+                "start": video_data['start'],
+                "end": video_data['end'],
+                "fullscreen": True
+            }
+            playback_frame = RTVIServerMessageFrame(playback_command)
+            await status_updater.rtvi.push_frame(playback_frame)
+            logger.info(f"[RTVI] Sent video playback command: {video_data['file']} ({video_data['start']}s-{video_data['end']}s)")
+
             # 3. Add instruction for LLM to STOP and wait for user input (only to context, not to user)
             context.add_message({
                 "role": "system",

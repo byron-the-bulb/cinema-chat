@@ -1,0 +1,11 @@
+# Requirements for Raspberry Pi headless Daily.co client
+# Minimal dependencies - just Daily.co SDK and HTTP client
+
+# Daily.co Python SDK for WebRTC (audio only)
+daily-python==0.16.1
+
+# HTTP client for calling video service
+httpx
+
+# Flask for video playback service (already installed)
+flask

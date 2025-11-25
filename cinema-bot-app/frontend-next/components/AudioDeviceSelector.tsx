@@ -65,15 +65,17 @@ const AudioDeviceSelector: React.FC<AudioDeviceSelectorProps> = ({
 
     getDevices();
 
-    // Set up device change listener
-    const handleDeviceChange = () => {
-      getDevices();
-    };
+    // Set up device change listener (only if API is available)
+    if (navigator.mediaDevices) {
+      const handleDeviceChange = () => {
+        getDevices();
+      };
 
-    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
-    return () => {
-      navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
-    };
+      navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+      return () => {
+        navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+      };
+    }
   }, [insideProvider, onDeviceSelect, selectedDeviceId]);
 
   // Handle device selection outside provider

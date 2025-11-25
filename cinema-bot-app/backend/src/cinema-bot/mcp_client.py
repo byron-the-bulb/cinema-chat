@@ -19,15 +19,10 @@ class MCPClient:
 
     async def start(self):
         """Start the MCP server as a subprocess"""
-        # Get the path to the MCP venv python
-        mcp_venv_python = os.path.join(
-            os.path.dirname(self.server_script_path),
-            "venv", "bin", "python"
-        )
-
+        # Use system python3 - the MCP venv is broken
         logger.info(f"[MCP] Starting MCP server: {self.server_script_path}")
         self.process = await asyncio.create_subprocess_exec(
-            mcp_venv_python,
+            "python3",
             self.server_script_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,

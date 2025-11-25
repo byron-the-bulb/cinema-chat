@@ -20,45 +20,48 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 from config import Settings
 
-# HTTP Video Playback Service URL
+# HTTP Video Playback Service URL (not used in URL-based mode)
 PLAYBACK_SERVICE_URL = "http://localhost:5000"
 
-# Base path for videos
+# Video server configuration
+# Videos are served from WSL2 via HTTP on port 9000
+# IMPORTANT: Windows Firewall must allow inbound connections on port 9000
+# The HTTP server runs: python3 -m http.server 9000 --bind 0.0.0.0
 import os
-VIDEO_BASE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "videos")
+VIDEO_SERVER_URL = os.getenv("VIDEO_SERVER_URL", "http://192.168.1.143:9000")
 
 # Hardcoded scene library for testing
-# Format: keyword -> (video_filename, start_time, end_time, description, caption)
+# Format: keyword -> (video_url, start_time, end_time, description, caption)
 # Caption = what is actually SAID in the clip (important for semantic matching!)
 MOCK_SCENES = {
-    # Blood/circulation related
-    "blood": ("hemo_the_magnificent.mp4.mkv", 120.0, 127.0, "Blood cells flowing through vessels", "Hey, you guys are people! Fellas, Everybody, we got people!"),
-    "heart": ("hemo_the_magnificent.mp4.mkv", 450.0, 458.0, "Heart beating and pumping blood", "Without my delicate machinery of circulation I build for you"),
-    "circulation": ("hemo_the_magnificent.mp4.mkv", 890.0, 898.0, "Circulatory system overview", "Your blood travels through thousands of miles of vessels."),
-    "flow": ("hemo_the_magnificent.mp4.mkv", 1200.0, 1208.0, "Blood flowing through arteries", "Watch how the blood flows smoothly through these passages."),
+    # Blood/circulation related - using hemo_the_magnificent.mp4.mkv
+    "blood": (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 500.0, 508.0, "Blood cells flowing through vessels", "Now I place 2 side by side like so... now I take right burb into left burb so... and right tube into left burb so"),
+    "heart": (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 100.0, 108.0, "Heart beating and pumping blood", "We will give you a big and some chickens. Now I wonder which one you value the most"),
+    "circulation": (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 500.0, 508.0, "Circulatory system overview", "Now I place 2 side by side like so... now I take right burb into left burb so... and right tube into left burb so"),
+    "flow": (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 500.0, 508.0, "Blood flowing through arteries", "Now I place 2 side by side like so... now I take right burb into left burb so... and right tube into left burb so"),
 
-    # Senses related
-    "eye": ("gateway_to_the_mind.mp4.mkv", 200.0, 208.0, "How the eye works", "The eye is like a camera, capturing light and sending signals to the brain."),
-    "vision": ("gateway_to_the_mind.mp4.mkv", 350.0, 358.0, "Visual perception", "Everything you see is processed by your amazing visual cortex."),
-    "sense": ("gateway_to_the_mind.mp4.mkv", 50.0, 58.0, "Introduction to human senses", "Your senses are the gateways to understanding the world."),
-    "brain": ("gateway_to_the_mind.mp4.mkv", 600.0, 608.0, "Brain processing information", "The brain processes millions of signals every second."),
+    # Senses related (using test for now - will update with actual scenes later)
+    "eye": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "How the eye works", "The eye is like a camera, capturing light and sending signals to the brain."),
+    "vision": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Visual perception", "Everything you see is processed by your amazing visual cortex."),
+    "sense": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Introduction to human senses", "Your senses are the gateways to understanding the world."),
+    "brain": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Brain processing information", "The brain processes millions of signals every second."),
 
-    # Posture/body
-    "posture": ("your_posture_1953.mp4.mkv", 100.0, 108.0, "Good posture demonstration", "Stand tall with your shoulders back and head held high."),
-    "spine": ("your_posture_1953.mp4.mkv", 250.0, 258.0, "Spinal alignment", "Your spine is the central support for your entire body."),
-    "body": ("your_posture_1953.mp4.mkv", 50.0, 58.0, "Human body structure", "The human body is a magnificent machine."),
+    # Posture/body (using test for now)
+    "posture": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Good posture demonstration", "Stand tall with your shoulders back and head held high."),
+    "spine": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Spinal alignment", "Your spine is the central support for your entire body."),
+    "body": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Human body structure", "The human body is a magnificent machine."),
 
     # Generic fallbacks
-    "yes": ("hemo_the_magnificent.mp4.mkv", 10.0, 15.0, "Nodding/agreement gesture", "Yes, that's absolutely correct!"),
-    "no": ("gateway_to_the_mind.mp4.mkv", 30.0, 35.0, "Shaking head/disagreement", "No, that's not quite right."),
-    "think": ("gateway_to_the_mind.mp4.mkv", 400.0, 406.0, "Person thinking/contemplating", "Let me think about that for a moment..."),
-    "hello": ("hemo_the_magnificent.mp4.mkv", 0.0, 8.0, "Opening scene greeting", "The Bell telephone system bring you another in its series of programs on science!"),
+    "yes": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 3.0, "Nodding/agreement gesture", "Yes, that's absolutely correct!"),
+    "no": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 3.0, "Shaking head/disagreement", "No, that's not quite right."),
+    "think": (f"{VIDEO_SERVER_URL}/test.mp4", 0.0, 5.0, "Person thinking/contemplating", "Let me think about that for a moment..."),
+    "hello": (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 0.0, 10.0, "Opening scene greeting", "The Bell telephone system bring you another in its series of programs on science!"),
 }
 
-# Default fallback scenes
+# Default fallback scenes (using hemo video with actual timestamps)
 DEFAULT_SCENES = [
-    ("hemo_the_magnificent.mp4.mkv", 500.0, 508.0, "Generic blood scene", "Now I place 2 side by side like so... now I take right burb into left burb so... and right tube into left burb so"),
-    ("gateway_to_the_mind.mp4.mkv", 100.0, 108.0, "Generic mind scene", "We will give you a big and some chickens. Now I wonder which one you value the most"),
+    (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 500.0, 508.0, "Generic blood scene", "Now I place 2 side by side like so... now I take right burb into left burb so... and right tube into left burb so"),
+    (f"{VIDEO_SERVER_URL}/hemo_the_magnificent.mp4.mkv", 100.0, 108.0, "Generic mind scene", "We will give you a big and some chickens. Now I wonder which one you value the most"),
 ]
 
 app = Server("cinema-chat-mock")
@@ -323,59 +326,22 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     caption = scene_data[3] if len(scene_data) > 3 else ""
                     break
 
-        # Call HTTP playback service
-        try:
-            response = await http_client.post(
-                f"{PLAYBACK_SERVICE_URL}/play",
-                json={
-                    "video_path": file,
-                    "start": start,
-                    "end": end,
-                    "fullscreen": True
-                }
-            )
+        # Just return metadata - actual playback will be triggered via RTVI
+        # by the backend handler sending a message to the Pi Daily client
+        response_data = {
+            "status": "success",
+            "video_played": {
+                "file": file,
+                "start": start,
+                "end": end,
+                "duration": end - start,
+                "description": description,
+                "caption": caption,
+                "reasoning": reasoning
+            }
+        }
 
-            if response.status_code == 200:
-                result = response.json()
-
-                # Return JSON with video metadata
-                response_data = {
-                    "status": "success",
-                    "video_played": {
-                        "file": file,
-                        "start": start,
-                        "end": end,
-                        "duration": end - start,
-                        "description": description,
-                        "caption": caption,
-                        "pid": result.get("pid"),
-                        "reasoning": reasoning
-                    }
-                }
-
-                return [TextContent(type="text", text=json.dumps(response_data, indent=2))]
-            else:
-                error_msg = response.json().get('message', 'Unknown error')
-                return [
-                    TextContent(
-                        type="text",
-                        text=json.dumps({
-                            "status": "error",
-                            "message": f"Failed to play video: {error_msg}"
-                        })
-                    )
-                ]
-
-        except Exception as e:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps({
-                        "status": "error",
-                        "message": f"Error calling playback service: {str(e)}"
-                    })
-                )
-            ]
+        return [TextContent(type="text", text=json.dumps(response_data, indent=2))]
 
     elif name == "get_mock_status":
         return [

@@ -267,22 +267,32 @@ def get_process_status(pid: int):
 
 
 @app.get("/conversation-status/{identifier}")
-async def get_conversation_status(identifier: str):
+async def get_conversation_status(identifier: str, last_seen: int = 0):
     """Get the conversation status for a specific participant or room.
-    
+
     Args:
         identifier (str): Participant ID or room URL
-        by_participant (bool): If True, use participant ID instead of room URL
-        
+        last_seen (int): Index of last seen status message (for pagination)
+
     Returns:
-        JSONResponse: Conversation status information
+        JSONResponse: Conversation status information with only new messages
     """
     # Look up by participant ID
-    print(f"Looking up conversation status for: {identifier}")
+    print(f"Looking up conversation status for: {identifier} (last_seen={last_seen})")
     if identifier in participant_status:
         print(f"Conversation status found for: {identifier}")
-        return JSONResponse(participant_status[identifier])
-    
+        status_data = participant_status[identifier].copy()
+
+        # Only return new status messages (pagination)
+        if "context" in status_data and "status_messages" in status_data["context"]:
+            all_messages = status_data["context"]["status_messages"]
+            new_messages = all_messages[last_seen:]
+            status_data["context"]["status_messages"] = new_messages
+            status_data["context"]["total_message_count"] = len(all_messages)
+            print(f"Returning {len(new_messages)} new status messages (total: {len(all_messages)})")
+
+        return JSONResponse(status_data)
+
     # Default status if not found
     return JSONResponse({"status": "initializing", "context": {}})
 
@@ -290,34 +300,59 @@ async def get_conversation_status(identifier: str):
 @app.post("/update-status")
 async def update_conversation_status(request: Request):
     """Update the conversation status using participant ID as primary identifier.
-    
+
     Args:
         request (Request): Request containing the new status with identifier
-        
+
     Returns:
         JSONResponse: Updated conversation status
     """
     data = await request.json()
     print(f"Status update data: {data}")
-    
+
     # Check for required identifier
     if "identifier" not in data:
         return JSONResponse(
             {"error": "identifier is required"},
             status_code=400
         )
-    
+
     identifier = data["identifier"]
     print(f"Updating status for identifier: {identifier}")
-    
+
     # Create or update the status for this participant
     if identifier not in participant_status:
         print(f"Creating new status entry for identifier: {identifier}")
-        participant_status[identifier] = {}
-    
-    # Update the status with the provided data
-    participant_status[identifier] = data
-   
+        participant_status[identifier] = {
+            "status": "initializing",
+            "identifier": identifier,
+            "context": {
+                "messages": [],
+                "status_messages": []  # All status updates (including reasoning/video)
+            }
+        }
+
+    # Initialize context if it doesn't exist
+    if "context" not in participant_status[identifier]:
+        participant_status[identifier]["context"] = {
+            "messages": [],
+            "status_messages": []
+        }
+
+    # Update main status field
+    participant_status[identifier]["status"] = data.get("status", participant_status[identifier].get("status"))
+    participant_status[identifier]["status_context"] = data.get("status_context")
+    participant_status[identifier]["ui_override"] = data.get("ui_override")
+    participant_status[identifier]["identifier"] = identifier
+
+    # Also add status to status_messages array for display
+    status_text = data.get("status", "")
+    if status_text:
+        if "status_messages" not in participant_status[identifier]["context"]:
+            participant_status[identifier]["context"]["status_messages"] = []
+        participant_status[identifier]["context"]["status_messages"].append(status_text)
+        print(f"Added status message: {status_text[:100]}...")
+
     return JSONResponse(participant_status[identifier])
 
 

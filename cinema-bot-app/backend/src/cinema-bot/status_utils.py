@@ -27,17 +27,34 @@ class StatusUpdater:
         if not self.rtvi:
             logger.error("StatusUpdater not initialized with RTVI processor")
             return False
-        
+
         data = {
             "status": status,
             "identifier": self.identifier,
             "status_context": context,
             "ui_override": ui_override  # Structured UI override data
         }
-        
+
         try:
+            # Send status via RTVI to connected clients
             status_frame = RTVIServerMessageFrame(data)
             await self.rtvi.push_frame(status_frame)
+
+            # Also update the HTTP-accessible status for polling clients
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "http://localhost:8765/update-status",
+                        json=data,
+                        timeout=aiohttp.ClientTimeout(total=1.0)
+                    ) as response:
+                        if response.status != 200:
+                            logger.warning(f"Failed to update HTTP status: {response.status}")
+            except asyncio.TimeoutError:
+                logger.warning("Timeout updating HTTP status (non-critical)")
+            except Exception as http_error:
+                logger.warning(f"Error updating HTTP status (non-critical): {http_error}")
+
             return True
         except Exception as e:
             logger.error(f"Error updating status: {e}")
