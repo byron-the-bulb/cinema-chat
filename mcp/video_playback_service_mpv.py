@@ -31,9 +31,48 @@ process_lock = threading.Lock()
 VIDEO_BASE = "/home/twistedtv/videos"
 
 
+def play_static_directly():
+    """Play static video directly (not via script) in infinite loop."""
+    global current_process
+
+    STATIC_VIDEO = "/home/twistedtv/videos/static.mp4"
+
+    # Build MPV command to play static in loop
+    cmd = [
+        "bash", "-c",
+        f"mpv --drm-device=/dev/dri/card1 --audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0 --no-osc --no-osd-bar --loop=inf --fullscreen {STATIC_VIDEO} > /dev/null 2>&1"
+    ]
+
+    try:
+        with process_lock:
+            current_process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL
+            )
+        print(f"Started static playback directly (PID: {current_process.pid})")
+    except Exception as e:
+        print(f"Failed to start static playback: {e}")
+
+
+def monitor_playback_and_restart_static():
+    """Monitor video playback and restart static when it finishes."""
+    global current_process
+
+    if current_process:
+        current_process.wait()  # Wait for video to finish
+        time.sleep(0.5)  # Brief delay
+
+        with process_lock:
+            current_process = None
+
+        # Restart static playback directly
+        play_static_directly()
+        print("Video finished, restarted static playback")
+
+
 def play_video(video_path, start_time, end_time, fullscreen=True):
     """
-    Play a video clip using VLC (cvlc).
+    Play a video clip using MPV.
 
     Args:
         video_path: Path to video file (relative to VIDEO_BASE or absolute)
@@ -57,19 +96,8 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     if not is_url and not os.path.exists(video_path):
         return False, f"Video file not found: {video_path}", None
 
-    # Stop any current playback
+    # Stop any current playback (including static)
     stop_playback()
-
-    # Wake up the display system
-    # Switch to VT1 and unblank to fully initialize DRM/KMS
-    try:
-        subprocess.run(['sudo', 'chvt', '1'], check=False, timeout=1)
-        time.sleep(0.1)
-        subprocess.run(['sudo', 'bash', '-c', 'echo 0 > /sys/class/graphics/fb0/blank'],
-                     check=False, timeout=2)
-        time.sleep(0.3)  # Give DRM time to fully initialize
-    except:
-        pass
 
     # Calculate duration
     duration = end_time - start_time
@@ -92,19 +120,12 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
 
         pid = current_process.pid
 
-        # Re-blank framebuffer after video completes to hide terminal
-        import threading
-        def blank_after_video():
-            current_process.wait()  # Wait for mpv to finish
-            time.sleep(0.5)  # Brief delay
-            try:
-                # Blank framebuffer to hide terminal
-                subprocess.run(['sudo', 'bash', '-c', 'echo 1 > /sys/class/graphics/fb0/blank'],
-                             check=False, timeout=2)
-            except:
-                pass
-
-        threading.Thread(target=blank_after_video, daemon=True).start()
+        # Start background thread to monitor playback and restart static
+        monitor_thread = threading.Thread(
+            target=monitor_playback_and_restart_static,
+            daemon=True
+        )
+        monitor_thread.start()
 
         return True, f"Playing {os.path.basename(video_path)} ({start_time}s - {end_time}s)", pid
 
@@ -113,26 +134,27 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
 
 
 def stop_playback():
-    """Stop any currently running video playback."""
+    """Stop any currently running video playback (including static)."""
     global current_process
 
     with process_lock:
-        if current_process and current_process.poll() is None:
+        # Kill all mpv processes (both content and static)
+        try:
+            subprocess.run(['pkill', '-9', 'mpv'], check=False, timeout=2)
+        except Exception:
+            pass
+
+        # Clean up our tracked process
+        if current_process:
             try:
-                # Terminate the process
-                current_process.terminate()
-                current_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                # Force kill if graceful termination fails
-                current_process.kill()
-                current_process.wait()
+                if current_process.poll() is None:
+                    current_process.terminate()
+                    current_process.wait(timeout=1)
             except Exception:
                 pass
-
             current_process = None
-            return True, "Playback stopped"
 
-    return False, "No playback running"
+        return True, "Playback stopped"
 
 
 @app.route('/health', methods=['GET'])
@@ -215,7 +237,7 @@ def stop():
 
 
 if __name__ == '__main__':
-    print("🎬 Cinema-Chat Video Playback Service (VLC)")
+    print("🎬 Cinema-Chat Video Playback Service (MPV)")
     print("=" * 50)
     print(f"📁 Video base directory: {VIDEO_BASE}")
     print("🌐 Starting server on http://0.0.0.0:5000")
@@ -230,6 +252,8 @@ if __name__ == '__main__':
     print("  curl -X POST http://localhost:5000/play \\")
     print("    -H 'Content-Type: application/json' \\")
     print("    -d '{\"video_path\":\"test.mp4\",\"start\":0,\"end\":5}'")
+    print()
+    print("⚠️  Static playback will start with first video request")
     print()
 
     app.run(host='0.0.0.0', port=5000, debug=False)

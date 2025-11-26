@@ -1,0 +1,19 @@
+[Unit]
+Description=Cinema Chat Next.js Frontend
+After=network.target
+
+[Service]
+Type=exec
+User=twistedtv
+WorkingDirectory=/home/twistedtv/frontend-next
+Environment="PATH=/usr/bin:/usr/local/bin"
+Environment="PORT=3000"
+ExecStartPre=/bin/bash -c 'lsof -ti:3000 | xargs -r kill -9 || true'
+ExecStart=/usr/bin/npm run dev
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/tmp/nextjs.log
+StandardError=append:/tmp/nextjs.log
+
+[Install]
+WantedBy=multi-user.target
