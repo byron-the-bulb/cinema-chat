@@ -14,7 +14,9 @@ import subprocess
 import sys
 import urllib.parse
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, List
+from datetime import datetime
+import signal
 
 import aiohttp
 from dotenv import load_dotenv
@@ -40,8 +42,124 @@ bot_procs = {}
 bot_status = {}
 participant_status = {}
 
+# Dictionary to track active rooms: {room_url: {identifier, bot_pid, pi_client_pid, created_at}}
+active_rooms = {}
+
 # Store Daily API helpers
 daily_helpers = {}
+
+
+def kill_process_tree(pid: int) -> bool:
+    """Kill a process and all its children.
+
+    Args:
+        pid (int): Process ID to kill
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Get process group and kill the entire tree
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError) as e:
+        print(f"Error killing process {pid}: {e}")
+        try:
+            # Fallback: try direct kill
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except (ProcessLookupError, PermissionError, OSError) as e2:
+            print(f"Error in fallback kill for {pid}: {e2}")
+            return False
+
+
+def cleanup_room(room_url: str) -> Dict[str, Any]:
+    """Cleanup a specific room and all associated processes.
+
+    Args:
+        room_url (str): URL of the room to clean up
+
+    Returns:
+        Dict[str, Any]: Status of cleanup operations
+    """
+    result = {
+        "room_url": room_url,
+        "bot_terminated": False,
+        "pi_client_terminated": False,
+        "video_service_terminated": False,
+        "errors": []
+    }
+
+    if room_url not in active_rooms:
+        result["errors"].append(f"Room {room_url} not found in active rooms")
+        return result
+
+    room_info = active_rooms[room_url]
+
+    # Terminate bot process
+    bot_pid = room_info.get("bot_pid")
+    if bot_pid:
+        proc_entry = bot_procs.get(bot_pid)
+        if proc_entry:
+            proc = proc_entry[0]
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                result["bot_terminated"] = True
+                print(f"Terminated bot process {bot_pid} for room {room_url}")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                result["bot_terminated"] = True
+                print(f"Force killed bot process {bot_pid} for room {room_url}")
+            except Exception as e:
+                result["errors"].append(f"Error terminating bot {bot_pid}: {e}")
+
+            # Remove from tracking
+            del bot_procs[bot_pid]
+
+    # Terminate Pi client process (if tracked)
+    # NOTE: Pi client runs on the Pi, so we send termination request via SSH
+    pi_client_pid = room_info.get("pi_client_pid")
+    if pi_client_pid:
+        try:
+            # Kill via SSH to avoid killing our own connection
+            subprocess.run(
+                ['ssh', 'twistedtv@192.168.1.201', f'kill {pi_client_pid}'],
+                check=False,
+                timeout=5
+            )
+            result["pi_client_terminated"] = True
+            print(f"Terminated Pi client process {pi_client_pid} for room {room_url}")
+        except Exception as e:
+            result["errors"].append(f"Error terminating Pi client {pi_client_pid}: {e}")
+
+    # Terminate video playback service (if tracked)
+    video_service_pid = room_info.get("video_service_pid")
+    if video_service_pid:
+        try:
+            # Kill via SSH
+            subprocess.run(
+                ['ssh', 'twistedtv@192.168.1.201', f'kill {video_service_pid}'],
+                check=False,
+                timeout=5
+            )
+            result["video_service_terminated"] = True
+            print(f"Terminated video service {video_service_pid} for room {room_url}")
+        except Exception as e:
+            result["errors"].append(f"Error terminating video service {video_service_pid}: {e}")
+
+    # Clean up status tracking
+    if room_url in bot_status:
+        del bot_status[room_url]
+
+    identifier = room_info.get("identifier")
+    if identifier and identifier in participant_status:
+        del participant_status[identifier]
+
+    # Remove from active rooms
+    del active_rooms[room_url]
+
+    return result
 
 
 def cleanup():
@@ -49,10 +167,21 @@ def cleanup():
 
     Called during server shutdown.
     """
+    # Clean up all active rooms
+    room_urls = list(active_rooms.keys())
+    for room_url in room_urls:
+        cleanup_room(room_url)
+
+    # Clean up any remaining bot processes
     for entry in bot_procs.values():
         proc = entry[0]
-        proc.terminate()
-        proc.wait()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
 
 @asynccontextmanager
@@ -219,9 +348,20 @@ async def rtvi_connect(request: Request) -> Dict[Any, Any]:
             env=env,
         )
         bot_procs[proc.pid] = (proc, room_url)
+
+        # Track this room in active_rooms
+        active_rooms[room_url] = {
+            "identifier": identifier,
+            "bot_pid": proc.pid,
+            "pi_client_pid": None,  # Will be updated by /register-pi-client
+            "video_service_pid": None,  # Will be updated by /register-video-service
+            "created_at": datetime.now().isoformat(),
+            "status": "bot_started"
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {e}")
-    
+
     print(f"Bot subprocess started with identifier: {identifier}")
 
     # Return the authentication bundle in format expected by DailyTransport
@@ -354,6 +494,314 @@ async def update_conversation_status(request: Request):
         print(f"Added status message: {status_text[:100]}...")
 
     return JSONResponse(participant_status[identifier])
+
+
+@app.get("/api/pi/audio-devices")
+async def get_pi_audio_devices():
+    """Get list of available audio input devices on the Raspberry Pi.
+
+    Returns:
+        JSON response with list of audio devices
+    """
+    try:
+        # SSH to Pi and run arecord -l to list audio capture devices
+        pi_host = os.getenv("PI_HOST", "192.168.1.201")
+        pi_user = os.getenv("PI_USER", "twistedtv")
+
+        result = subprocess.run(
+            ["ssh", f"{pi_user}@{pi_host}", "arecord -l"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"arecord command failed: {result.stderr}")
+
+        # Parse arecord output to extract devices
+        # Format: card 1: Device [USB Audio Device], device 0: USB Audio [USB Audio]
+        devices = []
+        for line in result.stdout.split('\n'):
+            if line.startswith('card'):
+                # Extract card and device numbers
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    card_part = parts[0].strip()
+                    device_part = parts[1].strip() if len(parts) > 1 else ""
+
+                    # Extract card number
+                    card_num = int(card_part.split()[1])
+
+                    # Extract device name
+                    device_name = device_part.split('[')[1].split(']')[0] if '[' in device_part else "Unknown"
+
+                    # Extract device number from "device 0:" format
+                    device_num = 0
+                    for part in parts:
+                        if 'device' in part:
+                            device_num = int(part.split()[1].replace(':', ''))
+                            break
+
+                    # Create ALSA device ID
+                    alsa_id = f"hw:{card_num},{device_num}"
+
+                    devices.append({
+                        "card": card_num,
+                        "device": device_num,
+                        "name": device_name,
+                        "alsa_id": alsa_id
+                    })
+
+        return JSONResponse({
+            "devices": devices,
+            "raw_output": result.stdout
+        })
+
+    except Exception as e:
+        print(f"Error getting Pi audio devices: {e}")
+        return JSONResponse(
+            {"error": str(e), "devices": []},
+            status_code=500
+        )
+
+
+@app.post("/api/pi/audio-device")
+async def set_pi_audio_device(request: Request):
+    """Set the active audio input device on the Raspberry Pi.
+
+    Request body:
+        {
+            "device_id": "hw:1,0"  # ALSA device ID
+        }
+
+    Returns:
+        JSON response with success status
+    """
+    try:
+        data = await request.json()
+        device_id = data.get("device_id")
+
+        if not device_id:
+            return JSONResponse(
+                {"error": "device_id is required"},
+                status_code=400
+            )
+
+        # Store the selected device in an environment variable file on the Pi
+        # This will be used by the Pi client when it starts
+        pi_host = os.getenv("PI_HOST", "192.168.1.201")
+        pi_user = os.getenv("PI_USER", "twistedtv")
+
+        # Create a config file on the Pi with the selected device
+        config_content = f"AUDIO_DEVICE={device_id}\n"
+
+        result = subprocess.run(
+            ["ssh", f"{pi_user}@{pi_host}",
+             f"echo '{config_content}' > /home/{pi_user}/audio_device.conf"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"Failed to set audio device: {result.stderr}")
+
+        return JSONResponse({
+            "success": True,
+            "message": f"Audio device set to {device_id}",
+            "device_id": device_id
+        })
+
+    except Exception as e:
+        print(f"Error setting Pi audio device: {e}")
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500
+        )
+
+
+@app.get("/rooms")
+async def list_active_rooms() -> JSONResponse:
+    """List all active rooms with their details.
+
+    Returns:
+        JSONResponse: List of active rooms with status information
+    """
+    # Clean up dead processes first
+    rooms_to_remove = []
+    for room_url, room_info in active_rooms.items():
+        bot_pid = room_info.get("bot_pid")
+        if bot_pid and bot_pid in bot_procs:
+            proc = bot_procs[bot_pid][0]
+            if proc.poll() is not None:
+                # Process is dead, mark for removal
+                rooms_to_remove.append(room_url)
+
+    for room_url in rooms_to_remove:
+        print(f"Removing dead room: {room_url}")
+        cleanup_room(room_url)
+
+    # Return active rooms with detailed status
+    rooms_list = []
+    for room_url, room_info in active_rooms.items():
+        bot_pid = room_info.get("bot_pid")
+        bot_running = False
+        if bot_pid and bot_pid in bot_procs:
+            proc = bot_procs[bot_pid][0]
+            bot_running = proc.poll() is None
+
+        rooms_list.append({
+            "room_url": room_url,
+            "identifier": room_info.get("identifier"),
+            "bot_pid": bot_pid,
+            "bot_running": bot_running,
+            "pi_client_pid": room_info.get("pi_client_pid"),
+            "created_at": room_info.get("created_at"),
+            "status": room_info.get("status")
+        })
+
+    return JSONResponse({
+        "active_rooms": rooms_list,
+        "total_count": len(rooms_list)
+    })
+
+
+@app.post("/cleanup-room")
+async def cleanup_room_endpoint(request: Request) -> JSONResponse:
+    """Cleanup a specific room and all associated processes.
+
+    Request body:
+        {
+            "room_url": "https://..."
+        }
+
+    Returns:
+        JSONResponse: Cleanup result with status of each operation
+    """
+    data = await request.json()
+    room_url = data.get("room_url")
+
+    if not room_url:
+        return JSONResponse(
+            {"error": "room_url is required"},
+            status_code=400
+        )
+
+    result = cleanup_room(room_url)
+
+    # Also try to delete the Daily room
+    try:
+        if daily_helpers.get("rest"):
+            deleted = await daily_helpers["rest"].delete_room_by_url(room_url)
+            result["daily_room_deleted"] = deleted
+    except Exception as e:
+        result["errors"].append(f"Error deleting Daily room: {e}")
+
+    return JSONResponse(result)
+
+
+@app.post("/cleanup-all-rooms")
+async def cleanup_all_rooms_endpoint() -> JSONResponse:
+    """Cleanup all active rooms.
+
+    Returns:
+        JSONResponse: Cleanup results for all rooms
+    """
+    results = []
+    room_urls = list(active_rooms.keys())
+
+    for room_url in room_urls:
+        result = cleanup_room(room_url)
+
+        # Try to delete the Daily room
+        try:
+            if daily_helpers.get("rest"):
+                deleted = await daily_helpers["rest"].delete_room_by_url(room_url)
+                result["daily_room_deleted"] = deleted
+        except Exception as e:
+            result["errors"].append(f"Error deleting Daily room: {e}")
+
+        results.append(result)
+
+    return JSONResponse({
+        "cleaned_rooms": results,
+        "total_cleaned": len(results)
+    })
+
+
+@app.post("/register-pi-client")
+async def register_pi_client(request: Request) -> JSONResponse:
+    """Register a Pi client PID with a room for tracking.
+
+    Request body:
+        {
+            "room_url": "https://...",
+            "pi_client_pid": 12345
+        }
+
+    Returns:
+        JSONResponse: Registration status
+    """
+    data = await request.json()
+    room_url = data.get("room_url")
+    pi_client_pid = data.get("pi_client_pid")
+
+    if not room_url or not pi_client_pid:
+        return JSONResponse(
+            {"error": "room_url and pi_client_pid are required"},
+            status_code=400
+        )
+
+    if room_url in active_rooms:
+        active_rooms[room_url]["pi_client_pid"] = pi_client_pid
+        active_rooms[room_url]["status"] = "pi_client_connected"
+        print(f"Registered Pi client PID {pi_client_pid} for room {room_url}")
+        return JSONResponse({
+            "success": True,
+            "message": f"Pi client {pi_client_pid} registered for room {room_url}"
+        })
+    else:
+        return JSONResponse(
+            {"error": f"Room {room_url} not found in active rooms"},
+            status_code=404
+        )
+
+
+@app.post("/register-video-service")
+async def register_video_service(request: Request) -> JSONResponse:
+    """Register a video playback service PID with a room for tracking.
+
+    Request body:
+        {
+            "room_url": "https://...",
+            "video_service_pid": 12345
+        }
+
+    Returns:
+        JSONResponse: Registration status
+    """
+    data = await request.json()
+    room_url = data.get("room_url")
+    video_service_pid = data.get("video_service_pid")
+
+    if not room_url or not video_service_pid:
+        return JSONResponse(
+            {"error": "room_url and video_service_pid are required"},
+            status_code=400
+        )
+
+    if room_url in active_rooms:
+        active_rooms[room_url]["video_service_pid"] = video_service_pid
+        print(f"Registered video service PID {video_service_pid} for room {room_url}")
+        return JSONResponse({
+            "success": True,
+            "message": f"Video service {video_service_pid} registered for room {room_url}"
+        })
+    else:
+        return JSONResponse(
+            {"error": f"Room {room_url} not found in active rooms"},
+            status_code=404
+        )
 
 
 # Debug catch-all endpoint to help diagnose 404 issues

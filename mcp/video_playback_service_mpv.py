@@ -24,55 +24,65 @@ import signal
 app = Flask(__name__)
 
 # Global state
-current_process = None
+current_process = None  # Currently playing video (content or static)
+is_playing_static = False  # Track if we're showing static
 process_lock = threading.Lock()
 
 # Video base directory on Raspberry Pi
 VIDEO_BASE = "/home/twistedtv/videos"
 
 
-def play_static_directly():
-    """Play static video directly (not via script) in infinite loop."""
-    global current_process
+def start_static_if_nothing_playing():
+    """Start static if nothing else is playing."""
+    global current_process, is_playing_static
 
-    STATIC_VIDEO = "/home/twistedtv/videos/static.mp4"
+    with process_lock:
+        # Check if anything is currently playing
+        if current_process and current_process.poll() is None:
+            # Something is already playing, don't start static
+            return
 
-    # Build MPV command to play static in loop
-    cmd = [
-        "bash", "-c",
-        f"mpv --drm-device=/dev/dri/card1 --audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0 --no-osc --no-osd-bar --loop=inf --fullscreen {STATIC_VIDEO} > /dev/null 2>&1"
-    ]
+        # Nothing playing, start static
+        STATIC_VIDEO = "/home/twistedtv/videos/static.mp4"
+        cmd = [
+            "bash", "-c",
+            f"mpv --drm-device=/dev/dri/card1 --audio-device=alsa/hdmi:CARD=vc4hdmi0,DEV=0 --no-osc --no-osd-bar --loop=inf --fullscreen {STATIC_VIDEO} > /dev/null 2>&1"
+        ]
 
-    try:
-        with process_lock:
+        try:
             current_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL
             )
-        print(f"Started static playback directly (PID: {current_process.pid})")
-    except Exception as e:
-        print(f"Failed to start static playback: {e}")
+            is_playing_static = True
+            print(f"Started static (PID: {current_process.pid})")
+        except Exception as e:
+            print(f"Failed to start static: {e}")
 
 
-def monitor_playback_and_restart_static():
-    """Monitor video playback and restart static when it finishes."""
-    global current_process
+def monitor_playback():
+    """Monitor current playback. When it finishes, start static."""
+    global current_process, is_playing_static
 
     if current_process:
-        current_process.wait()  # Wait for video to finish
-        time.sleep(0.5)  # Brief delay
+        proc_to_monitor = current_process
+        was_static = is_playing_static
+        proc_to_monitor.wait()  # Wait for video to finish
 
         with process_lock:
-            current_process = None
+            if current_process == proc_to_monitor:
+                current_process = None
+                is_playing_static = False
 
-        # Restart static playback directly
-        play_static_directly()
-        print("Video finished, restarted static playback")
+                if not was_static:
+                    print("Content video finished, starting static...")
+                    # Start static in background thread to avoid blocking
+                    threading.Thread(target=start_static_if_nothing_playing, daemon=True).start()
 
 
 def play_video(video_path, start_time, end_time, fullscreen=True):
     """
-    Play a video clip using MPV.
+    Play a video clip. Stops static if it's playing.
 
     Args:
         video_path: Path to video file (relative to VIDEO_BASE or absolute)
@@ -83,10 +93,9 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     Returns:
         (success, message, pid)
     """
-    global current_process
+    global current_process, is_playing_static
 
     # Resolve video path
-    # Check if it's a URL (http:// or https://)
     is_url = video_path.startswith('http://') or video_path.startswith('https://')
 
     if not is_url and not os.path.isabs(video_path):
@@ -96,14 +105,21 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     if not is_url and not os.path.exists(video_path):
         return False, f"Video file not found: {video_path}", None
 
-    # Stop any current playback (including static)
-    stop_playback()
+    # Stop any currently playing video (including static)
+    # Use pkill to ensure we kill the actual mpv process, not just the shell
+    try:
+        subprocess.run(['pkill', '-9', 'mpv'], check=False, timeout=2)
+        time.sleep(0.2)  # Brief delay to ensure process is dead
+    except Exception as e:
+        print(f"Error killing mpv: {e}")
 
-    # Calculate duration
-    duration = end_time - start_time
+    with process_lock:
+        if current_process:
+            print(f"Stopped previous playback (was_static: {is_playing_static})")
+            current_process = None
+            is_playing_static = False
 
-    # Build mpv command with sudo for DRM access
-    # Let mpv auto-detect the correct connector on card1
+    # Build mpv command for content
     log_file = f'/home/twistedtv/mpv_{int(time.time())}.log'
     cmd = [
         "bash", "-c",
@@ -111,18 +127,20 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     ]
 
     try:
-        # Start the video player process
+        # Start the content video
         with process_lock:
             current_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL
             )
+            is_playing_static = False
 
         pid = current_process.pid
+        print(f"Playing content (PID: {pid})")
 
-        # Start background thread to monitor playback and restart static
+        # Start background thread to monitor playback
         monitor_thread = threading.Thread(
-            target=monitor_playback_and_restart_static,
+            target=monitor_playback,
             daemon=True
         )
         monitor_thread.start()
@@ -134,27 +152,42 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
 
 
 def stop_playback():
-    """Stop any currently running video playback (including static)."""
-    global current_process
+    """Stop current playback and start static."""
+    global current_process, is_playing_static
 
     with process_lock:
-        # Kill all mpv processes (both content and static)
+        if current_process and current_process.poll() is None:
+            try:
+                current_process.terminate()
+                current_process.wait(timeout=1)
+            except Exception:
+                try:
+                    current_process.kill()
+                except Exception:
+                    pass
+            current_process = None
+            is_playing_static = False
+
+    # Start static after stopping
+    start_static_if_nothing_playing()
+    return True, "Playback stopped, showing static"
+
+
+def stop_all():
+    """Stop ALL playback including static (for shutdown only)."""
+    global current_process, is_playing_static
+
+    with process_lock:
+        # Kill all mpv processes
         try:
             subprocess.run(['pkill', '-9', 'mpv'], check=False, timeout=2)
         except Exception:
             pass
 
-        # Clean up our tracked process
-        if current_process:
-            try:
-                if current_process.poll() is None:
-                    current_process.terminate()
-                    current_process.wait(timeout=1)
-            except Exception:
-                pass
-            current_process = None
+        current_process = None
+        is_playing_static = False
 
-        return True, "Playback stopped"
+        return True, "All playback stopped"
 
 
 @app.route('/health', methods=['GET'])
@@ -165,6 +198,7 @@ def health():
         "status": "ok",
         "service": "video-playback",
         "playing": is_playing,
+        "is_static": is_playing_static,
     })
 
 
@@ -175,6 +209,7 @@ def status():
     return jsonify({
         "playing": is_playing,
         "pid": current_process.pid if is_playing else None,
+        "is_static": is_playing_static,
     })
 
 
@@ -253,7 +288,8 @@ if __name__ == '__main__':
     print("    -H 'Content-Type: application/json' \\")
     print("    -d '{\"video_path\":\"test.mp4\",\"start\":0,\"end\":5}'")
     print()
-    print("⚠️  Static playback will start with first video request")
+    print("🔄 Starting static (nothing else playing)...")
+    start_static_if_nothing_playing()
     print()
 
     app.run(host='0.0.0.0', port=5000, debug=False)

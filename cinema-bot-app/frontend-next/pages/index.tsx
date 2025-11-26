@@ -5,7 +5,7 @@ import styles from '@/styles/Home.module.css';
 // Import components
 import ChatLog, { ChatMessage, MessageType } from '@/components/ChatLog';
 import LoadingSpinner from '@/components/LoadingSpinner';
-// import PiAudioDeviceSelector from '@/components/PiAudioDeviceSelector'; // Disabled - endpoint not available
+import PiAudioDeviceSelector from '@/components/PiAudioDeviceSelector';
 
 // Generate a truly unique ID for messages
 function generateUniqueId() {
@@ -13,10 +13,22 @@ function generateUniqueId() {
 }
 
 // Server URL constants from environment variables
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000/api';
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://172.28.172.5:8765';
+
+// Interface for active room data
+interface ActiveRoom {
+  room_url: string;
+  identifier: string;
+  bot_pid: number;
+  bot_running: boolean;
+  pi_client_pid: number | null;
+  video_service_pid: number | null;
+  created_at: string;
+  status: string;
+}
 
 export default function Home() {
-  const [statusText, setStatusText] = useState('Ready to start');
+  const [statusText, setStatusText] = useState('Checking for active sessions...');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -27,6 +39,7 @@ export default function Home() {
   const [lastSeenMessageCount, setLastSeenMessageCount] = useState(0);
   const lastSeenStatusCountRef = useRef(0);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
+  const [existingRoom, setExistingRoom] = useState<ActiveRoom | null>(null);
 
   // Handle server URL change
   const handleServerUrlChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -57,12 +70,29 @@ export default function Home() {
 
   const handleStartConnection = useCallback(async () => {
     console.log('Starting Cinema Chat session...');
-    setStatusText('Creating session...');
+    setStatusText('Checking for existing sessions...');
     setIsConnecting(true);
 
     try {
-      // Call backend API to create Daily.co room
       const baseUrl = serverUrl || API_URL;
+
+      // First, check if there's already an active room
+      const roomsResponse = await fetch(`${baseUrl}/rooms`);
+      if (roomsResponse.ok) {
+        const roomsData = await roomsResponse.json();
+        if (roomsData.active_rooms && roomsData.active_rooms.length > 0) {
+          const room = roomsData.active_rooms[0];
+          setExistingRoom(room);
+          setStatusText('Active session already exists');
+          addChatMessage('⚠️ An active session already exists. Please stop it first.', 'system');
+          setIsConnecting(false);
+          return;
+        }
+      }
+
+      // No existing room, proceed to create new one
+      setStatusText('Creating session...');
+
       const response = await fetch(`${baseUrl}/connect`, {
         method: 'POST',
         headers: {
@@ -95,8 +125,9 @@ export default function Home() {
       }
 
       setCurrentRoomUrl(roomUrl);
-      setSessionIdentifier(identifier); // Save identifier for polling
+      setSessionIdentifier(identifier);
       setIsConnected(true);
+      setExistingRoom(null);
       setStatusText('Session active - Pi client connecting...');
       addChatMessage('Session started successfully', 'system');
       addChatMessage(`Room: ${roomUrl}`, 'system');
@@ -137,26 +168,109 @@ export default function Home() {
     setStatusText('Stopping session...');
 
     try {
-      // Optionally call backend to end session
-      // For now, just reset state
+      const baseUrl = serverUrl || API_URL;
+
+      // Determine which room to cleanup
+      let roomToCleanup = currentRoomUrl;
+      if (!roomToCleanup && existingRoom) {
+        roomToCleanup = existingRoom.room_url;
+      }
+
+      if (roomToCleanup) {
+        // Call backend to cleanup the room and all processes
+        const cleanupResponse = await fetch(`${baseUrl}/cleanup-room`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ room_url: roomToCleanup })
+        });
+
+        if (cleanupResponse.ok) {
+          const result = await cleanupResponse.json();
+          console.log('Cleanup result:', result);
+
+          if (result.bot_terminated) {
+            addChatMessage('Bot process terminated', 'system');
+          }
+          if (result.pi_client_terminated) {
+            addChatMessage('Pi client terminated', 'system');
+          }
+          if (result.video_service_terminated) {
+            addChatMessage('Video service terminated', 'system');
+          }
+          if (result.errors && result.errors.length > 0) {
+            result.errors.forEach((error: string) => {
+              console.warn('Cleanup error:', error);
+            });
+          }
+        } else {
+          console.error('Cleanup request failed:', cleanupResponse.statusText);
+        }
+      }
+
+      // Reset UI state
       setIsConnected(false);
       setCurrentRoomUrl(null);
       setSessionIdentifier(null);
       setLastSeenMessageCount(0);
       lastSeenStatusCountRef.current = 0;
       setIsUserSpeaking(false);
-      setStatusText('Session ended');
+      setExistingRoom(null);
+      setStatusText('Ready to start');
       addChatMessage('Session stopped', 'system');
+
     } catch (error: any) {
       console.error('Failed to stop session:', error);
       setStatusText(`Error stopping: ${error.message}`);
+      addChatMessage(`Error: ${error.message}`, 'system');
     }
-  }, [addChatMessage]);
+  }, [serverUrl, currentRoomUrl, existingRoom, addChatMessage]);
 
-  // Send welcome message on mount
+  // Check for existing rooms on mount
   useEffect(() => {
-    addChatMessage('Cinema Chat ready', 'system');
-  }, [addChatMessage]);
+    const checkExistingRooms = async () => {
+      try {
+        const baseUrl = serverUrl || API_URL;
+        const response = await fetch(`${baseUrl}/rooms`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.active_rooms && data.active_rooms.length > 0) {
+            const room = data.active_rooms[0];
+            setExistingRoom(room);
+            setCurrentRoomUrl(room.room_url);
+            setSessionIdentifier(room.identifier);
+            setIsConnected(true);
+            setStatusText('Reconnected to existing session');
+            addChatMessage('✓ Found existing session', 'system');
+            addChatMessage(`Room: ${room.room_url}`, 'system');
+            addChatMessage(`Status: ${room.status}`, 'system');
+            if (room.bot_running) {
+              addChatMessage(`Bot running (PID: ${room.bot_pid})`, 'system');
+            }
+            if (room.pi_client_pid) {
+              addChatMessage(`Pi client connected (PID: ${room.pi_client_pid})`, 'system');
+            }
+            if (room.video_service_pid) {
+              addChatMessage(`Video service running (PID: ${room.video_service_pid})`, 'system');
+            }
+          } else {
+            setStatusText('Ready to start');
+            addChatMessage('Cinema Chat ready', 'system');
+          }
+        } else {
+          setStatusText('Ready to start');
+          addChatMessage('Cinema Chat ready', 'system');
+        }
+      } catch (error) {
+        console.error('Error checking for existing rooms:', error);
+        setStatusText('Ready to start');
+        addChatMessage('Cinema Chat ready', 'system');
+      }
+    };
+
+    checkExistingRooms();
+  }, [serverUrl, addChatMessage]);
 
   // Poll for conversation updates from backend
   useEffect(() => {
@@ -280,10 +394,10 @@ export default function Home() {
           />
         </div>
 
-        {/* Pi Audio Device Selection - Disabled until endpoint is restored */}
-        {/* <div className={styles.stationNameContainer}>
-          <PiAudioDeviceSelector backendUrl={serverUrl.replace(/\/api$/, '')} />
-        </div> */}
+        {/* Pi Audio Device Selection */}
+        <div className={styles.stationNameContainer}>
+          <PiAudioDeviceSelector />
+        </div>
 
         {isConnected && currentRoomUrl && (
           <div className={styles.sessionInfo}>

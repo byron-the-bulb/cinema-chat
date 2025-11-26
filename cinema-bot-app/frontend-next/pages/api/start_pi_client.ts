@@ -43,21 +43,38 @@ export default async function handler(
           // Ignore error if no process to kill
         }
 
-        // Start new video service with nohup
-        const videoServiceCmd = 'cd /home/twistedtv && nohup python3 video_playback_service_mpv.py > /tmp/video_mpv.log 2>&1 &';
-        await execPromise(videoServiceCmd);
+        // Start new video service with nohup and capture PID
+        const videoServiceCmd = 'cd /home/twistedtv && nohup python3 video_playback_service_mpv.py > /tmp/video_mpv.log 2>&1 & echo $!';
+        const { stdout: pidOutput } = await execPromise(videoServiceCmd);
+        const videoServicePid = parseInt(pidOutput.trim());
 
-        console.log('Video playback service started');
+        console.log(`Video playback service started with PID: ${videoServicePid}`);
         await new Promise(resolve => setTimeout(resolve, 1500)); // Give it time to start
 
-        // Start static noise playback immediately
-        try {
-          const startStaticCmd = 'curl -X POST http://localhost:5000/play -H "Content-Type: application/json" -d \'{"video_path":"/home/twistedtv/videos/static.mp4","start":0,"end":999999,"fullscreen":true}\' > /dev/null 2>&1 &';
-          await execPromise(startStaticCmd);
-          console.log('Static noise playback started');
-        } catch (staticErr) {
-          console.error('Failed to start static (continuing anyway):', staticErr);
+        // Register the video service PID with the backend
+        if (videoServicePid && backendUrl) {
+          try {
+            const registerUrl = `${backendUrl}/register-video-service`;
+            const registerResponse = await fetch(registerUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                room_url: roomUrl,
+                video_service_pid: videoServicePid
+              })
+            });
+
+            if (registerResponse.ok) {
+              console.log(`Registered video service PID ${videoServicePid} with backend`);
+            } else {
+              console.warn(`Failed to register video service with backend: ${registerResponse.statusText}`);
+            }
+          } catch (registerError) {
+            console.error('Error registering video service with backend:', registerError);
+          }
         }
+
+        // Note: Static background loop is started automatically by video service
       } catch (videoErr) {
         console.error('Failed to start video service (continuing anyway):', videoErr);
         // Don't fail the entire request if video service fails to start
@@ -104,6 +121,28 @@ export default async function handler(
       childProcess.unref();
 
       console.log(`Pi client started with PID: ${childProcess.pid}, log: ${logFile}`);
+
+      // Register the Pi client PID with the backend for tracking
+      try {
+        const registerUrl = `${backendUrl}/register-pi-client`;
+        const registerResponse = await fetch(registerUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            room_url: roomUrl,
+            pi_client_pid: childProcess.pid
+          })
+        });
+
+        if (registerResponse.ok) {
+          console.log(`Registered Pi client PID ${childProcess.pid} with backend`);
+        } else {
+          console.warn(`Failed to register Pi client with backend: ${registerResponse.statusText}`);
+        }
+      } catch (registerError) {
+        console.error('Error registering Pi client with backend:', registerError);
+        // Don't fail the entire request if registration fails
+      }
 
       return res.status(200).json({
         success: true,
