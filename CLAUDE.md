@@ -109,6 +109,52 @@ Repository: https://github.com/byron-the-bulb/cinema-chat
 - NVIDIA GPU (recommended for Whisper STT)
 - Access to GoodCLIPS API instance
 - OpenAI/Anthropic API key
+- Raspberry Pi (for video playback on TV)
+
+### Raspberry Pi File Management Workflow
+
+**CRITICAL: Always edit files locally first, then sync to Pi**
+
+The Raspberry Pi runs several components:
+- Video playback service (`video_playback_service_mpv.py`)
+- Daily.co client (`pi_daily_client_rtvi.py`)
+- Next.js frontend (started via API call from frontend)
+
+**Key files that run on Pi:**
+- **MCP/Backend**:
+  - Local: `mcp/video_playback_service_mpv.py` → Pi: `/home/twistedtv/video_playback_service_mpv.py`
+  - Local: `mcp/pi_daily_client_rtvi.py` → Pi: `/home/twistedtv/pi_daily_client_rtvi.py`
+  - Local: `mcp/pi_daily_client_rtvi_v2.py` → Pi: `/home/twistedtv/pi_daily_client_rtvi_v2.py`
+- **Frontend API**:
+  - Local: `cinema-bot-app/frontend-next/pages/api/start_pi_client.ts` (runs on Pi via Next.js)
+  - Local: `data/videos/streaming_server.py` (HTTP video server, runs on development machine)
+
+**Workflow:**
+1. **Edit locally FIRST**: Always make changes to files in the local repo
+   - MCP files: Edit in `mcp/` directory
+   - Frontend API files: Edit in `cinema-bot-app/frontend-next/pages/api/` directory
+   - Video server: Edit in `data/videos/` directory
+2. **Sync to Pi**: Use scp/rsync to copy updated files to the Pi:
+   ```bash
+   # Sync MCP/backend files
+   scp mcp/video_playback_service_mpv.py twistedtv@192.168.1.201:/home/twistedtv/
+   scp mcp/pi_daily_client_rtvi.py twistedtv@192.168.1.201:/home/twistedtv/
+   scp mcp/pi_daily_client_rtvi_v2.py twistedtv@192.168.1.201:/home/twistedtv/
+
+   # Sync frontend (Next.js runs on Pi)
+   rsync -av --exclude node_modules cinema-bot-app/frontend-next/ twistedtv@192.168.1.201:~/cinema-chat/frontend-next/
+   ```
+3. **Restart services on Pi**: After syncing, restart the affected services
+   - Video playback service: `pkill -f video_playback_service_mpv.py && python3 /home/twistedtv/video_playback_service_mpv.py &`
+   - Pi Daily client: Automatically started by Next.js API
+   - Next.js: `cd ~/cinema-chat/frontend-next && npm run dev`
+4. **Commit to git**: Commit the local changes so they're tracked in version control
+
+**Never:**
+- Edit files directly on the Pi via SSH
+- Make changes on Pi without syncing back to local repo
+- Assume local and Pi files are in sync - always verify before making changes
+- Edit Pi files and forget to commit changes to git
 
 ### Environment Variables
 ```bash

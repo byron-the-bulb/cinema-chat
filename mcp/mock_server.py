@@ -28,6 +28,7 @@ PLAYBACK_SERVICE_URL = "http://localhost:5000"
 # IMPORTANT: Windows Firewall must allow inbound connections on port 9000
 # The HTTP server runs: python3 -m http.server 9000 --bind 0.0.0.0
 import os
+# Use local file paths on the Pi instead of HTTP URLs to avoid network timeouts
 VIDEO_SERVER_URL = os.getenv("VIDEO_SERVER_URL", "http://192.168.1.143:9000")
 
 # Hardcoded scene library for testing

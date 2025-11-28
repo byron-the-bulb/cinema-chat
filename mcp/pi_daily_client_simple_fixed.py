@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Simplified Daily.co Client for Raspberry Pi
-Based on official Daily Python demo: https://github.com/daily-co/daily-python/blob/main/demos/pyaudio/record_and_play.py
-
-Uses ALSA for audio capture (since we verified that works with plughw:1,0)
-Writes to Daily virtual microphone in synchronous callback (not async loop)
+Full-featured Daily.co Client for Raspberry Pi with ALSA Audio
+Combines RTVI-compatible structure from pi_daily_client_rtvi.py
+with ALSA audio capture from the official Daily Python demo.
 """
 
 import asyncio
@@ -14,8 +12,6 @@ import json
 import logging
 import httpx
 import threading
-import time
-import subprocess
 import alsaaudio
 from daily import Daily, CallClient, EventHandler
 from typing import Optional
@@ -23,17 +19,18 @@ from typing import Optional
 # Configuration
 BACKEND_URL = os.getenv("BACKEND_URL", "http://192.168.1.143:8765/api")
 VIDEO_SERVICE_URL = os.getenv("VIDEO_SERVICE_URL", "http://localhost:5000")
+DAILY_ROOM_URL = os.getenv("DAILY_ROOM_URL", "")
+DAILY_TOKEN = os.getenv("DAILY_TOKEN", "")
 AUDIO_CONFIG_FILE = "/home/twistedtv/audio_device.conf"
-CLEANUP_SCRIPT = "/home/twistedtv/cleanup_pi.sh"
 
 # Audio settings (16kHz mono to match backend expectations)
 SAMPLE_RATE = 16000
 CHANNELS = 1
 PERIOD_SIZE = 160  # 10ms at 16kHz
 
-# Setup logging
+# Setup logging with DEBUG level to see all message details
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -139,34 +136,49 @@ class ALSAAudioThread(threading.Thread):
         self.running = False
 
 
-class CinemaClient(EventHandler):
-    """Cinema Chat Daily.co client"""
+class CinemaRTVIClient(EventHandler):
+    """
+    RTVI-compatible Daily.co client for Cinema Chat.
+
+    Replicates the browser RTVI client functionality:
+    - Joins Daily.co room
+    - Receives audio from bot
+    - Handles transcription events
+    - Processes video playback commands
+    """
 
     def __init__(self, backend_url: str, video_service_url: str):
         super().__init__()
         self.backend_url = backend_url
         self.video_service_url = video_service_url
         self.http_client = httpx.AsyncClient()
-        self.room_url = None
-        self.token = None
-        self.audio_thread = None
-        self.should_exit = False
-        self.bot_left = False
+        self.room_url: Optional[str] = None
+        self.token: Optional[str] = None
+        self.audio_thread: Optional[ALSAAudioThread] = None
 
     async def connect_to_backend(self):
         """Connect to backend and get Daily.co room info"""
         logger.info("=" * 60)
-        logger.info("🎬 Cinema Chat - Pi Client (Fixed)")
+        logger.info("🎬 Cinema Chat - Raspberry Pi RTVI Client with ALSA Audio")
         logger.info("=" * 60)
         logger.info(f"Backend: {self.backend_url}")
         logger.info(f"Video Service: {self.video_service_url}")
         logger.info("=" * 60)
 
         try:
+            # Call backend /connect endpoint (same as browser)
             logger.info("Connecting to backend...")
             response = await self.http_client.post(
                 f"{self.backend_url}/connect",
-                json={"config": []},
+                json={
+                    "config": [{
+                        "service": "tts",
+                        "options": [{
+                            "name": "provider",
+                            "value": "cartesia"
+                        }]
+                    }]
+                },
                 timeout=30.0
             )
 
@@ -187,87 +199,150 @@ class CinemaClient(EventHandler):
             logger.error(f"❌ Failed to connect to backend: {e}")
             return False
 
-    def on_call_state_updated(self, state):
-        """Called when call state changes"""
-        logger.info(f"📞 Call state: {state}")
+    def on_joined(self, data, error):
+        """Called when we join the room"""
+        if error:
+            logger.error(f"Error joining room: {error}")
+            return
 
-        if state == "joined":
-            logger.info("✅ Joined Daily.co room successfully")
-            logger.info("🎤 Audio should now be flowing to backend")
-        elif state == "left":
-            logger.info("Left Daily.co room")
-            self.should_exit = True
+        logger.info("✅ Joined Daily.co room")
+        logger.info("🎤 Streaming phone audio to bot")
+        logger.info("📺 Listening for video commands...")
 
     def on_participant_joined(self, participant):
-        """Called when bot joins"""
+        """Called when bot joins - Daily.co SDK passes participant dict directly"""
         username = participant.get("user_name", participant.get("id", 'Unknown'))
         logger.info(f"🤖 Bot joined: {username}")
 
     def on_participant_left(self, participant, reason=None):
-        """Called when bot leaves - trigger cleanup"""
+        """Called when bot leaves - Daily.co SDK passes participant dict directly"""
         username = participant.get("user_name", participant.get("id", 'Unknown'))
-        logger.info(f"🤖 Bot left: {username}")
-
-        # Check if this is the bot participant (not ourselves)
-        # The bot typically has user_name like "Pipecat Bot" or similar
-        if username and "bot" in username.lower():
-            logger.info("🧹 Bot has left the room, initiating cleanup...")
-            self.bot_left = True
-            self.should_exit = True
+        logger.info(f"Bot left: {username}")
 
     def on_app_message(self, message, sender):
-        """Handle app messages from bot (video playback commands)"""
-        logger.debug(f"📨 Received message from {sender}")
+        """
+        Handles app messages from the bot.
+        Daily.co SDK signature: (self, message, sender)
+
+        This replicates the browser's handling of:
+        - Video playback commands
+        - Status updates
+        - Any custom messages
+        """
+        logger.info(f"📨 Received message from {sender}")
+        logger.debug(f"🔍 RAW MESSAGE: {message}")
+        logger.debug(f"🔍 MESSAGE TYPE: {type(message)}")
 
         try:
             # Parse message
             if isinstance(message, str):
                 msg_data = json.loads(message)
+                logger.debug(f"🔍 PARSED FROM STRING: {msg_data}")
             else:
                 msg_data = message
+                logger.debug(f"🔍 DIRECT OBJECT: {msg_data}")
+
+            logger.info(f"🔍 MESSAGE DATA TYPE: {msg_data.get('type')}")
+            logger.debug(f"🔍 FULL MSG_DATA: {json.dumps(msg_data, indent=2)}")
 
             # Unwrap server-message envelopes
             if msg_data.get("type") == "server-message" and "data" in msg_data:
+                logger.info(f"🔓 Unwrapping server-message envelope")
                 msg_data = msg_data["data"]
+                logger.info(f"🔍 UNWRAPPED TYPE: {msg_data.get('type')}")
+                logger.debug(f"🔍 UNWRAPPED DATA: {json.dumps(msg_data, indent=2)}")
 
-            # Handle video playback commands
-            if msg_data.get("type") == "video-playback-command" and msg_data.get("action") == "play":
-                logger.info(f"🎬 Playing video: {msg_data.get('video_path')}")
-                try:
-                    response = httpx.post(
-                        f"{self.video_service_url}/play",
-                        json={
-                            "video_path": msg_data.get("video_path"),
-                            "start": msg_data.get("start", 0),
-                            "end": msg_data.get("end", 10),
-                            "fullscreen": msg_data.get("fullscreen", True)
-                        },
-                        timeout=5.0
-                    )
-                    if response.status_code == 200:
-                        logger.info(f"✅ Video playback started")
-                    else:
-                        logger.error(f"❌ Video playback failed: {response.text}")
-                except Exception as e:
-                    logger.error(f"❌ Error calling video service: {e}")
+            # Handle video playback commands (same as simple client)
+            if msg_data.get("type") == "video-playback-command":
+                logger.info(f"✅ MATCHED video-playback-command!")
+                if msg_data.get("action") == "play":
+                    logger.info(f"✅ MATCHED action=play, calling play_video()")
+                    # Call video service directly (synchronous HTTP call)
+                    # Can't use async in Daily.co callback thread
+                    import httpx
+                    try:
+                        response = httpx.post(
+                            f"{self.video_service_url}/play",
+                            json={
+                                "video_path": msg_data.get("video_path"),
+                                "start": msg_data.get("start", 0),
+                                "end": msg_data.get("end", 10),
+                                "fullscreen": msg_data.get("fullscreen", True)
+                            },
+                            timeout=5.0
+                        )
+                        if response.status_code == 200:
+                            result = response.json()
+                            logger.info(f"✅ Video started: PID {result.get('pid')}")
+                        else:
+                            logger.error(f"❌ Video playback failed: {response.text}")
+                    except Exception as e:
+                        logger.error(f"❌ Error calling video service: {e}")
+                else:
+                    logger.warning(f"⚠️  video-playback-command but action={msg_data.get('action')}, not 'play'")
+
+            # Handle test ping messages
+            elif msg_data.get("type") == "pi-test-ping":
+                logger.info(f"✅ Test ping #{msg_data.get('counter')}: {msg_data.get('message')}")
+
+            # Handle other message types (status, config, etc.)
+            elif msg_data.get("type") == "status":
+                logger.info(f"📊 Status: {msg_data.get('message')}")
+
+            elif msg_data.get("type") == "config":
+                logger.info(f"⚙️  Config update: {msg_data}")
+
+            else:
+                logger.warning(f"⚠️  Unknown message type: {msg_data.get('type')}")
 
         except Exception as e:
             logger.error(f"Error handling app message: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def play_video(self, video_path, start, end, fullscreen=True):
+        """Call the local video playback service"""
+        logger.info(f"🎬 Playing: {video_path} ({start}s - {end}s)")
+
+        try:
+            response = await self.http_client.post(
+                f"{self.video_service_url}/play",
+                json={
+                    "video_path": video_path,
+                    "start": start,
+                    "end": end,
+                    "fullscreen": fullscreen
+                },
+                timeout=5.0
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"✅ Video started: PID {result.get('pid')}")
+            else:
+                error = response.json().get("message", "Unknown error")
+                logger.error(f"❌ Video playback failed: {error}")
+
+        except Exception as e:
+            logger.error(f"❌ Error calling video service: {e}")
+
+    def on_transcription_message(self, message):
+        """Handle transcription updates (user speech-to-text)
+        Daily.co SDK signature: (self, message)
+        """
+        text = message.get("text", "")
+        is_final = message.get("is_final", False)
+
+        if is_final:
+            logger.info(f"👤 User said: {text}")
 
     def on_error(self, error):
         """Called on error"""
-        logger.error(f"❌ Daily.co error: {error}")
+        logger.error(f"Daily.co error: {error}")
 
 
-async def main():
-    """Main entry point"""
-    backend_url = os.getenv("BACKEND_URL", BACKEND_URL)
-    video_service_url = os.getenv("VIDEO_SERVICE_URL", VIDEO_SERVICE_URL)
-
-    if not backend_url:
-        logger.error("❌ No backend URL configured")
-        logger.error("Set BACKEND_URL environment variable")
-        sys.exit(1)
+async def run_client(backend_url: str, video_service_url: str, room_url: Optional[str] = None, token: Optional[str] = None):
+    """Run the Pi RTVI-compatible Daily.co client with ALSA audio"""
 
     # Initialize Daily
     Daily.init()
@@ -286,16 +361,23 @@ async def main():
     logger.info("✅ Virtual microphone created (non-blocking mode)")
 
     # Create event handler
-    client = CinemaClient(backend_url, video_service_url)
+    client = CinemaRTVIClient(backend_url, video_service_url)
 
-    # Get room URL from backend
-    if not await client.connect_to_backend():
-        logger.error("Failed to connect to backend")
-        return
+    # Get room URL from backend if not provided
+    if not room_url:
+        if not await client.connect_to_backend():
+            logger.error("Failed to connect to backend")
+            return
+        room_url = client.room_url
+        token = client.token
+    else:
+        client.room_url = room_url
+        client.token = token
 
     # Create call client
     call_client = CallClient(event_handler=client)
 
+    # Join the room
     try:
         # Start audio capture thread BEFORE joining
         logger.info("Starting audio capture thread...")
@@ -306,26 +388,32 @@ async def main():
         # Give audio thread time to initialize
         await asyncio.sleep(0.5)
 
-        logger.info(f"Joining room: {client.room_url}")
+        logger.info(f"Joining room: {room_url}")
 
-        # Join with virtual microphone - following official Daily demo pattern
+        # Configure to send audio with customConstraints (from official Daily demo)
+        # Note: join() is synchronous, actual join completion signaled via on_joined event
         call_client.join(
-            client.room_url,
-            meeting_token=client.token if client.token else None,
+            room_url,
+            meeting_token=token if token else None,
             client_settings={
                 "inputs": {
-                    "camera": False,
+                    "camera": False,  # No video
                     "microphone": {
                         "isEnabled": True,
                         "settings": {
-                            "deviceId": "pi-microphone"  # Use device NAME string, not object
+                            "deviceId": "pi-microphone",  # Use device NAME string, not object
+                            "customConstraints": {
+                                "autoGainControl": {"exact": True},
+                                "noiseSuppression": {"exact": True},
+                                "echoCancellation": {"exact": True},
+                            },
                         }
                     }
                 },
                 "publishing": {
                     "camera": False,
                     "microphone": {
-                        "isPublishing": True,  # Explicitly enable publishing
+                        "isPublishing": True,
                         "sendSettings": {
                             "channelConfig": "mono"  # Match our CHANNELS setting
                         }
@@ -334,41 +422,53 @@ async def main():
             }
         )
 
-        # Wait for join to complete
-        await asyncio.sleep(2)
+        # Keep running and send periodic test messages
         logger.info("✅ Client running. Press Ctrl+C to stop.")
-        logger.info("🎤 Audio is being captured and sent to backend")
-
-        # Keep running until bot leaves or Ctrl+C
-        while not client.should_exit:
-            await asyncio.sleep(1)
-
-        if client.bot_left:
-            logger.info("🧹 Exiting due to bot leaving room...")
+        test_counter = 0
+        while True:
+            await asyncio.sleep(5)
+            test_counter += 1
+            try:
+                # Send test app message to verify Pi->Room communication
+                call_client.send_app_message({
+                    "type": "pi-test-ping",
+                    "counter": test_counter,
+                    "message": f"Pi test ping #{test_counter}",
+                    "timestamp": asyncio.get_event_loop().time()
+                })
+                logger.info(f"📤 Sent test ping #{test_counter} to room")
+            except Exception as e:
+                logger.error(f"Failed to send test ping: {e}")
 
     except KeyboardInterrupt:
-        logger.info("🧹 Shutting down (Ctrl+C)...")
+        logger.info("Shutting down...")
     except Exception as e:
         logger.error(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         # Clean up audio thread
         if client.audio_thread:
             client.audio_thread.stop()
 
-        # Leave the Daily room
         try:
             await call_client.leave()
             logger.info("Left room")
         except:
             pass
 
-        # Run cleanup script to kill all Pi processes
-        logger.info("🧹 Running cleanup script to terminate all Pi processes...")
-        cleanup_pi_processes()
 
-        logger.info("✅ Cleanup complete, exiting")
+async def main():
+    """Main entry point"""
+    backend_url = os.getenv("BACKEND_URL", BACKEND_URL)
+    video_service_url = os.getenv("VIDEO_SERVICE_URL", VIDEO_SERVICE_URL)
+    room_url = os.getenv("DAILY_ROOM_URL", DAILY_ROOM_URL) or None
+    token = os.getenv("DAILY_TOKEN", DAILY_TOKEN) or None
+
+    if not backend_url:
+        logger.error("❌ No backend URL configured")
+        logger.error("Set BACKEND_URL environment variable")
+        sys.exit(1)
+
+    await run_client(backend_url, video_service_url, room_url, token)
 
 
 if __name__ == "__main__":

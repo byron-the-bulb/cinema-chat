@@ -351,10 +351,35 @@ async def run_bot(room_url, token, identifier, data=None):
         except Exception as e:
             logger.error(f"Error during client connection handling: {e}")
 
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        """Handle app messages from Pi client (test pings for diagnostics)"""
+        try:
+            logger.info(f"📨 Received app message from {sender}")
+            logger.debug(f"Message content: {message}")
+
+            # Parse the message if it's a string
+            if isinstance(message, str):
+                msg_data = json.loads(message)
+            else:
+                msg_data = message
+
+            # Log test ping messages
+            if msg_data.get("type") == "pi-test-ping":
+                logger.info(f"✅ Test ping #{msg_data.get('counter')}: {msg_data.get('message')}")
+                logger.debug(f"Timestamp: {msg_data.get('timestamp')}")
+
+                # Send to conversation log so it appears in frontend
+                await status_updater.update_status(
+                    f"[PI TEST PING] #{msg_data.get('counter')}: {msg_data.get('message')}"
+                )
+        except Exception as e:
+            logger.error(f"Error handling app message: {e}")
+
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.info(f"Participant left: {participant['id']}, reason: {reason}")
-        try:           
+        try:
             if room_url and os.getenv("DAILY_API_KEY"):
                 import aiohttp
                 # Initialize Daily REST helper with proper aiohttp session
@@ -379,16 +404,16 @@ async def run_bot(room_url, token, identifier, data=None):
         finally:
             # Close the status updater session
             await status_updater.close()
-            
+
             # Cancel the pipeline, which stops processing and removes the bot from the room
             await task.cancel()
-            
+
             # Log that we're exiting the process
             logger.info("Participant left, canceling pipeline task...")
-            
+
             # Give a small delay to allow logs to flush
             await asyncio.sleep(1)
-            
+
             # Instead of sys.exit, raise an exception that will be caught by the outer try/except
             # This allows for proper cleanup of resources
             raise asyncio.CancelledError("Participant left the room")

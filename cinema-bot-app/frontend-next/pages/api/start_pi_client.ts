@@ -8,7 +8,7 @@ import { spawn } from 'child_process';
 
 // Pi client paths - use venv_daily python with all dependencies
 const VENV_PYTHON = '/home/twistedtv/venv_daily/bin/python3';
-const PYTHON_CLIENT = '/home/twistedtv/pi_daily_client_rtvi.py';
+const PYTHON_CLIENT = '/home/twistedtv/pi_daily_client_simple_fixed.py';  // Using ALSA audio capture with customConstraints
 
 export default async function handler(
   req: NextApiRequest,
@@ -27,20 +27,21 @@ export default async function handler(
 
     // Spawn a new Pi client for this room
     try {
-      // Start video playback service (with static noise) before starting Pi client
+      // Clean up all existing Pi processes first
       try {
         const { exec } = require('child_process');
         const util = require('util');
         const execPromise = util.promisify(exec);
 
-        console.log('Starting video playback service...');
+        console.log('Cleaning up existing Pi processes...');
 
-        // Kill any existing video service first
+        // Run the cleanup script on the Pi
         try {
-          await execPromise('pkill -9 -f video_playback_service_mpv.py');
-          await new Promise(resolve => setTimeout(resolve, 500)); // Brief delay
-        } catch (killErr) {
-          // Ignore error if no process to kill
+          const { stdout } = await execPromise('ssh twistedtv@192.168.1.201 "bash /home/twistedtv/cleanup_pi.sh"');
+          console.log('Cleanup output:', stdout);
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for cleanup to complete
+        } catch (cleanupErr: any) {
+          console.error('Cleanup error (continuing anyway):', cleanupErr.message);
         }
 
         // Start new video service with nohup and capture PID
