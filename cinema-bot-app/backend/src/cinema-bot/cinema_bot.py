@@ -45,7 +45,7 @@ from pipecat_flows import FlowManager
 from .cinema_script import SYSTEM_ROLE, create_initial_node
 from .status_utils import status_updater
 from .custom_flow_manager import CustomFlowManager
-from pipecat.frames.frames import BotStoppedSpeakingFrame, TranscriptionFrame, TextFrame, Frame, FunctionCallResultFrame
+from pipecat.frames.frames import BotStoppedSpeakingFrame, TranscriptionFrame, TextFrame, Frame, FunctionCallResultFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from uuid import uuid4
 from pipecat.utils.time import time_now_iso8601
@@ -133,6 +133,32 @@ class VideoResponseProcessor(FrameProcessor):
             return
 
         # Let all other frames through
+        await self.push_frame(frame, direction)
+
+
+class UserSpeakingProcessor(FrameProcessor):
+    """
+    Processor that monitors user speaking state and sends updates to the frontend.
+
+    Listens for UserStartedSpeakingFrame and UserStoppedSpeakingFrame from the
+    pipeline and sends RTVI status updates to the connected clients.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Call parent class initialization
+        await super().process_frame(frame, direction)
+
+        # Detect when user starts speaking
+        if isinstance(frame, UserStartedSpeakingFrame):
+            logger.info("🎤 User started speaking")
+            await status_updater.update_user_speaking(True)
+
+        # Detect when user stops speaking
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            logger.info("🔇 User stopped speaking")
+            await status_updater.update_user_speaking(False)
+
+        # Always pass frames through
         await self.push_frame(frame, direction)
 
 
@@ -273,9 +299,13 @@ async def run_bot(room_url, token, identifier, data=None):
     # TEMPORARILY DISABLED - debugging initialization issue
     # video_response_processor = VideoResponseProcessor(context_aggregator=context_aggregator)
 
+    # Create user speaking processor to monitor VAD state
+    user_speaking_processor = UserSpeakingProcessor()
+
     conversation_pipeline = Pipeline(
         [
             transport.input(),  # Websocket input from client
+            user_speaking_processor,  # Monitor user speaking state
             rtvi,
             # stt_mute_filter removed - blocking transcription
             stt,  # Speech-To-Text

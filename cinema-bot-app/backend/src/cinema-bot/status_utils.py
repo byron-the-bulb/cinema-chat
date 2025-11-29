@@ -60,6 +60,32 @@ class StatusUpdater:
             logger.error(f"Error updating status: {e}")
             return False
 
+    async def update_user_speaking(self, is_speaking: bool):
+        """
+        Update the user speaking state in the frontend.
+
+        Args:
+            is_speaking: True when user starts speaking, False when they stop
+        """
+        logger.info(f"Updating user_speaking state: {is_speaking}")
+        if not self.rtvi:
+            logger.error("StatusUpdater not initialized with RTVI processor")
+            return False
+
+        data = {
+            "user_speaking": is_speaking,
+            "identifier": self.identifier
+        }
+
+        try:
+            # Send user_speaking state via RTVI to connected clients
+            status_frame = RTVIServerMessageFrame(data)
+            await self.rtvi.push_frame(status_frame)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating user_speaking state: {e}")
+            return False
+
     async def close(self):
         logger.info("Sending goodbye system status")
         if not self.rtvi:
