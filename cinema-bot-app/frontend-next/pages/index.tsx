@@ -47,9 +47,13 @@ export default function Home() {
   };
 
   const addChatMessage = useCallback((text: string, type: MessageType) => {
-    if (!text) return;
-    console.log(`Adding ${type} message: ${text}`);
+    if (!text) {
+      console.log('[addChatMessage] Empty text, returning');
+      return;
+    }
+    console.log(`[addChatMessage] Called with type="${type}", text="${text}"`);
     setChatMessages(prevMessages => {
+      console.log(`[addChatMessage] Current message count: ${prevMessages.length}`);
       // Only check for exact duplicates in the last 2 messages (immediate duplicates only)
       // This prevents blocking legitimate messages that arrive in batches from polling
       const recentMessages = prevMessages.slice(-2);
@@ -57,7 +61,7 @@ export default function Home() {
         msg => msg.text === text && msg.type === type
       );
       if (isDuplicate) {
-        console.log(`Prevented duplicate message: ${text}`);
+        console.log(`[addChatMessage] ❌ PREVENTED DUPLICATE: type="${type}", text="${text}"`);
         return prevMessages;
       }
       const newMessage = {
@@ -66,6 +70,7 @@ export default function Home() {
         type,
         timestamp: new Date()
       };
+      console.log(`[addChatMessage] ✅ ADDING MESSAGE: type="${type}", text="${text}"`);
       return [...prevMessages, newMessage];
     });
   }, []);
@@ -345,8 +350,22 @@ export default function Home() {
           const statusMessages = data.context.status_messages;
           console.log('[POLLING DEBUG] Processing status messages:', statusMessages);
           statusMessages.forEach((msg: string) => {
-            console.log('[POLLING DEBUG] Adding status message:', msg);
-            addChatMessage(msg, 'system');
+            console.log('[POLLING DEBUG] Raw message:', msg);
+            console.log('[POLLING DEBUG] Message type check - startsWith "User: ":', msg.startsWith('User: '));
+            console.log('[POLLING DEBUG] First 10 chars:', msg.substring(0, 10));
+            console.log('[POLLING DEBUG] Char codes:', Array.from(msg.substring(0, 10)).map(c => c.charCodeAt(0)));
+
+            // Parse message type based on content
+            if (msg.startsWith('User: ')) {
+              // Transcription message - extract the text and add as user message
+              const transcriptionText = msg.substring(6); // Remove "User: " prefix
+              console.log('[POLLING DEBUG] ✅ DETECTED USER MESSAGE - transcription:', transcriptionText);
+              addChatMessage(transcriptionText, 'user');
+            } else {
+              // All other status messages (reasoning, video, etc.)
+              console.log('[POLLING DEBUG] Adding as system message');
+              addChatMessage(msg, 'system');
+            }
           });
 
           // Update the count of seen status messages

@@ -138,10 +138,10 @@ class VideoResponseProcessor(FrameProcessor):
 
 class UserSpeakingProcessor(FrameProcessor):
     """
-    Processor that monitors user speaking state and sends updates to the frontend.
+    Processor that monitors user speaking state and transcriptions, sending updates to the frontend.
 
-    Listens for UserStartedSpeakingFrame and UserStoppedSpeakingFrame from the
-    pipeline and sends RTVI status updates to the connected clients.
+    Listens for UserStartedSpeakingFrame, UserStoppedSpeakingFrame, and TranscriptionFrame
+    from the pipeline and sends RTVI status updates to the connected clients.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -157,6 +157,16 @@ class UserSpeakingProcessor(FrameProcessor):
         elif isinstance(frame, UserStoppedSpeakingFrame):
             logger.info("🔇 User stopped speaking")
             await status_updater.update_user_speaking(False)
+
+        # Capture transcriptions and send to frontend
+        elif isinstance(frame, TranscriptionFrame):
+            transcription_text = frame.text
+            logger.info(f"📝 [TRANSCRIPTION CAPTURE] User said: {transcription_text}")
+            # Send transcription to frontend as a user message
+            await status_updater.update_status(
+                f"User: {transcription_text}",
+                {"type": "transcription", "text": transcription_text, "role": "user"}
+            )
 
         # Always pass frames through
         await self.push_frame(frame, direction)
@@ -305,10 +315,10 @@ async def run_bot(room_url, token, identifier, data=None):
     conversation_pipeline = Pipeline(
         [
             transport.input(),  # Websocket input from client
-            user_speaking_processor,  # Monitor user speaking state
             rtvi,
             # stt_mute_filter removed - blocking transcription
             stt,  # Speech-To-Text
+            user_speaking_processor,  # Monitor user speaking state AND capture transcriptions (MUST be after STT)
             context_aggregator.user(),
             llm,  # LLM
             # video_response_processor,  # Replace LLM text with video descriptions - TEMPORARILY DISABLED
@@ -358,6 +368,63 @@ async def run_bot(room_url, token, identifier, data=None):
 
     rtvi.register_action(uioverride_response_action)
 
+    # Background task to sync LLM context messages to HTTP status
+    async def sync_context_messages():
+        """Periodically sync the LLM context messages to the HTTP status endpoint.
+
+        This runs completely outside the pipeline and just reads the existing
+        context_aggregator messages, then updates the HTTP endpoint.
+        """
+        try:
+            while True:
+                await asyncio.sleep(0.5)  # Sync every 500ms
+
+                # Get current LLM context messages from the assistant's context
+                # The context_aggregator is a pair, we access the assistant context
+                messages = []
+                try:
+                    # Access the messages from the assistant's context
+                    if hasattr(context_aggregator, 'assistant'):
+                        assistant_context = context_aggregator.assistant()
+                        if hasattr(assistant_context, '_context') and hasattr(assistant_context._context, 'messages'):
+                            messages = assistant_context._context.messages
+                            logger.info(f"[CONTEXT SYNC] Found {len(messages)} messages in context")
+                        else:
+                            logger.debug("[CONTEXT SYNC] No _context.messages found")
+                    else:
+                        logger.debug("[CONTEXT SYNC] No assistant() method on context_aggregator")
+                except Exception as e:
+                    logger.warning(f"[CONTEXT SYNC] Error accessing context messages: {e}")
+
+                # Convert to simple dict format for frontend
+                formatted_messages = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        formatted_messages.append({
+                            "role": msg.get("role", "unknown"),
+                            "content": msg.get("content", "")
+                        })
+
+                if formatted_messages:
+                    logger.info(f"[CONTEXT SYNC] Syncing {len(formatted_messages)} formatted messages")
+
+                # Update the participant status via HTTP
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        await session.post(
+                            "http://localhost:8765/sync-context",
+                            json={
+                                "identifier": identifier,
+                                "messages": formatted_messages
+                            },
+                            timeout=aiohttp.ClientTimeout(total=0.5)
+                        )
+                    except Exception as e:
+                        # Non-critical, just log at debug level
+                        logger.debug(f"[CONTEXT SYNC] HTTP POST error (non-critical): {e}")
+        except asyncio.CancelledError:
+            logger.info("Context sync task cancelled")
+
     @transport.event_handler("on_participant_joined")
     async def on_participant_joined(transport, participant):
         #await audiobuffer.start_recording()
@@ -372,7 +439,11 @@ async def run_bot(room_url, token, identifier, data=None):
             
             # Start transcription for the user
             await transport.capture_participant_transcription(participant_id)
-            
+
+            # Start background task to sync LLM context messages
+            asyncio.create_task(sync_context_messages())
+            logger.info("Started background task to sync LLM context messages")
+
             # Initialize the flow manager
             await flow_manager.initialize()
 

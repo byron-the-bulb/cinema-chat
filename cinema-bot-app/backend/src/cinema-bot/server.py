@@ -513,6 +513,31 @@ async def update_conversation_status(request: Request):
     return JSONResponse(participant_status[identifier])
 
 
+@app.post("/sync-context")
+async def sync_context_messages(request: Request):
+    """Sync LLM context messages to participant status.
+
+    This endpoint receives the full LLM conversation context (user + assistant messages)
+    from the bot's context_aggregator and stores it in participant_status.
+
+    Args:
+        request: JSON with {identifier, messages}
+
+    Returns:
+        JSONResponse: Success status
+    """
+    data = await request.json()
+    identifier = data.get("identifier")
+    messages = data.get("messages", [])
+
+    if identifier and identifier in participant_status:
+        # Update the LLM context messages
+        participant_status[identifier]["context"]["messages"] = messages
+        return JSONResponse({"success": True, "message_count": len(messages)})
+
+    return JSONResponse({"success": False, "error": "Identifier not found"}, status_code=404)
+
+
 @app.get("/api/pi/audio-devices")
 async def get_pi_audio_devices():
     """Get list of available audio input devices on the Raspberry Pi.
