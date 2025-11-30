@@ -34,9 +34,12 @@ const PiAudioDeviceSelector: React.FC = () => {
       const data = await response.json();
       setDevices(data.devices || []);
 
-      // Select the first device by default if none selected
+      // Select the first device by default for display only
+      // (Actual configuration happens when Pi client starts)
       if (data.devices && data.devices.length > 0 && !selectedDevice) {
-        setSelectedDevice(data.devices[0].alsa_id);
+        const firstDevice = data.devices[0].alsa_id;
+        setSelectedDevice(firstDevice);
+        console.log(`Detected audio device: ${firstDevice} (will be auto-configured on session start)`);
       }
     } catch (err) {
       console.error('Error loading Pi audio devices:', err);

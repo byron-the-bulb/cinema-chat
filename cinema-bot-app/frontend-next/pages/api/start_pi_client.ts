@@ -27,22 +27,42 @@ export default async function handler(
 
     // Spawn a new Pi client for this room
     try {
-      // Clean up all existing Pi processes first
+      // Clean up all existing Pi processes first - MUST succeed to prevent multiple sessions
+      const { exec } = require('child_process');
+      const util = require('util');
+      const execPromise = util.promisify(exec);
+
+      console.log('Cleaning up existing Pi processes...');
+
+      // Run the cleanup script locally (Next.js is running on the Pi)
       try {
-        const { exec } = require('child_process');
-        const util = require('util');
-        const execPromise = util.promisify(exec);
+        const { stdout } = await execPromise('bash /home/twistedtv/cleanup_pi.sh');
+        console.log('Cleanup output:', stdout);
 
-        console.log('Cleaning up existing Pi processes...');
+        // Verify cleanup actually worked by checking for running processes
+        const { stdout: verifyOutput } = await execPromise('ps aux | grep -E "pi_daily_client_simple_fixed.py" | grep -v grep || echo "CLEAN"');
 
-        // Run the cleanup script on the Pi
-        try {
-          const { stdout } = await execPromise('ssh twistedtv@192.168.1.201 "bash /home/twistedtv/cleanup_pi.sh"');
-          console.log('Cleanup output:', stdout);
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for cleanup to complete
-        } catch (cleanupErr: any) {
-          console.error('Cleanup error (continuing anyway):', cleanupErr.message);
+        if (!verifyOutput.includes('CLEAN')) {
+          console.error('Cleanup verification failed - processes still running:', verifyOutput);
+          return res.status(500).json({
+            success: false,
+            error: 'Failed to cleanup existing Pi processes. Please manually kill them before starting a new session.',
+            details: verifyOutput
+          });
         }
+
+        console.log('Cleanup verification: All Pi client processes terminated');
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for cleanup to complete
+      } catch (cleanupErr: any) {
+        console.error('Cleanup failed:', cleanupErr.message);
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to cleanup existing Pi processes',
+          details: cleanupErr.message
+        });
+      }
+
+      try {
 
         // Start new video service with nohup and capture PID
         const videoServiceCmd = 'cd /home/twistedtv && nohup python3 video_playback_service_mpv.py > /tmp/video_mpv.log 2>&1 & echo $!';
@@ -81,15 +101,48 @@ export default async function handler(
         // Don't fail the entire request if video service fails to start
       }
 
-      // Read the configured audio device if available
+      // Auto-detect and configure audio device before starting Pi client
       let audioDevice = 'default';
       try {
         const fs = require('fs');
-        if (fs.existsSync('/home/twistedtv/audio_device.conf')) {
-          audioDevice = fs.readFileSync('/home/twistedtv/audio_device.conf', 'utf-8').trim();
+        const { exec } = require('child_process');
+        const util = require('util');
+        const execPromise = util.promisify(exec);
+
+        // Detect available audio devices
+        try {
+          const { stdout } = await execPromise('arecord -l');
+          const lines = stdout.split('\n');
+
+          // Find first audio capture device
+          for (const line of lines) {
+            const cardMatch = line.match(/^card\s+(\d+):/);
+            if (cardMatch) {
+              const cardNum = parseInt(cardMatch[1]);
+              const deviceMatch = line.match(/device\s+(\d+):/);
+              const deviceNum = deviceMatch ? parseInt(deviceMatch[1]) : 0;
+
+              // Use plughw format
+              audioDevice = `plughw:${cardNum},${deviceNum}`;
+              console.log(`Auto-detected audio device: ${audioDevice}`);
+
+              // Write to config file for future reference
+              fs.writeFileSync('/home/twistedtv/audio_device.conf', audioDevice, 'utf-8');
+              break;
+            }
+          }
+        } catch (detectErr) {
+          console.warn('Could not auto-detect audio device, checking config file...');
+          // Fall back to config file if auto-detection fails
+          if (fs.existsSync('/home/twistedtv/audio_device.conf')) {
+            audioDevice = fs.readFileSync('/home/twistedtv/audio_device.conf', 'utf-8').trim();
+            console.log(`Using audio device from config: ${audioDevice}`);
+          } else {
+            console.log('No audio device config found, using default');
+          }
         }
       } catch (err) {
-        console.log('No audio device config found, using default');
+        console.log('Error reading audio config, using default:', err);
       }
 
       const env = {

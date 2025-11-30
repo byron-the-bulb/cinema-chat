@@ -23,7 +23,8 @@ class StatusUpdater:
             logger.info(f"Room URL for reference: {room_url}")
     
     async def update_status(self, status, context=None,ui_override=None):
-        logger.info(f"Updating status: {status} with UI override: {ui_override}")
+        logger.info(f"[MESSAGE DELIVERY] StatusUpdater.update_status called with: {status[:100]}...")
+        logger.info(f"[MESSAGE DELIVERY] UI override: {ui_override}")
         if not self.rtvi:
             logger.error("StatusUpdater not initialized with RTVI processor")
             return False
@@ -34,6 +35,7 @@ class StatusUpdater:
             "status_context": context,
             "ui_override": ui_override  # Structured UI override data
         }
+        logger.info(f"[MESSAGE DELIVERY] Sending message to identifier: {self.identifier}")
 
         try:
             # Send status via RTVI to connected clients
@@ -42,13 +44,16 @@ class StatusUpdater:
 
             # Also update the HTTP-accessible status for polling clients
             try:
+                logger.info(f"[MESSAGE DELIVERY] Posting to /update-status endpoint...")
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         "http://localhost:8765/update-status",
                         json=data,
                         timeout=aiohttp.ClientTimeout(total=1.0)
                     ) as response:
-                        if response.status != 200:
+                        if response.status == 200:
+                            logger.info(f"[MESSAGE DELIVERY] Successfully posted message to HTTP endpoint")
+                        else:
                             logger.warning(f"Failed to update HTTP status: {response.status}")
             except asyncio.TimeoutError:
                 logger.warning("Timeout updating HTTP status (non-critical)")

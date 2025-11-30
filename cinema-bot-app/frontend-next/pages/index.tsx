@@ -50,9 +50,11 @@ export default function Home() {
     if (!text) return;
     console.log(`Adding ${type} message: ${text}`);
     setChatMessages(prevMessages => {
-      const isDuplicate = prevMessages.some(
-        msg => msg.text === text && msg.type === type &&
-          (new Date().getTime() - msg.timestamp.getTime() < 2000)
+      // Only check for exact duplicates in the last 2 messages (immediate duplicates only)
+      // This prevents blocking legitimate messages that arrive in batches from polling
+      const recentMessages = prevMessages.slice(-2);
+      const isDuplicate = recentMessages.some(
+        msg => msg.text === text && msg.type === type
       );
       if (isDuplicate) {
         console.log(`Prevented duplicate message: ${text}`);

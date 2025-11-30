@@ -418,18 +418,33 @@ async def get_conversation_status(identifier: str, last_seen: int = 0):
         JSONResponse: Conversation status information with only new messages
     """
     # Look up by participant ID
-    print(f"Looking up conversation status for: {identifier} (last_seen={last_seen})")
+    print(f"[MESSAGE DELIVERY] GET request for identifier: {identifier} (last_seen={last_seen})")
     if identifier in participant_status:
-        print(f"Conversation status found for: {identifier}")
-        status_data = participant_status[identifier].copy()
+        print(f"[MESSAGE DELIVERY] Found participant status for: {identifier}")
+
+        # Build response dict (don't modify the original!)
+        status_data = {
+            "status": participant_status[identifier].get("status"),
+            "identifier": participant_status[identifier].get("identifier"),
+            "status_context": participant_status[identifier].get("status_context"),
+            "ui_override": participant_status[identifier].get("ui_override")
+        }
 
         # Only return new status messages (pagination)
-        if "context" in status_data and "status_messages" in status_data["context"]:
-            all_messages = status_data["context"]["status_messages"]
+        if "context" in participant_status[identifier] and "status_messages" in participant_status[identifier]["context"]:
+            all_messages = participant_status[identifier]["context"]["status_messages"]
             new_messages = all_messages[last_seen:]
-            status_data["context"]["status_messages"] = new_messages
-            status_data["context"]["total_message_count"] = len(all_messages)
-            print(f"Returning {len(new_messages)} new status messages (total: {len(all_messages)})")
+            # Create a NEW context dict for the response (don't modify original!)
+            status_data["context"] = {
+                "status_messages": new_messages,
+                "total_message_count": len(all_messages)
+            }
+            print(f"[MESSAGE DELIVERY] Returning {len(new_messages)} new messages (total stored: {len(all_messages)}, last_seen: {last_seen})")
+            if new_messages:
+                for i, msg in enumerate(new_messages):
+                    print(f"[MESSAGE DELIVERY] Message {last_seen + i}: {msg[:80]}...")
+        else:
+            status_data["context"] = {}
 
         return JSONResponse(status_data)
 
@@ -491,7 +506,9 @@ async def update_conversation_status(request: Request):
         if "status_messages" not in participant_status[identifier]["context"]:
             participant_status[identifier]["context"]["status_messages"] = []
         participant_status[identifier]["context"]["status_messages"].append(status_text)
-        print(f"Added status message: {status_text[:100]}...")
+        message_count = len(participant_status[identifier]["context"]["status_messages"])
+        print(f"[MESSAGE DELIVERY] Added status message #{message_count}: {status_text[:100]}...")
+        print(f"[MESSAGE DELIVERY] Total messages stored: {message_count}")
 
     return JSONResponse(participant_status[identifier])
 

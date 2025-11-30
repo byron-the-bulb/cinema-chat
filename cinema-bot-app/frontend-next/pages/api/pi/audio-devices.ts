@@ -52,8 +52,8 @@ export default async function handler(
           const deviceMatch = line.match(/device\s+(\d+):/);
           const deviceNum = deviceMatch ? parseInt(deviceMatch[1]) : 0;
 
-          // Create ALSA device ID
-          const alsaId = `hw:${cardNum},${deviceNum}`;
+          // Create ALSA device ID (use plughw for better compatibility)
+          const alsaId = `plughw:${cardNum},${deviceNum}`;
 
           devices.push({
             card: cardNum,

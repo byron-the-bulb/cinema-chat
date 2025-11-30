@@ -4,7 +4,6 @@
 
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
 
 const AUDIO_CONFIG_FILE = '/home/twistedtv/audio_device.conf';
 
@@ -23,10 +22,10 @@ export default async function handler(
       return res.status(400).json({ error: 'device_id is required' });
     }
 
-    // Validate ALSA device ID format (e.g., hw:1,0)
-    if (!/^hw:\d+,\d+$/.test(device_id)) {
+    // Validate ALSA device ID format (e.g., hw:1,0 or plughw:1,0)
+    if (!/^(plug)?hw:\d+,\d+$/.test(device_id)) {
       return res.status(400).json({
-        error: 'Invalid device_id format. Expected format: hw:CARD,DEVICE (e.g., hw:1,0)'
+        error: 'Invalid device_id format. Expected format: hw:CARD,DEVICE or plughw:CARD,DEVICE (e.g., hw:1,0 or plughw:1,0)'
       });
     }
 
