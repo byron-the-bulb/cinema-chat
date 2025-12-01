@@ -442,7 +442,9 @@ async def get_conversation_status(identifier: str, last_seen: int = 0):
             print(f"[MESSAGE DELIVERY] Returning {len(new_messages)} new messages (total stored: {len(all_messages)}, last_seen: {last_seen})")
             if new_messages:
                 for i, msg in enumerate(new_messages):
-                    print(f"[MESSAGE DELIVERY] Message {last_seen + i}: {msg[:80]}...")
+                    # Handle both old string format and new object format for logging
+                    msg_preview = msg.get('text', str(msg))[:80] if isinstance(msg, dict) else str(msg)[:80]
+                    print(f"[MESSAGE DELIVERY] Message {last_seen + i}: {msg_preview}...")
         else:
             status_data["context"] = {}
 

@@ -47,6 +47,13 @@ export default function Home() {
   };
 
   const addChatMessage = useCallback((text: string, type: MessageType) => {
+    // Safety check: ensure text is actually a string
+    if (typeof text === 'object') {
+      console.error('[addChatMessage] ERROR: Received object instead of string:', text);
+      // Try to extract text from object
+      text = (text as any).text || JSON.stringify(text);
+    }
+
     if (!text) {
       console.log('[addChatMessage] Empty text, returning');
       return;
@@ -64,13 +71,16 @@ export default function Home() {
         console.log(`[addChatMessage] ❌ PREVENTED DUPLICATE: type="${type}", text="${text}"`);
         return prevMessages;
       }
+      // Final safety check - ensure text is a string
+      const safeText = typeof text === 'string' ? text : String(text);
+
       const newMessage = {
         id: generateUniqueId(),
-        text,
+        text: safeText,
         type,
         timestamp: new Date()
       };
-      console.log(`[addChatMessage] ✅ ADDING MESSAGE: type="${type}", text="${text}"`);
+      console.log(`[addChatMessage] ✅ ADDING MESSAGE: type="${type}", text="${safeText}"`);
       return [...prevMessages, newMessage];
     });
   }, []);
@@ -327,7 +337,7 @@ export default function Home() {
               if (msg.role === 'user') {
                 addChatMessage(msg.content || '[User spoke]', 'user');
               } else if (msg.role === 'assistant') {
-                addChatMessage(msg.content || '[Bot responded]', 'guide');
+                addChatMessage(msg.content || '[Bot responded]', 'bot');
               } else if (msg.role === 'system' || msg.type === 'system') {
                 addChatMessage(msg.content || msg.text, 'system');
               }
@@ -349,22 +359,56 @@ export default function Home() {
         if (data.context && data.context.status_messages) {
           const statusMessages = data.context.status_messages;
           console.log('[POLLING DEBUG] Processing status messages:', statusMessages);
-          statusMessages.forEach((msg: string) => {
-            console.log('[POLLING DEBUG] Raw message:', msg);
-            console.log('[POLLING DEBUG] Message type check - startsWith "User: ":', msg.startsWith('User: '));
-            console.log('[POLLING DEBUG] First 10 chars:', msg.substring(0, 10));
-            console.log('[POLLING DEBUG] Char codes:', Array.from(msg.substring(0, 10)).map(c => c.charCodeAt(0)));
+          statusMessages.forEach((msg: any) => {
+            // Handle both old format (string) and new format (object with text + context)
+            let messageText: string;
+            let messageContext: any = null;
 
-            // Parse message type based on content
-            if (msg.startsWith('User: ')) {
-              // Transcription message - extract the text and add as user message
-              const transcriptionText = msg.substring(6); // Remove "User: " prefix
-              console.log('[POLLING DEBUG] ✅ DETECTED USER MESSAGE - transcription:', transcriptionText);
-              addChatMessage(transcriptionText, 'user');
+            if (typeof msg === 'string') {
+              // Old format: plain string
+              messageText = msg;
+            } else if (typeof msg === 'object' && msg !== null) {
+              // New format: object with text and context
+              messageText = msg.text || JSON.stringify(msg);
+              messageContext = msg.context || null;
             } else {
-              // All other status messages (reasoning, video, etc.)
+              // Fallback: convert to string
+              messageText = String(msg);
+            }
+
+            console.log('[POLLING DEBUG] Raw msg object:', JSON.stringify(msg));
+            console.log('[POLLING DEBUG] messageText type:', typeof messageText);
+            console.log('[POLLING DEBUG] messageText value:', messageText);
+            console.log('[POLLING DEBUG] Message context:', messageContext);
+
+            // Determine message type from context metadata (preferred) or text prefix (fallback)
+            if (messageContext && messageContext.role === 'user') {
+              // Use context metadata to identify user messages
+              const transcriptionText = messageContext.text || messageText.replace(/^User: /, '');
+              console.log('[POLLING DEBUG] ✅ DETECTED USER MESSAGE (from context):', transcriptionText);
+              addChatMessage(transcriptionText, 'user');
+            } else if (messageText && typeof messageText === 'string' && messageText.startsWith('User: ')) {
+              // Fallback: parse from text prefix if no context available
+              const transcriptionText = messageText.substring(6);
+              console.log('[POLLING DEBUG] ✅ DETECTED USER MESSAGE (from prefix):', transcriptionText);
+              addChatMessage(transcriptionText, 'user');
+            } else if (messageText && typeof messageText === 'string' && messageText.startsWith('[REASONING]')) {
+              // Bot reasoning messages
+              console.log('[POLLING DEBUG] ✅ DETECTED REASONING MESSAGE:', messageText.substring(0, 50));
+              addChatMessage(messageText, 'reasoning');
+            } else if (messageText && typeof messageText === 'string' && messageText.startsWith('[VIDEO:')) {
+              // Video selection messages
+              console.log('[POLLING DEBUG] ✅ DETECTED VIDEO MESSAGE:', messageText.substring(0, 50));
+              addChatMessage(messageText, 'video');
+            } else if (messageText && typeof messageText === 'string' && messageText.startsWith('[SEARCH RESULTS]')) {
+              // Search results messages
+              console.log('[POLLING DEBUG] ✅ DETECTED SEARCH RESULTS:', messageText.substring(0, 50));
+              addChatMessage(messageText, 'bot');
+            } else {
+              // All other status messages (system notifications, etc.)
               console.log('[POLLING DEBUG] Adding as system message');
-              addChatMessage(msg, 'system');
+              console.log('[POLLING DEBUG] About to call addChatMessage with:', { messageText, type: typeof messageText });
+              addChatMessage(messageText, 'system');
             }
           });
 

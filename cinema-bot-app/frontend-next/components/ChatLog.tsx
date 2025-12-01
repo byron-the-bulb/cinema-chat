@@ -5,7 +5,7 @@ import styles from '@/styles/ChatLog.module.css';
 import { RTVIMessage } from '@pipecat-ai/client-js';
 
 // Message types
-export type MessageType = 'system' | 'user' | 'guide' | 'status';
+export type MessageType = 'system' | 'user' | 'bot' | 'reasoning' | 'video' | 'status';
 
 // Chat message interface
 export interface ChatMessage {
@@ -22,12 +22,45 @@ interface ChatLogProps {
   uiOverride: any | null;
 }
 
-const ChatLog: React.FC<ChatLogProps> = ({ messages, isWaitingForUser, isUserSpeaking, uiOverride }) => {
+const ChatLog: React.FC<ChatLogProps> = ({ messages: rawMessages, isWaitingForUser, isUserSpeaking, uiOverride }) => {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const uiOverrideRef = useRef<HTMLDivElement>(null);
   const client = useRTVIClient();
   const [selectedOption, setSelectedOption] = useState('');
-  
+
+  // ULTRA CRITICAL: Immediately clean incoming messages to prevent ANY React errors
+  // This must happen BEFORE anything else
+  const messages = rawMessages.map((msg, idx) => {
+    if (msg && typeof msg.text !== 'string') {
+      const safeText = typeof msg.text === 'object' && msg.text !== null && 'text' in msg.text
+        ? String((msg.text as any).text || JSON.stringify(msg.text))
+        : String(msg.text || '[Invalid message]');
+      console.error(`[ChatLog] EMERGENCY: Fixed non-string at index ${idx}:`, msg.text, '→', safeText);
+      return { ...msg, text: safeText };
+    }
+    return msg;
+  });
+
+  // CRITICAL: Clean messages BEFORE rendering to prevent React errors
+  // Use useMemo to ensure this runs before render
+  const safeMessages = React.useMemo(() => {
+    return messages.map((msg, idx) => {
+      if (typeof msg.text !== 'string') {
+        console.error(`[ChatLog] Message ${idx} has non-string text:`, msg.text);
+        const convertedText = typeof msg.text === 'object' && msg.text !== null && 'text' in msg.text
+          ? (msg.text as any).text
+          : JSON.stringify(msg.text);
+        console.error(`[ChatLog] Converted to:`, convertedText);
+        console.error(`[ChatLog] Type after conversion:`, typeof convertedText);
+        return {
+          ...msg,
+          text: convertedText
+        };
+      }
+      return msg;
+    });
+  }, [messages]);
+
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     if (chatEndRef.current) {
@@ -106,7 +139,7 @@ const ChatLog: React.FC<ChatLogProps> = ({ messages, isWaitingForUser, isUserSpe
       </div>
 
       <div className={styles.chatMessages}>
-        {messages.map((message) => (
+        {safeMessages.map((message) => (
           <div 
             key={message.id} 
             className={`${styles.chatMessage} ${styles[`message${message.type.charAt(0).toUpperCase() + message.type.slice(1)}`]}`}
@@ -114,19 +147,18 @@ const ChatLog: React.FC<ChatLogProps> = ({ messages, isWaitingForUser, isUserSpe
             <div className={styles.messageHeader}>
               <span className={styles.messageType}>
                 {message.type === 'user' ? 'Participant' :
-                 message.type === 'guide' ? (
-                   message.text.startsWith('[REASONING]') ? 'Reasoning' :
-                   message.text.startsWith('[SEARCH RESULTS]') ? 'Search Results' :
-                   message.text.startsWith('[VIDEO:') ? 'Video' :
-                   'Cinema Chat'
-                 ) :
+                 message.type === 'bot' ? 'Cinema Chat' :
+                 message.type === 'reasoning' ? 'Reasoning' :
+                 message.type === 'video' ? 'Video' :
                  message.type === 'system' ? 'System' : 'Status'}
               </span>
               <span className={styles.messageTime}>
                 {message.timestamp.toLocaleTimeString()}
               </span>
             </div>
-            <div className={styles.messageContent}>{message.text}</div>
+            <div className={styles.messageContent}>
+              {typeof message.text === 'string' ? message.text : JSON.stringify(message.text)}
+            </div>
           </div>
         ))}
         {uiOverride && (

@@ -93,10 +93,22 @@
   border: 1px solid #bbdefb;
 }
 
-.messageGuide {
+.messageBot {
   align-self: flex-start;
   background-color: #e8eaf6;
   border: 1px solid #c5cae9;
+}
+
+.messageReasoning {
+  align-self: flex-start;
+  background-color: #fff3e0;
+  border: 1px solid #ffcc80;
+}
+
+.messageVideo {
+  align-self: flex-start;
+  background-color: #e1f5fe;
+  border: 1px solid #81d4fa;
 }
 
 .messageSystem, .messageStatus {
@@ -142,8 +154,16 @@
   color: #1976d2;
 }
 
-.messageGuide .messageType {
+.messageBot .messageType {
   color: #512da8;
+}
+
+.messageReasoning .messageType {
+  color: #e65100;
+}
+
+.messageVideo .messageType {
+  color: #0277bd;
 }
 
 .messageSystem .messageType,
