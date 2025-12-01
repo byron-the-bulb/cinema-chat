@@ -1,16 +1,23 @@
-# Sphinx Voice Bot Frontend (Next.js)
+# Cinema Chat Frontend (Next.js)
 
-This is a Next.js 15.3 implementation of the Sphinx Voice Bot guide interface that provides real-time voice conversations with emotion analysis and feedback.
+This is a Next.js 15.3 implementation of the Cinema Chat interface that provides real-time voice conversations where the bot responds through contextually appropriate movie clips displayed on a TV.
 
 ## Features
 
 - Built with Next.js 15.3 and React 19
 - Integrated with Pipecat SDK using Daily Transport for audio streaming
-- Real-time emotion analysis through Hume AI integration
+- Real-time speech-to-text using Whisper
+- Semantic video search integration via MCP (Model Context Protocol)
 - API endpoints for connecting to RunPod GPU instances
-- Multiple TTS providers (Cartesia, ElevenLabs, OpenAI)
-- Voice selection and configuration with emotion customization
 - Chat history and conversation visualization
+- **No TTS** - Bot responds exclusively through video clips
+
+## Key Difference from Traditional Voice Bots
+
+Unlike traditional voice bots that use Text-to-Speech (TTS), Cinema Chat responds through old movie clips:
+- LLM generates semantic descriptions of desired scenes/emotions
+- MCP server searches video library using GoodCLIPS semantic search
+- Selected video clips play on TV as the bot's "voice"
 
 ## Getting Started
 
@@ -32,7 +39,7 @@ npm run dev
 yarn dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to interact with the Sphinx Voice Bot.
+Open [http://localhost:3000](http://localhost:3000) with your browser to interact with Cinema Chat.
 
 ## Environment Variables
 
@@ -43,47 +50,44 @@ Create a `.env.local` file with the following variables:
 NEXT_PUBLIC_API_URL=http://localhost:3000/api
 NEXT_PUBLIC_WS_URL=ws://localhost:3000
 
-# RunPod Configuration
+# RunPod Configuration (optional - for cloud deployment)
 NEXT_PUBLIC_RUNPOD_TEMPLATE_ID=your_runpod_template_id
-
-# TTS Configuration
-DEFAULT_VOICE_ID=ec58877e-44ae-4581-9078-a04225d42bd4
-DEFAULT_TTS_MODEL=sonic-turbo-2025-03-07
-
-# External API keys for TTS
-NEXT_PUBLIC_CARTESIA_API_KEY=your_cartesia_api_key
-CARTESIA_API_KEY=your_cartesia_api_key
-ELEVENLABS_API_KEY=your_elevenlabs_api_key
-OPENAI_API_KEY=your_openai_api_key
-
-# For API routes (server-side)
 RUNPOD_API_KEY=your_runpod_api_key
+
+# Daily.co Configuration (for WebRTC audio transport)
 DAILY_API_KEY=your_daily_api_key
-HUME_API_KEY=your_hume_api_key
+
+# LLM Configuration
+OPENAI_API_KEY=your_openai_api_key
 
 # AWS CloudWatch Configuration (optional)
 AWS_ACCESS_KEY_ID=your_aws_access_key
 AWS_SECRET_ACCESS_KEY=your_aws_secret_key
 AWS_REGION=us-east-1
-CLOUDWATCH_LOG_GROUP=/sphinx-voice-bot
+CLOUDWATCH_LOG_GROUP=/cinema-chat
 
 # Whisper STT Configuration
-SPHINX_WHISPER_DEVICE=cuda
+WHISPER_DEVICE=cuda  # or cpu
 ```
 
 ## Architecture
 
 The frontend application follows this flow:
 
-1. User accesses the web interface and initiates a conversation
-2. Frontend calls `/api/connect` which:
+1. User speaks into phone connected to computer's audio input
+2. Browser captures audio via Web Audio API
+3. Frontend calls `/api/connect` or `/api/connect_local` which:
    - Creates a Daily.co room for audio communication
-   - Launches a Sphinx bot instance on RunPod with GPU acceleration
+   - Launches a Cinema Chat bot instance (locally or on RunPod with GPU acceleration)
    - Returns connection credentials to the frontend
-3. Frontend establishes connection with the bot through Daily.co
-4. Real-time audio is processed through the Pipecat SDK with Daily Transport
-5. Conversation is managed by the backend bot with emotion analysis
-6. UI components update based on conversation state and analysis results
+4. Frontend establishes connection with the bot through Daily.co
+5. Real-time audio is processed through the Pipecat SDK with Daily Transport
+6. Conversation flow:
+   - User audio → Whisper STT → Text
+   - Text → LLM → Semantic video description
+   - LLM calls MCP tools to search and play video
+   - Video plays on TV (secondary monitor)
+7. UI components update based on conversation state and video selections
 
 ## RunPod Execution Details
 
@@ -95,12 +99,12 @@ The frontend integrates with RunPod to provide on-demand GPU-accelerated bot ins
    - When a user initiates a conversation, the frontend calls the `/api/connect` endpoint
    - This endpoint performs two key operations:
      1. Creating a Daily.co room for audio communication
-     2. Spawning a new Sphinx bot instance on RunPod
+     2. Spawning a new Cinema Chat bot instance on RunPod
 
 2. **RunPod Pod Provisioning**:
    - The system uses the RunPod GraphQL API to create a new pod instance
    - The API call specifies resource requirements (GPU type, CPU, memory)
-   - A pre-configured Docker image with the Sphinx bot is deployed
+   - A pre-configured Docker image with the Cinema Chat bot is deployed
    - Environment variables for API keys, room URL, and tokens are passed to the container
 
 3. **Failover Mechanism**:
@@ -114,8 +118,7 @@ The frontend integrates with RunPod to provide on-demand GPU-accelerated bot ins
      5. Additional fallback options with other GPUs
 
 4. **Configuration and Environment**:
-   - The TTS configuration (voice, model, speed, emotion) from the frontend UI is passed to the pod
-   - API keys for OpenAI, Hume, Cartesia/ElevenLabs are securely passed as environment variables
+   - API keys for OpenAI and other services are securely passed as environment variables
    - AWS CloudWatch configuration is provided for logging
    - The pod connects to the Daily room using the provided credentials
 
@@ -123,22 +126,21 @@ The frontend integrates with RunPod to provide on-demand GPU-accelerated bot ins
 
 The system requires a RunPod template with the following specifications:
 
-- **Docker Image**: The Sphinx Voice Bot Docker image
+- **Docker Image**: The Cinema Chat Docker image
 - **Environment Variables**:
   - `DAILY_ROOM_URL` - Set at runtime
   - `DAILY_TOKEN` - Set at runtime
   - `IDENTIFIER` - Set at runtime
-  - `TTS_CONFIG` - Set at runtime based on user preferences
   - Other API keys passed from frontend environment
 
 - **Resource Requirements**:
-  - GPU: NVIDIA CUDA compatible (RTX 4000/4090 recommended)
+  - GPU: NVIDIA CUDA compatible (RTX 4000/4090 recommended) for Whisper STT
   - Memory: 15-24GB minimum
   - CPU: 4-8 cores recommended
 
-### Implementation in `connect.ts`
+### Implementation in `connect_runpod.ts`
 
-The `/api/connect.ts` file contains the core implementation:
+The `/api/connect_runpod.ts` file contains the core implementation:
 
 ```typescript
 // RunPod GraphQL mutation to create pod
@@ -177,15 +179,17 @@ Which is then used in the `launchRunPodInstance` and `attemptRunPodLaunch` funct
 ## Project Structure
 
 - `pages/` - Next.js pages and API routes
-  - `index.tsx` - Main application page with voice bot UI
-  - `api/connect.ts` - Creates a Daily room and launches a Sphinx bot on RunPod
+  - `index.tsx` - Main application page with Cinema Chat UI
+  - `api/connect_runpod.ts` - Creates a Daily room and launches a Cinema Chat bot on RunPod
   - `api/connect_local.ts` - Local development version of connect endpoint
+  - `api/start_pi_client.ts` - Starts Raspberry Pi Daily client for audio/video
+  - `api/cleanup_pi.ts` - Cleans up Pi processes
+  - `api/trigger_video.ts` - Manual video trigger for testing
 - `components/` - React components
-  - `ChatLog.tsx` - Displays conversation history
-  - `EmotionSelector.tsx` - UI for selecting emotions
-  - `SpeedSelector.tsx` - Controls for TTS speed
-  - `VoiceSelector.tsx` - Voice selection interface
-  - `VoiceSettingsPanel.tsx` - TTS configuration panel
+  - `ChatLog.tsx` - Displays conversation history and transcriptions
+  - `LoadingSpinner.tsx` - Loading indicator
+  - `AudioDeviceSelector.tsx` - Local audio device selection
+  - `PiAudioDeviceSelector.tsx` - Raspberry Pi audio device selection
 - `styles/` - CSS and styling
 - `lib/` - Utility functions and API clients
 - `types/` - TypeScript type definitions
@@ -199,7 +203,6 @@ Which is then used in the `launchRunPodInstance` and `attemptRunPodLaunch` funct
   - `@pipecat-ai/client-js` - Core client library
   - `@pipecat-ai/client-react` - React components and hooks
   - `@pipecat-ai/daily-transport` - Integration with Daily.co
-- **Cartesia** - Text-to-speech service
 - **Styled Components** - CSS-in-JS styling solution
 
 ## Development Guide
@@ -208,17 +211,41 @@ Which is then used in the `launchRunPodInstance` and `attemptRunPodLaunch` funct
 
 To use a local backend instead of RunPod:
 
-1. Start the backend server locally (see backend README)
-2. Set `NEXT_PUBLIC_API_URL` to use the local endpoint: `http://localhost:3000/api/connect_local`
+1. Start the backend server locally (see backend README):
+   ```bash
+   cd ../backend/src/cinema-bot
+   python server.py
+   ```
+2. Start the MCP server:
+   ```bash
+   cd ../../../../mcp
+   python mock_server.py  # or python server.py for real GoodCLIPS integration
+   ```
+3. Use `NEXT_PUBLIC_API_URL` to use the local endpoint: `http://localhost:3000/api/connect_local`
+
+### Raspberry Pi Setup
+
+For installation deployment with Raspberry Pi handling video playback:
+
+1. Deploy necessary files to Pi:
+   ```bash
+   cd ../../../../mcp
+   ./deploy_to_pi.sh
+   ```
+2. The Pi runs:
+   - `video_playback_service_mpv.py` - MPV-based video playback
+   - `pi_daily_client_rtvi.py` or `pi_daily_client_rtvi_v2.py` - Daily.co client for audio
+   - Next.js frontend (for local monitoring)
 
 ### Adding New Features
 
 - **New UI Components**: Add to the `components` directory following the existing patterns
 - **API Extensions**: Extend functionality in the `pages/api` directory
-- **TTS Customization**: Modify voice settings in the VoiceSelector and related components
+- **Video Search Customization**: Modify MCP server integration in backend
 
 ### Troubleshooting
 
 - **Daily.co Connection Issues**: Verify your Daily API key and check browser permissions for microphone access
 - **RunPod Deployment Failures**: Check RunPod availability and template configuration
-- **TTS Not Working**: Verify API keys for Cartesia, ElevenLabs, or OpenAI
+- **Video Not Playing**: Check MCP server connection and video playback service on Pi
+- **Audio Issues**: Verify phone input device configuration and Pi audio settings

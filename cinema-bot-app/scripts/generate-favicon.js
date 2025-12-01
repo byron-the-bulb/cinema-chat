@@ -3,8 +3,8 @@ const path = require('path');
 const sharp = require('sharp');
 const toIco = require('to-ico');
 
-const publicDir = path.join(__dirname, '../public');
-const svgPath = path.join(publicDir, 'sphinx.svg');
+const publicDir = path.join(__dirname, '../frontend-next/public');
+const svgPath = path.join(publicDir, 'cinema-chat.svg');
 const sizes = [16, 32, 48, 64, 128, 192, 512];
 
 async function generateFavicons() {
