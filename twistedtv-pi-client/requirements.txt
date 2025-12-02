@@ -1,0 +1,17 @@
+# Daily.co and WebRTC
+daily-python==0.10.1
+pydantic==2.7.1
+
+# Audio processing
+pyaudio==0.2.14
+soundfile==0.12.1
+
+# HTTP
+httpx==0.27.0
+aiohttp==3.9.5
+
+# Video playback (MPV)
+python-mpv==1.0.7
+
+# Utilities
+python-dotenv==1.0.1
