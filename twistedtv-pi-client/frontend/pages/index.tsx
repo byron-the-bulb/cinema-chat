@@ -369,7 +369,7 @@ export default function Home() {
               if (msg.role === 'user') {
                 addChatMessage(msg.content || '[User spoke]', 'user');
               } else if (msg.role === 'assistant') {
-                addChatMessage(msg.content || '[Bot responded]', 'bot');
+                addChatMessage(msg.content || '[Bot responded]', 'reasoning');
               } else if (msg.role === 'system' || msg.type === 'system') {
                 addChatMessage(msg.content || msg.text, 'system');
               }

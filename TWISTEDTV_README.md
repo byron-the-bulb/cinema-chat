@@ -122,6 +122,19 @@ See [twistedtv-server/README.md](twistedtv-server/README.md) for:
 - Environment variable configuration
 - RunPod deployment
 
+**Local Server Installation (with CUDA):**
+```bash
+cd twistedtv-server
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# IMPORTANT: Run CUDA setup script to fix library version mismatch
+./setup_cuda.sh
+```
+
+The `setup_cuda.sh` script creates symbolic links for CUDA libraries. This is required because PyTorch CUDA 11.8 expects CUDA 12 library names, but the installed packages provide CUDA 11 libraries.
+
 #### 3. Pi Client Setup
 See [twistedtv-pi-client/README.md](twistedtv-pi-client/README.md) for:
 - Audio device configuration

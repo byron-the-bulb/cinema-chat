@@ -401,9 +401,56 @@ async def run_bot(room_url, token, identifier, data=None):
                 formatted_messages = []
                 for msg in messages:
                     if isinstance(msg, dict):
+                        content = msg.get("content", "")
+
+                        # For assistant messages with tool calls, extract reasoning AND show tool call logs
+                        if msg.get("role") == "assistant" and "tool_calls" in msg:
+                            tool_calls = msg.get("tool_calls", [])
+                            if tool_calls:
+                                reasoning_parts = []
+                                for tool_call in tool_calls:
+                                    if isinstance(tool_call, dict):
+                                        function_name = tool_call.get("function", {}).get("name", "")
+                                        try:
+                                            arguments = json.loads(tool_call.get("function", {}).get("arguments", "{}"))
+
+                                            # Extract reasoning from play_video_by_params calls
+                                            if function_name == "play_video_by_params":
+                                                reasoning = arguments.get("reasoning", "")
+                                                if reasoning:
+                                                    reasoning_parts.append(f"{reasoning}\n\n→ Calling play_video_by_params")
+                                                else:
+                                                    reasoning_parts.append("→ Calling play_video_by_params")
+                                            # Extract search description from search_video_clips calls
+                                            elif function_name == "search_video_clips":
+                                                description = arguments.get("description", "")
+                                                if description:
+                                                    reasoning_parts.append(f"Searching for: {description}\n\n→ Calling search_video_clips")
+                                                else:
+                                                    reasoning_parts.append("→ Calling search_video_clips")
+                                            # Legacy search_and_play_video function
+                                            elif function_name == "search_and_play_video":
+                                                query = arguments.get("search_query", "")
+                                                if query:
+                                                    reasoning_parts.append(f"Searching for: {query}\n\n→ Calling search_and_play_video")
+                                                else:
+                                                    reasoning_parts.append("→ Calling search_and_play_video")
+                                            elif function_name:
+                                                reasoning_parts.append(f"→ Calling {function_name}")
+                                        except json.JSONDecodeError:
+                                            pass
+
+                                # Append reasoning + tool call info to existing content (if any)
+                                if reasoning_parts:
+                                    tool_info = "\n\n".join(reasoning_parts)
+                                    if content:
+                                        content = f"{content}\n\n{tool_info}"
+                                    else:
+                                        content = tool_info
+
                         formatted_messages.append({
                             "role": msg.get("role", "unknown"),
-                            "content": msg.get("content", "")
+                            "content": content
                         })
 
                 if formatted_messages:
