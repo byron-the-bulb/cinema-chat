@@ -31,6 +31,7 @@ type Stream struct {
 	Duration       string  `json:"duration"`
 	BitRate        string  `json:"bit_rate"`
 	AvgFrameRate   string  `json:"avg_frame_rate,omitempty"`
+	Tags           map[string]string `json:"tags,omitempty"`
 }
 
 // FFprobeResult represents the result of ffprobe
@@ -152,9 +153,64 @@ func (f *FFmpegClient) ExtractSubtitles(videoPath, outputPath string) error {
 
 // ExtractSubtitlesToSRT extracts subtitles and converts to SRT format
 func (f *FFmpegClient) ExtractSubtitlesToSRT(videoPath, outputPath string) error {
+	// Use ffprobe metadata to choose the best English text subtitle stream.
+	meta, err := f.GetVideoMetadata(videoPath)
+	if err != nil {
+		return fmt.Errorf("failed to get video metadata for subtitles: %v", err)
+	}
+
+	type subInfo struct {
+		idx   int
+		codec string
+		lang  string
+	}
+	var subs []subInfo
+	for _, s := range meta.Streams {
+		if s.CodecType != "subtitle" {
+			continue
+		}
+		lang := ""
+		if s.Tags != nil {
+			if v, ok := s.Tags["language"]; ok {
+				lang = v
+			} else if v, ok := s.Tags["LANGUAGE"]; ok {
+				lang = v
+			}
+		}
+		subs = append(subs, subInfo{
+			idx:   len(subs), // index among subtitle streams
+			codec: s.CodecName,
+			lang:  lang,
+		})
+	}
+	if len(subs) == 0 {
+		return fmt.Errorf("no subtitle streams found in video")
+	}
+
+	// Prefer English SubRip > English other > first subtitle.
+	bestIdx := 0
+	hasEnglish := false
+	bestEnglishIdx := -1
+	bestEnglishIsSubrip := false
+	for i, s := range subs {
+		l := strings.ToLower(s.lang)
+		if l == "eng" || l == "en" {
+			if !hasEnglish || (!bestEnglishIsSubrip && s.codec == "subrip") {
+				hasEnglish = true
+				bestEnglishIdx = i
+				bestEnglishIsSubrip = (s.codec == "subrip")
+			}
+		}
+	}
+	if hasEnglish {
+		bestIdx = bestEnglishIdx
+	}
+	best := subs[bestIdx]
+
 	cmd := exec.Command(f.ffmpegPath,
+		"-y", // overwrite any existing SRT, including empty ones
 		"-i", videoPath,
-		"-vn", "-an", "-dn",
+		"-map", fmt.Sprintf("0:s:%d", best.idx),
 		"-c:s", "srt",
 		outputPath)
 
@@ -163,22 +219,8 @@ func (f *FFmpegClient) ExtractSubtitlesToSRT(videoPath, outputPath string) error
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
-	if err != nil {
-		// Try alternative approach - extract all subtitle streams
-		cmd = exec.Command(f.ffmpegPath,
-			"-i", videoPath,
-			"-map", "0:s:0?",
-			"-c:s", "srt",
-			outputPath)
-		
-		cmd.Stdout = &out
-		cmd.Stderr = &stderr
-		
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("ffmpeg failed to extract subtitles: %v, stderr: %s", err, stderr.String())
-		}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg failed to extract subtitles: %v, stderr: %s", err, stderr.String())
 	}
 
 	return nil
