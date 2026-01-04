@@ -101,7 +101,6 @@ func (db *DB) CreateScene(scene *models.Scene) error {
                 "start_time":    scene.StartTime,
                 "end_time":      scene.EndTime,
                 // duration is derived; keep it in sync in case it's stored
-                "duration":       scene.EndTime - scene.StartTime,
                 "has_captions":  scene.HasCaptions,
                 "caption_count": scene.CaptionCount,
             }),

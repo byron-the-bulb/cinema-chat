@@ -266,11 +266,22 @@ func (vp *VideoProcessor) ProcessCaptionExtraction(payload map[string]interface{
 	dir := filepath.Dir(filepathStr)
 	subtitlesPath := filepath.Join(dir, fmt.Sprintf("video_%v_subtitles.srt", videoID))
 	
-	// Try to extract subtitles
-	err := vp.ffmpegClient.ExtractSubtitlesToSRT(filepathStr, subtitlesPath)
-	if err != nil {
-		log.Printf("Warning: Failed to extract subtitles: %v", err)
-		// This is not a critical error, continue processing
+	// If subtitles file is missing or empty, (re)extract it. Only reuse an existing
+	// SRT if it is non-empty.
+	info, statErr := os.Stat(subtitlesPath)
+	if os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0) {
+		if statErr == nil && info.Size() == 0 {
+			log.Printf("Existing subtitles file %s is empty; re-extracting", subtitlesPath)
+		}
+		// Try to extract subtitles
+		err := vp.ffmpegClient.ExtractSubtitlesToSRT(filepathStr, subtitlesPath)
+		if err != nil {
+			log.Printf("Warning: Failed to extract subtitles: %v", err)
+			// This is not a critical error, continue processing without captions
+			return nil
+		}
+	} else if statErr != nil {
+		log.Printf("Warning: Failed to stat subtitles file %s: %v", subtitlesPath, statErr)
 		return nil
 	}
 	
@@ -353,6 +364,8 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         backend = "iv2"
     }
 
+    log.Printf("[embeddings] video_id=%d: starting embedding generation with backend=%s for %d scenes", video.ID, backend, len(scenes))
+
     switch backend {
     case "iv2", "internvl35":
         // Prepare IV2 runner input
@@ -416,6 +429,8 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             "backend":  backend,
         }
 
+        log.Printf("[embeddings] video_id=%d: starting IV2 visual embedding runner (backend=%s, model=%s)", video.ID, backend, modelID)
+
         payloadBytes, _ := json.Marshal(req)
         cmd := exec.Command("python3", "/root/internal/embeddings/iv2_runner.py")
         cmd.Stdin = bytes.NewReader(payloadBytes)
@@ -473,6 +488,13 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             log.Printf("Warning: failed to update video embedding_model: %v", err)
         }
         log.Printf("Persisted %d/%d scene embeddings for video %d", saved, len(resp.Vectors), video.ID)
+
+        log.Printf("[embeddings] video_id=%d: starting IV2 caption generation for %d scenes", video.ID, len(scenes))
+        if err := vp.generateIV2Captions(video, scenes, frames, stride, res, device, modelID); err != nil {
+            log.Printf("Warning: IV2 caption generation failed for video %d: %v", video.ID, err)
+        } else {
+            log.Printf("[embeddings] video_id=%d: completed IV2 caption generation", video.ID)
+        }
 
         // --- Compute text embeddings for scenes from captions (e5-base-v2) ---
         captions, err := vp.db.GetCaptionsByVideoID(video.ID)
@@ -555,8 +577,10 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             savedText++
         }
         log.Printf("Persisted %d/%d text embeddings for video %d", savedText, len(scenes), video.ID)
+        log.Printf("[embeddings] video_id=%d: completed text embedding stage (saved=%d/%d)", video.ID, savedText, len(scenes))
 
         // --- Compute CLIP image embeddings for scenes (ViT-B/32) ---
+        log.Printf("[embeddings] video_id=%d: starting CLIP embedding stage for %d scenes", video.ID, len(scenes))
         // Use the same scene ranges (srs) built earlier.
         creq := map[string]interface{}{
             "video_path": video.Filepath,
@@ -608,11 +632,16 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             savedClip++
         }
         log.Printf("Persisted %d/%d CLIP embeddings for video %d", savedClip, len(cResp.Vectors), video.ID)
+        log.Printf("[embeddings] video_id=%d: completed CLIP embedding stage (saved=%d/%d)", video.ID, savedClip, len(cResp.Vectors))
 
         // --- Compute CLAP audio embeddings per scene ---
+        if strings.EqualFold(os.Getenv("ENABLE_AUDIO_EMBEDDINGS"), "false") || os.Getenv("ENABLE_AUDIO_EMBEDDINGS") == "0" {
+            log.Printf("Skipping audio embeddings for video %d due to ENABLE_AUDIO_EMBEDDINGS", video.ID)
+            return nil
+        }
         areq := map[string]interface{}{
-            "video_path": video.Filepath,
-            "scenes":     srs,
+            "video_path":  video.Filepath,
+            "scenes":      srs,
             "sample_rate": 48000,
         }
         payloadBytes, _ = json.Marshal(areq)
@@ -670,4 +699,98 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
     default:
         return fmt.Errorf("unknown EMBEDDING_BACKEND: %s", backend)
     }
+}
+
+// generateIV2Captions generates one synthetic caption per scene using an external runner
+// and stores them as Caption rows with language "iv2". These captions will be picked up
+// by the existing text-embedding pipeline when aggregating per-scene text.
+func (vp *VideoProcessor) generateIV2Captions(video *models.Video, scenes []models.Scene, frames, stride, res int, device, modelID string) error {
+    type sceneRange struct {
+        SceneIndex int     `json:"scene_index"`
+        Start      float64 `json:"start"`
+        End        float64 `json:"end"`
+    }
+    var srs []sceneRange
+    for _, s := range scenes {
+        srs = append(srs, sceneRange{SceneIndex: s.SceneIndex, Start: s.StartTime, End: s.EndTime})
+    }
+
+    req := map[string]interface{}{
+        "video_path": video.Filepath,
+        "scenes":     srs,
+        "prompt":     os.Getenv("IV2_CAPTION_PROMPT"),
+        "sampling": map[string]int{
+            "frames":     frames,
+            "stride":     stride,
+            "resolution": res,
+        },
+        "device":   device,
+        "model_id": modelID,
+    }
+
+    payloadBytes, _ := json.Marshal(req)
+    cmd := exec.Command("python3", "/root/internal/embeddings/iv2_caption_runner.py")
+    cmd.Stdin = bytes.NewReader(payloadBytes)
+    stdout, _ := cmd.StdoutPipe()
+    stderr, _ := cmd.StderrPipe()
+    if err := cmd.Start(); err != nil {
+        return fmt.Errorf("failed to start iv2_caption_runner: %v", err)
+    }
+    // Stream stderr so per-scene progress logs from the Python runner appear in real time.
+    go func() {
+        if _, err := io.Copy(os.Stderr, stderr); err != nil {
+            log.Printf("Warning: failed to read iv2_caption_runner stderr for video %d: %v", video.ID, err)
+        }
+    }()
+    outBytes, _ := io.ReadAll(stdout)
+    if err := cmd.Wait(); err != nil {
+        return fmt.Errorf("iv2_caption_runner failed: %v", err)
+    }
+
+    var resp struct {
+        Model    string `json:"model"`
+        Captions []struct {
+            SceneIndex int    `json:"scene_index"`
+            Text       string `json:"text"`
+        } `json:"captions"`
+        Error string `json:"error"`
+    }
+    if err := json.Unmarshal(outBytes, &resp); err != nil {
+        return fmt.Errorf("failed to parse iv2_caption_runner output: %v; raw: %s", err, string(outBytes))
+    }
+    if resp.Error != "" {
+        return fmt.Errorf("iv2_caption_runner error: %s", resp.Error)
+    }
+
+    // Index scenes by scene_index for quick lookup of timing
+    sceneByIndex := make(map[int]models.Scene, len(scenes))
+    for _, s := range scenes {
+        sceneByIndex[s.SceneIndex] = s
+    }
+
+    saved := 0
+    for _, c := range resp.Captions {
+        if strings.TrimSpace(c.Text) == "" {
+            continue
+        }
+        s, ok := sceneByIndex[c.SceneIndex]
+        if !ok {
+            continue
+        }
+        cap := &models.Caption{
+            VideoID:   video.ID,
+            SceneID:   &s.ID,
+            StartTime: s.StartTime,
+            EndTime:   s.EndTime,
+            Text:      c.Text,
+            Language:  "iv2",
+        }
+        if err := vp.db.CreateCaption(cap); err != nil {
+            log.Printf("Warning: Failed to store IV2 caption for scene_index=%d: %v", c.SceneIndex, err)
+            continue
+        }
+        saved++
+    }
+    log.Printf("Persisted %d/%d IV2 captions for video %d", saved, len(resp.Captions), video.ID)
+    return nil
 }

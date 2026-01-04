@@ -89,12 +89,40 @@ def frames_to_imagenet_tensor(frames: np.ndarray, size: int, device: str) -> tor
     return x  # (T, C, H, W)
 
 
+def time_to_index(vr: VideoReader, fps: float, t: float) -> int:
+    total = len(vr)
+    if total == 0:
+        return 0
+    if t <= 0:
+        return 0
+
+    lo, hi = 0, total - 1
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            ts_start, _ = vr.get_frame_timestamp(mid)
+        except Exception:
+            break
+        if ts_start <= t:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    else:
+        return best
+
+    if math.isfinite(fps) is False or fps <= 0:
+        fps = 30.0
+    idx = int(round(t * fps))
+    return max(0, min(idx, total - 1))
+
+
 def extract_scene_tensor(vr: VideoReader, fps: float, start: float, end: float, T: int, stride: int, res: int, device: str) -> torch.Tensor:
     total = len(vr)
     # center sample at mid-time
     mid = (start + end) / 2.0
-    center_idx = int(round(mid * fps))
-    center_idx = max(0, min(center_idx, total - 1))
+    center_idx = time_to_index(vr, fps, mid)
     idxs = sample_indices_mid(center_idx, total, T, stride)
     # fetch frames
     batch = vr.get_batch(idxs)  # decord NDArray -> (T, H, W, C) RGB
@@ -106,8 +134,7 @@ def extract_scene_tensor(vr: VideoReader, fps: float, start: float, end: float, 
 def extract_scene_frames(vr: VideoReader, fps: float, start: float, end: float, T: int, stride: int) -> np.ndarray:
     total = len(vr)
     mid = (start + end) / 2.0
-    center_idx = int(round(mid * fps))
-    center_idx = max(0, min(center_idx, total - 1))
+    center_idx = time_to_index(vr, fps, mid)
     idxs = sample_indices_mid(center_idx, total, T, stride)
     batch = vr.get_batch(idxs)
     frames = batch.asnumpy()  # (T, H, W, C) RGB

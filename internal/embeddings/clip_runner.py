@@ -2,6 +2,7 @@
 import sys
 import json
 import os
+import math
 from typing import List, Dict, Any
 
 import numpy as np
@@ -33,6 +34,35 @@ def read_payload() -> Dict[str, Any]:
     except Exception as e:
         print(json.dumps({"error": f"invalid json input: {e}"}))
         sys.exit(0)
+
+
+def time_to_index(vr: VideoReader, fps: float, t: float) -> int:
+    total = len(vr)
+    if total == 0:
+        return 0
+    if t <= 0:
+        return 0
+
+    lo, hi = 0, total - 1
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            ts_start, _ = vr.get_frame_timestamp(mid)
+        except Exception:
+            break
+        if ts_start <= t:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    else:
+        return best
+
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 30.0
+    idx = int(round(t * fps))
+    return max(0, min(idx, total - 1))
 
 
 def _resolve_open_clip_spec(model_id: str):
@@ -75,10 +105,34 @@ def sample_scene_frame(vr: VideoReader, start: float, end: float) -> np.ndarray:
     total = len(vr)
     fps = float(vr.get_avg_fps()) if hasattr(vr, 'get_avg_fps') else 30.0
     mid = (start + end) / 2.0
-    idx = int(round(mid * fps))
-    idx = max(0, min(idx, total - 1))
+    idx = time_to_index(vr, fps, mid)
     frame = vr.get_batch([idx]).asnumpy()[0]  # (H, W, C) RGB uint8
     return frame
+
+
+def sample_scene_frames_multi(vr: VideoReader, start: float, end: float, target_fps: float = 5.0, max_frames: int = 32) -> List[np.ndarray]:
+    total = len(vr)
+    fps = float(vr.get_avg_fps()) if hasattr(vr, 'get_avg_fps') else 30.0
+    if end <= start:
+        return [sample_scene_frame(vr, start, end)]
+
+    duration = max(end - start, 1e-3)
+    n = int(duration * target_fps)
+    if n <= 0:
+        n = 1
+    if n > max_frames:
+        n = max_frames
+
+    idxs: List[int] = []
+    last_idx = None
+    for i in range(n):
+        t = start + (duration * (i + 0.5) / n)
+        idx = time_to_index(vr, fps, t)
+        if last_idx is None or idx != last_idx:
+            idxs.append(idx)
+            last_idx = idx
+    batch = vr.get_batch(idxs).asnumpy()
+    return [batch[i] for i in range(batch.shape[0])]
 
 
 def main():
@@ -121,9 +175,10 @@ def main():
         print(json.dumps(out))
         return
 
-    # image mode (per-scene image embedding from frame)
+    # image mode (per-scene image embedding from multiple frames)
     video_path = payload.get("video_path")
     scenes = payload.get("scenes", [])
+    target_fps = float(payload.get("target_fps", 5.0))
     if not video_path or not isinstance(scenes, list) or len(scenes) == 0:
         print(json.dumps({"error": "invalid input: video_path and scenes are required for image mode"}))
         return
@@ -135,8 +190,7 @@ def main():
         return
 
     results = []
-    images = []
-    scene_indices = []
+    D = None
     for s in scenes:
         try:
             si = int(s.get("scene_index"))
@@ -144,32 +198,40 @@ def main():
             et = float(s.get("end", st + 0.1))
         except Exception:
             continue
-        frame = sample_scene_frame(vr, st, et)  # (H, W, C) RGB uint8
-        images.append(frame)
-        scene_indices.append(si)
 
-    if not images:
+        frames = sample_scene_frames_multi(vr, st, et, target_fps=target_fps)
+        if not frames:
+            continue
+
+        with torch.no_grad():
+            if backend == 'open_clip':
+                pil_images = [Image.fromarray(img) for img in frames]
+                enc_imgs = torch.stack([proc(im).to(device) for im in pil_images], dim=0)
+                feats = model.encode_image(enc_imgs)
+            else:
+                enc = proc(images=frames, return_tensors="pt")
+                enc = to_device(enc, device)
+                feats = model.get_image_features(**enc)
+            feats = l2_normalize(feats)
+
+        # Ensure 2D tensor
+        if feats.ndim == 1:
+            feats = feats.unsqueeze(0)
+
+        if D is None:
+            D = int(feats.shape[1])
+
+        # Average frame embeddings to a single scene vector
+        vec = feats.mean(dim=0, keepdim=True)[0]
+        results.append({"scene_index": si, "vector": to_list(vec)})
+
+    if not results:
         print(json.dumps({"error": "no valid scenes to process"}))
         return
 
-    with torch.no_grad():
-        if backend == 'open_clip':
-            pil_images = [Image.fromarray(img) for img in images]
-            enc_imgs = torch.stack([proc(im).to(device) for im in pil_images], dim=0)
-            feats = model.encode_image(enc_imgs)
-        else:
-            enc = proc(images=images, return_tensors="pt")
-            enc = to_device(enc, device)
-            feats = model.get_image_features(**enc)
-        feats = l2_normalize(feats)
-
-    D = int(feats.shape[1])
-    for i, si in enumerate(scene_indices):
-        results.append({"scene_index": si, "vector": to_list(feats[i])})
-
     print(json.dumps({
         "model": f"{backend}:{model_id}",
-        "embedding_dim": D,
+        "embedding_dim": D if D is not None else 0,
         "vectors": results,
     }))
 
