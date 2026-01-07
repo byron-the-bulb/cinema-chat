@@ -1,6 +1,6 @@
 """
 MCP Client for Cinema Chat
-Communicates with the mock MCP server via stdio (subprocess)
+Communicates with the MCP server via stdio (subprocess)
 """
 import asyncio
 import json
@@ -9,7 +9,7 @@ from typing import Any, Dict
 from loguru import logger
 
 class MCPClient:
-    """Simple MCP client that communicates with mock_server.py via subprocess"""
+    """Simple MCP client that communicates with MCP server via subprocess"""
 
     def __init__(self, server_script_path: str):
         self.server_script_path = server_script_path
@@ -19,10 +19,12 @@ class MCPClient:
 
     async def start(self):
         """Start the MCP server as a subprocess"""
-        # Use system python3 - the MCP venv is broken
-        logger.info(f"[MCP] Starting MCP server: {self.server_script_path}")
+        # Use venv python to ensure httpx and other dependencies are available
+        import sys
+        python_path = sys.executable  # Use the same python that's running the bot
+        logger.info(f"[MCP] Starting MCP server: {self.server_script_path} with {python_path}")
         self.process = await asyncio.create_subprocess_exec(
-            "python3",
+            python_path,
             self.server_script_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -127,11 +129,11 @@ async def get_mcp_client() -> MCPClient:
     """Get or create the global MCP client"""
     global _mcp_client
     if _mcp_client is None:
-        # Path to mock_server.py in new structure
+        # Path to MCP server
         server_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
             "mcp_server",
-            "mock_server.py"
+            "server.py"
         )
         _mcp_client = MCPClient(server_path)
         await _mcp_client.start()

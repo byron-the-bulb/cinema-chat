@@ -6,7 +6,8 @@ from flask import Flask, send_from_directory, request
 import os
 
 app = Flask(__name__)
-VIDEO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'videos')
+# Use shared video directory with GoodCLIPS
+VIDEO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'videos')
 
 @app.route('/<path:filename>')
 def serve_video(filename):

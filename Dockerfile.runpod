@@ -1,0 +1,101 @@
+# RunPod all-in-one image: PostgreSQL + Redis + goodclips-worker
+# Data persisted to /workspace (RunPod persistent storage)
+
+# Build stage for Go binary
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+RUN go mod tidy
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o goodclips cmd/main.go
+
+# Runtime stage with CUDA + PostgreSQL + Redis
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Install PostgreSQL, Redis, Python, and system deps
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       postgresql-14 \
+       postgresql-contrib-14 \
+       postgresql-server-dev-14 \
+       redis-server \
+       python3 \
+       python3-pip \
+       ffmpeg \
+       ca-certificates \
+       sudo \
+       curl \
+       wget \
+       git \
+       build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pgvector extension from source
+RUN cd /tmp \
+    && git clone --branch v0.7.4 https://github.com/pgvector/pgvector.git \
+    && cd pgvector \
+    && make \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/pgvector
+
+# Install PyTorch (CUDA 12.1 wheels) and other Python deps
+RUN python3 -m pip install --upgrade pip \
+    && pip install --no-cache-dir \
+         torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 \
+         --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir \
+         decord av opencv-python-headless timm huggingface-hub \
+         transformers==4.52.1 einops accelerate scenedetect \
+         open-clip-torch pillow safetensors librosa audioread
+
+WORKDIR /root/
+
+# Copy Go binary
+COPY --from=builder /app/goodclips .
+
+# Copy Python scripts
+COPY --from=builder /app/internal/scenedetect/ ./internal/scenedetect/
+COPY --from=builder /app/internal/embeddings/ ./internal/embeddings/
+
+# Copy database migrations
+COPY --from=builder /app/migrations/ ./migrations/
+
+RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py
+
+# Copy scripts
+COPY scripts/runpod-entrypoint.sh /entrypoint.sh
+COPY scripts/export-db.sh /root/export-db.sh
+COPY scripts/download-and-process.sh /root/download-and-process.sh
+RUN chmod +x /entrypoint.sh /root/export-db.sh /root/download-and-process.sh
+
+# Expose ports (API, PostgreSQL, Redis)
+EXPOSE 8080 5432 6379
+
+# =============================================================================
+# RUNPOD CONFIGURATION
+# =============================================================================
+# Expose Ports: 8080/http, 5432/tcp
+#   - 8080: GoodCLIPS API
+#   - 5432: PostgreSQL (for remote pg_dump)
+#
+# Environment Variables:
+#   AUTO_DOWNLOAD_URL      - URL to download video on startup (optional)
+#   AUTO_DOWNLOAD_FILENAME - Filename to save as (default: video.mp4)
+#
+# Example for Night of the Living Dead:
+#   AUTO_DOWNLOAD_URL=https://archive.org/download/night_of_the_living_dead_dvd/Night.mp4
+#   AUTO_DOWNLOAD_FILENAME=night_of_the_living_dead.mp4
+#
+# To sync database locally after processing:
+#   PGPASSWORD=goodclips_dev_password pg_dump -h <pod-id>-5432.proxy.runpod.net \
+#     -U goodclips -d goodclips --no-owner --no-acl | \
+#     psql -h localhost -U goodclips -d goodclips
+# =============================================================================
+
+ENTRYPOINT ["/entrypoint.sh"]
