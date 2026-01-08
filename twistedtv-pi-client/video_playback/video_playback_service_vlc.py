@@ -48,7 +48,7 @@ def start_static_if_nothing_playing():
         # VLC command for static loop
         # --play-and-exit not used here because we want infinite loop
         cmd = [
-            "cvlc",
+            "cvlc", "--vout=drm_vout", "--drm-device=/dev/dri/card1",
             "--fullscreen",
             "--no-video-title-show",
             "--no-osd",
@@ -138,7 +138,7 @@ def play_video(video_path, start_time, end_time, fullscreen=True):
     log_file_path = f'/home/twistedtv/vlc_{int(time.time())}.log'
 
     cmd = [
-        "cvlc",
+        "cvlc", "--vout=drm_vout", "--drm-device=/dev/dri/card1",
         "--play-and-exit",
         "--fullscreen",
         "--no-video-title-show",

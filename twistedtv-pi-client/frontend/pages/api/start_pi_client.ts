@@ -8,8 +8,8 @@ import { spawn } from 'child_process';
 
 // Pi client paths - use venv_daily python with all dependencies
 const VENV_PYTHON = '/home/twistedtv/venv_daily/bin/python3';
-const PYTHON_CLIENT = '/home/twistedtv/twistedtv-new/pi_daily_client/pi_daily_client.py';
-const VIDEO_SERVICE = '/home/twistedtv/twistedtv-new/video_playback/video_playback_service_mpv.py';
+const PYTHON_CLIENT = '/home/twistedtv/twistedtv-pi-client/pi_daily_client/pi_daily_client.py';
+const VIDEO_SERVICE = '/home/twistedtv/twistedtv-pi-client/video_playback/video_playback_service_mpv.py';
 
 export default async function handler(
   req: NextApiRequest,
@@ -56,17 +56,21 @@ export default async function handler(
         await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for cleanup to complete
       } catch (cleanupErr: any) {
         console.error('Cleanup failed:', cleanupErr.message);
+        console.error('Cleanup error stack:', cleanupErr.stack);
+        console.error('Cleanup error code:', cleanupErr.code);
         return res.status(500).json({
           success: false,
           error: 'Failed to cleanup existing Pi processes',
-          details: cleanupErr.message
+          details: cleanupErr.message,
+          code: cleanupErr.code,
+          stack: cleanupErr.stack
         });
       }
 
       try {
 
         // Start new video service with nohup and capture PID
-        const videoServiceCmd = `cd /home/twistedtv/twistedtv-new/video_playback && nohup python3 video_playback_service_mpv.py > /tmp/video_mpv.log 2>&1 & echo $!`;
+        const videoServiceCmd = `cd /home/twistedtv/twistedtv-pi-client/video_playback && nohup python3 video_playback_service_mpv.py > /tmp/video_mpv.log 2>&1 & echo $!`;
         const { stdout: pidOutput } = await execPromise(videoServiceCmd);
         const videoServicePid = parseInt(pidOutput.trim());
 
