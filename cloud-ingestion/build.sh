@@ -14,10 +14,11 @@ fi
 
 FULL_IMAGE="${DOCKER_USERNAME}/${IMAGE_NAME}:${TAG}"
 
+# Navigate to repo root (parent of cloud-ingestion/)
 cd "$(dirname "$0")/.."
 
 echo "Building ${FULL_IMAGE}..."
-docker build -f Dockerfile.runpod -t "${FULL_IMAGE}" .
+docker build -f cloud-ingestion/Dockerfile -t "${FULL_IMAGE}" .
 
 echo "Pushing to Docker Hub..."
 docker push "${FULL_IMAGE}"

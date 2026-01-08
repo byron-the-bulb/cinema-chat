@@ -68,10 +68,10 @@ COPY --from=builder /app/migrations/ ./migrations/
 
 RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py
 
-# Copy scripts
-COPY scripts/runpod-entrypoint.sh /entrypoint.sh
-COPY scripts/export-db.sh /root/export-db.sh
-COPY scripts/download-and-process.sh /root/download-and-process.sh
+# Copy scripts (from cloud-ingestion subdirectory)
+COPY cloud-ingestion/entrypoint.sh /entrypoint.sh
+COPY cloud-ingestion/export-db.sh /root/export-db.sh
+COPY cloud-ingestion/download-and-process.sh /root/download-and-process.sh
 RUN chmod +x /entrypoint.sh /root/export-db.sh /root/download-and-process.sh
 
 # Expose ports (API, PostgreSQL, Redis)
