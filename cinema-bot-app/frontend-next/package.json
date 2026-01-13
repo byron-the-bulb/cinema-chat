@@ -1,0 +1,36 @@
+{
+  "name": "cinema-chat-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.787.0",
+    "@cartesia/cartesia-js": "^2.2.0",
+    "@daily-co/daily-js": "^0.77.0",
+    "@daily-co/daily-react": "^0.22.0",
+    "@pipecat-ai/client-js": "^0.3.5",
+    "@pipecat-ai/client-react": "^0.3.5",
+    "@pipecat-ai/daily-transport": "^0.3.8",
+    "axios": "^1.8.4",
+    "next": "15.3.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "styled-components": "^6.1.17",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.25",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.1",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "15.3.0",
+    "local-ssl-proxy": "^2.0.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
