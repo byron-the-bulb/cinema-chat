@@ -175,7 +175,7 @@ def generate_caption(model: Any, tokenizer: Any, images: List[Image.Image], ques
     prefix = "".join(f"Frame{i+1}: <image>\\n" for i in range(num_frames))
     full_question = prefix + question
 
-    generation_config = dict(max_new_tokens=256, do_sample=False)
+    generation_config = dict(max_new_tokens=512, do_sample=False)
 
     if not hasattr(model, "chat"):
         raise RuntimeError("model object has no chat(...) method")
@@ -267,7 +267,14 @@ def main() -> None:
             continue
         question = prompt.strip()
         if not question:
-            question = "Describe this video scene in one concise sentence."
+            question = (
+                "Describe this scene in detail. Include:\n"
+                "- What is happening (actions, events, narrative)\n"
+                "- Visual style (lighting, camera angle, composition, black-and-white or color)\n"
+                "- Mood and atmosphere (tension, calm, eerie, joyful, melancholy)\n"
+                "- Setting and environment (indoor, outdoor, time of day)\n"
+                "- Characters visible and their expressions, body language, or gestures"
+            )
         # Placeholder caption logic; replace with real IV2-based captioning.
         try:
             text = generate_caption(model, tokenizer, images, question, device)
