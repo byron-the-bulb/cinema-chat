@@ -61,7 +61,7 @@ async def get_caption_for_scene(scene_id: int) -> str:
 PLAYBACK_SERVICE_URL = os.getenv("PLAYBACK_SERVICE_URL", "http://localhost:5000")
 
 # Video server URL - where videos are served from
-VIDEO_SERVER_URL = os.getenv("VIDEO_SERVER_URL", "http://192.168.1.113:9000")
+VIDEO_SERVER_URL = os.getenv("VIDEO_SERVER_URL", "http://192.168.1.106:9000")
 
 # GoodCLIPS API URL
 GOODCLIPS_API_URL = os.getenv("GOODCLIPS_API_URL", "http://localhost:8080")

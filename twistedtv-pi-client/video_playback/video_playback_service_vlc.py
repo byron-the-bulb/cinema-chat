@@ -9,7 +9,7 @@ Usage:
     python3 video_playback_service_vlc.py
 
     # Then from anywhere:
-    curl -X POST http://192.168.1.201:5000/play \
+    curl -X POST http://192.168.1.109:5000/play \
       -H 'Content-Type: application/json' \
       -d '{"video_path": "test.mp4", "start": 0, "end": 5}'
 """

@@ -1,578 +1,511 @@
 # TwistedTV Documentation
 
-**Last Updated:** 2025-11-30
+**Last Updated:** 2026-02-25
 
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
-2. [System Architecture](#system-architecture)
-3. [Directory Structure](#directory-structure)
-4. [Component Details](#component-details)
-5. [Setup & Installation](#setup--installation)
-6. [Deployment Guide](#deployment-guide)
+2. [Architecture — What Runs Where](#architecture--what-runs-where)
+3. [Server Reinstall Guide](#server-reinstall-guide)
+4. [Cloud Ingestion (RunPod)](#cloud-ingestion-runpod)
+5. [Directory Structure](#directory-structure)
+6. [Component Details](#component-details)
 7. [Operation & Usage](#operation--usage)
 8. [Debugging & Troubleshooting](#debugging--troubleshooting)
-9. [Development Guidelines](#development-guidelines)
-10. [PR Preparation](#pr-preparation)
+9. [Known Gotchas](#known-gotchas)
 
 ---
 
 ## Project Overview
 
-**TwistedTV** is an art installation where visitors speak into a vintage rotary phone and converse with an AI that responds exclusively through old movie clips displayed on a TV. The system uses semantic search to find contextually appropriate video clips that serve as the bot's "voice."
-
-### Key Features
-
-- **No Text-to-Speech**: All responses are video clips from classic films
-- **Real-time Conversation**: Whisper STT for speech recognition, GPT-4 for understanding
-- **Semantic Video Search**: Uses GoodCLIPS API for multi-modal video embeddings
-- **Distributed Architecture**: Server runs in cloud/local, Pi runs at installation site
-- **WebRTC Transport**: Daily.co for audio between phone and server
-
-### Hardware Components
-
-- **Vintage Rotary Phone**: Audio input device
-- **Raspberry Pi**: On-site client for audio capture and video playback
-- **TV**: Display for video clips (HDMI from Pi)
-- **Server**: Cloud or local machine for AI processing
-
----
-
-## System Architecture
-
-### High-Level Data Flow
-
-```
-┌──────────────────────────────────────────────────┐
-│         Raspberry Pi (Installation Site)          │
-│         IP: 192.168.1.201 (local network)         │
-├──────────────────────────────────────────────────┤
-│                                                  │
-│  1. Phone (connected to audio input)             │
-│     ↓                                             │
-│  2. Pi Daily.co Client (Python)                  │
-│     - Captures audio from phone                   │
-│     - Sends to Daily.co WebRTC                    │
-│     - Receives video commands                     │
-│     - Calls localhost:5000                        │
-│     ↓                                             │
-│  3. Video Playback Service (port 5000)           │
-│     - Plays videos via mpv on HDMI                │
-│     - Manages display blanking                    │
-│     ↓                                             │
-│  4. TV (HDMI output)                             │
-│     - Shows video clips                           │
-│     - Blanks between clips (NO SIGNAL)            │
-│                                                  │
-│  Optional: Next.js Dashboard (port 3000)         │
-│     - Web UI for monitoring/config                │
-│     - Accessible from other devices               │
-│                                                  │
-└──────────────────────────────────────────────────┘
-                      ↕
-             Daily.co WebRTC Cloud
-          (Audio up, Commands down)
-                      ↕
-┌──────────────────────────────────────────────────┐
-│    Server (Cloud or Local, different network)    │
-├──────────────────────────────────────────────────┤
-│                                                  │
-│  1. FastAPI Backend (port 8765)                  │
-│     - Receives audio via Daily.co WebRTC          │
-│     - DailyTransport (Pipecat)                    │
-│     ↓                                             │
-│  2. Whisper STT (GPU accelerated)                │
-│     - Transcribes phone audio to text             │
-│     ↓                                             │
-│  3. OpenAI GPT-4                                 │
-│     - Understands conversation                    │
-│     - Calls MCP tools                             │
-│     ↓                                             │
-│  4. MCP Server (stdio)                           │
-│     - search_video_clips (semantic search)        │
-│     - play_video_by_params (select clip)          │
-│     - Returns video metadata to LLM               │
-│     ↓                                             │
-│  5. Backend sends video command                  │
-│     - Via Daily.co app message or RTVI            │
-│     - To Pi client                                │
-│                                                  │
-└──────────────────────────────────────────────────┘
-```
+**TwistedTV** is an art installation where visitors speak into a vintage rotary phone and converse with an AI that responds exclusively through old movie clips displayed on a TV. There is no text-to-speech — the bot "speaks" only through video.
 
 ### Conversation Flow
 
-1. **User speaks into phone** → Audio captured by Pi microphone
-2. **Pi Daily client** → Sends audio to Daily.co WebRTC room
-3. **Server receives** → Audio transcribed by Whisper STT
-4. **LLM processes** → GPT-4 generates response intent/meaning
-5. **LLM calls MCP tool** → Requests video clip with semantic description
-6. **MCP server queries** → GoodCLIPS API for matching scene
-7. **MCP returns metadata** → Best matching clip identified
-8. **Server sends command** → Via Daily.co to Pi client
-9. **Pi plays video** → mpv displays clip on TV via HDMI
-10. **Cycle repeats** → User responds to video
+1. User speaks into phone → Audio captured by Pi microphone
+2. Pi Daily client → Sends audio to Daily.co WebRTC room
+3. Server receives → Audio transcribed by Whisper STT
+4. LLM processes → GPT-4 generates semantic description of desired response
+5. LLM calls MCP tool → Queries GoodCLIPS API for matching scene
+6. Server sends command → Via Daily.co to Pi client
+7. Pi plays video → MPV displays clip on TV via HDMI
+8. TV returns to static → Waiting for next input
 
-### Communication Protocols
+---
 
-- **Daily.co WebRTC**: Bidirectional audio + control messages
-- **HTTP**: Local video playback service (Pi:5000), video streaming (server:9000)
-- **MCP (stdio)**: JSON-RPC for LLM tool calling
-- **RTVI Protocol**: Real-time Video Intelligence for bot control
+## Architecture — What Runs Where
+
+There are three locations. **Do not confuse them.**
+
+### Server (192.168.1.106, Fedora Linux)
+
+Runs permanently. Handles the AI conversation, video search, and video streaming.
+
+| Service | Port | Manager |
+|---------|------|---------|
+| TwistedTV FastAPI (bot + Whisper + GPT-4 + WebRTC) | 8765 | systemd: `twistedtv-server.service` |
+| Video Streaming Server (Flask) | 9000 | systemd: `twistedtv-video-server.service` |
+| GoodCLIPS Go API (semantic search) | 8080 | Docker Compose |
+| PostgreSQL + pgvector | 5432 | Docker Compose |
+| Redis | 6379 | Docker Compose |
+
+### Raspberry Pi (192.168.1.109)
+
+Runs permanently at the installation site. Handles audio I/O and video display.
+
+| Service | Port | Manager |
+|---------|------|---------|
+| Video Playback Service (MPV on HDMI) | 5000 | systemd user: `video-player.service` |
+| Next.js Dashboard | 3000 | systemd user: `frontend.service` |
+| Pi Daily Client (audio capture + WebRTC) | — | Spawned on demand by dashboard API |
+
+### Cloud — RunPod (temporary, only during ingestion)
+
+**Video ingestion does NOT run on the server.** It runs on temporary RunPod GPU pods.
+
+A GPU pod spins up, downloads the movie, detects scenes, generates embeddings + captions, then the database is exported via `pg_dump` to the server and the pod is terminated. This is fully automated by `cloud-ingestion/process-movie.sh`.
+
+### Data Flow Diagram
+
+```
+┌──────────────────────────────────────────────────────┐
+│         Raspberry Pi (192.168.1.109)                  │
+│         Installation site — audio I/O + display       │
+├──────────────────────────────────────────────────────┤
+│  Phone (audio input)                                  │
+│    → Pi Daily Client (captures audio, sends WebRTC)   │
+│    → Video Playback Service :5000 (plays clips on TV) │
+│    → Next.js Dashboard :3000 (monitoring UI)          │
+└──────────────────────────────────────────────────────┘
+                        ↕
+               Daily.co WebRTC Cloud
+            (audio up, commands down)
+                        ↕
+┌──────────────────────────────────────────────────────┐
+│         Server (192.168.1.106)                        │
+│         Always-on — AI processing + data              │
+├──────────────────────────────────────────────────────┤
+│  FastAPI Backend :8765                                │
+│    → Whisper STT (transcribes audio)                  │
+│    → GPT-4 (understands conversation)                 │
+│    → MCP Server (queries GoodCLIPS for video clips)   │
+│                                                       │
+│  GoodCLIPS API :8080 (semantic video search)          │
+│  PostgreSQL :5432 (scene embeddings + metadata)       │
+│  Redis :6379 (job queue)                              │
+│  Video Streaming :9000 (serves .mp4 files to Pi)      │
+└──────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│         RunPod Cloud (temporary)                      │
+│         GPU pods — only during movie ingestion        │
+├──────────────────────────────────────────────────────┤
+│  process-movie.sh creates pod → downloads movie →     │
+│  detects scenes → generates embeddings → pg_dump →    │
+│  imports to server Postgres → terminates pod          │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Server Reinstall Guide
+
+If the server (192.168.1.106) is wiped, follow these steps exactly. Total time: ~30 minutes (plus ~30 minutes for movie ingestion).
+
+### Prerequisites
+
+- Fedora Linux with `twistedtv` user
+- Internet access
+- The Pi (192.168.1.109) should already be set up
+
+### Step 1: Install System Dependencies
+
+```bash
+# Python 3.12 (NOT 3.14 — too new for daily-python/ctranslate2)
+sudo dnf install -y python3.12 python3.12-devel
+
+# Docker
+sudo dnf install -y docker docker-compose
+sudo systemctl enable --now docker
+sudo usermod -aG docker twistedtv
+# Log out and back in for group to take effect
+
+# PostgreSQL client (for pg_dump during ingestion)
+sudo dnf install -y postgresql
+
+# lsof (used by systemd services)
+sudo dnf install -y lsof
+```
+
+### Step 2: Clone the Repository
+
+```bash
+cd /home/twistedtv
+git clone https://github.com/byron-the-bulb/cinema-chat.git
+cd cinema-chat
+git checkout thomas-updates  # or whatever the current branch is
+```
+
+### Step 3: Create Python Virtual Environment
+
+```bash
+cd /home/twistedtv/cinema-chat/twistedtv-server
+python3.12 -m venv venv
+source venv/bin/activate
+
+# Install CPU PyTorch first (no GPU on this server)
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Install all dependencies
+pip install -r requirements.txt
+
+# Also install Flask for the video streaming server
+pip install flask
+```
+
+### Step 4: Create .env File
+
+```bash
+cat > /home/twistedtv/cinema-chat/twistedtv-server/cinema_bot/.env << 'EOF'
+OPENAI_API_KEY=<your-openai-key>
+DAILY_API_KEY=<your-daily-key>
+DAILY_API_URL=https://api.daily.co/v1
+WHISPER_DEVICE=cpu
+REPO_ID=Systran/faster-distil-whisper-medium.en
+HOST=0.0.0.0
+FAST_API_PORT=8765
+BACKEND_SERVER_URL=http://192.168.1.106:8765
+GOODCLIPS_API_URL=http://localhost:8080
+VIDEO_SERVER_URL=http://192.168.1.106:9000
+PLAYBACK_SERVICE_URL=http://192.168.1.109:5000
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=goodclips
+DB_PASSWORD=goodclips_dev_password
+DB_NAME=goodclips
+RUNPOD_API_KEY=<your-runpod-key>
+MY_AWS_ACCESS_KEY_ID=<your-aws-key>
+MY_AWS_SECRET_ACCESS_KEY=<your-aws-secret>
+MY_AWS_REGION=us-west-2
+CLOUDWATCH_LOG_GROUP=/twistedtv
+EOF
+```
+
+**Where to get API keys:** Copy from the Pi's `.env` at `/home/twistedtv/twistedtv-pi-client/frontend/.env` (SSH to Pi first).
+
+### Step 5: Start Docker Compose (GoodCLIPS Stack)
+
+```bash
+cd /home/twistedtv/cinema-chat
+docker compose up -d
+
+# Wait for services to be healthy
+docker compose ps  # Should show postgres, redis, goodclips-api as "Up"
+
+# Fix the torch/timm version mismatch in the API container
+docker exec goodclips-api pip uninstall -y timm torchvision
+```
+
+**Why the timm fix?** The container has torch 2.4.0 but pip pulls in torchvision 0.25 (needs torch 2.6). This breaks the `transformers` model loading. Removing timm/torchvision is safe because the text embedding model (e5-base-v2) doesn't need them.
+
+### Step 6: Create Systemd Services
+
+**IMPORTANT:** On Fedora with SELinux, systemd cannot execute binaries from home directories directly. All `ExecStart` must be wrapped in `/bin/bash -c '...'`.
+
+Create `/tmp/twistedtv-server.service`:
+```ini
+[Unit]
+Description=TwistedTV Server (Cinema Bot)
+After=network.target
+
+[Service]
+Type=exec
+User=twistedtv
+WorkingDirectory=/home/twistedtv/cinema-chat/twistedtv-server/cinema_bot
+ExecStartPre=/bin/bash -c 'lsof -ti:8765 | xargs -r kill -9 || true'
+ExecStart=/bin/bash -c '/home/twistedtv/cinema-chat/twistedtv-server/venv/bin/python server.py'
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/tmp/twistedtv-server.log
+StandardError=append:/tmp/twistedtv-server.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create `/tmp/twistedtv-video-server.service`:
+```ini
+[Unit]
+Description=TwistedTV Video Streaming Server
+After=network.target
+
+[Service]
+Type=exec
+User=twistedtv
+WorkingDirectory=/home/twistedtv/cinema-chat/twistedtv-video-server
+ExecStartPre=/bin/bash -c 'lsof -ti:9000 | xargs -r kill -9 || true'
+ExecStart=/bin/bash -c '/home/twistedtv/cinema-chat/twistedtv-server/venv/bin/python streaming_server.py'
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/tmp/twistedtv-video-server.log
+StandardError=append:/tmp/twistedtv-video-server.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install and start:
+```bash
+# Copy (not symlink — SELinux blocks symlinks too)
+sudo cp /tmp/twistedtv-server.service /etc/systemd/system/
+sudo cp /tmp/twistedtv-video-server.service /etc/systemd/system/
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now twistedtv-server
+sudo systemctl enable --now twistedtv-video-server
+
+# Verify
+systemctl is-active twistedtv-server twistedtv-video-server
+# Should print: active / active
+```
+
+### Step 7: Ingest a Movie
+
+The database is empty after a fresh install. You need to ingest at least one movie using the cloud ingestion pipeline (RunPod GPU pod).
+
+```bash
+RUNPOD_API_KEY="<your-runpod-key>" \
+  bash /home/twistedtv/cinema-chat/cloud-ingestion/process-movie.sh \
+  'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4' \
+  'carnival_of_souls.mp4'
+```
+
+This takes ~30 minutes. The script will:
+1. Create a RunPod GPU pod
+2. Download the movie and process it (scene detection + embeddings)
+3. Export the database via `pg_dump` (using the pod's direct IP, not the HTTP proxy)
+4. Import into the local PostgreSQL
+5. Download the video file to `data/videos/`
+6. Terminate the pod
+
+### Step 8: Verify Everything Works
+
+```bash
+# Test semantic search
+curl -s http://localhost:8080/api/v1/search/semantic \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "a woman looking scared", "limit": 3}' | python3 -m json.tool
+
+# Test video streaming
+curl -s -I http://localhost:9000/carnival_of_souls.mp4 | head -3
+
+# Test from the Pi
+ssh twistedtv@192.168.1.109 \
+  "curl -s http://192.168.1.106:8080/health"
+
+# Test video playback on Pi
+ssh twistedtv@192.168.1.109 \
+  "curl -s -X POST http://localhost:5000/play \
+    -H 'Content-Type: application/json' \
+    -d '{\"video_path\": \"http://192.168.1.106:9000/carnival_of_souls.mp4\", \"start\": 100, \"end\": 105}'"
+```
+
+### Step 9: Update Pi Configuration (if server IP changed)
+
+On the Pi, update the server URL in `/home/twistedtv/twistedtv-pi-client/frontend/.env`:
+```
+NEXT_PUBLIC_API_URL=http://<new-server-ip>:8765
+```
+
+Then rebuild and restart the frontend:
+```bash
+ssh twistedtv@192.168.1.109
+cd ~/twistedtv-pi-client/frontend
+npm run build
+systemctl --user restart frontend
+```
+
+---
+
+## Cloud Ingestion (RunPod)
+
+### Overview
+
+Movie ingestion requires a GPU for scene detection, embedding generation (SigLIP), and captioning. Since the server has no GPU, this runs on temporary RunPod pods.
+
+### Automated Pipeline
+
+The script `cloud-ingestion/process-movie.sh` handles everything:
+
+```bash
+RUNPOD_API_KEY="<key>" bash cloud-ingestion/process-movie.sh '<movie_url>' '<filename>'
+```
+
+**What it does:**
+1. Creates a RunPod GPU pod (NVIDIA RTX A4000) with the `va55/goodclips-runpod:latest` Docker image
+2. Exposes ports: `8080/http` (GoodCLIPS API) and `5432/tcp` (PostgreSQL)
+3. Waits for the pod to be ready and the API to be healthy
+4. Monitors processing progress (scene detection → embeddings → captions)
+5. Exports the database using `pg_dump` via the pod's **direct public IP** (not the HTTP proxy)
+6. Imports the dump into the local PostgreSQL
+7. Downloads the video file to `data/videos/`
+8. Terminates the pod
+
+**Environment variables:**
+- `RUNPOD_API_KEY` (required) — Your RunPod API key
+- `GPU_TYPE` (optional) — Default: `NVIDIA RTX A4000`
+- `KEEP_POD` (optional) — Set to `true` to keep pod running after completion
+
+### Important: RunPod TCP Proxy Limitation
+
+RunPod's `*.proxy.runpod.net` URLs are **HTTP-only proxies**. They do NOT pass through raw TCP connections. This means you **cannot** use them for `pg_dump` or direct PostgreSQL connections.
+
+The `process-movie.sh` script works around this by extracting the pod's direct public IP and mapped port from the RunPod API, instead of using the proxy URL.
+
+### Adding More Movies
+
+Good sources for public domain movies:
+- [Internet Archive](https://archive.org/details/feature_films) — Public domain films
+- Look for direct `.mp4` download links
+
+Example movies that work well:
+```bash
+# Carnival of Souls (1962, horror)
+'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'
+
+# Night of the Living Dead (1968, horror)
+'https://archive.org/download/night_of_the_living_dead_dvd/Night.mp4'
+```
 
 ---
 
 ## Directory Structure
 
-The codebase is organized into three main directories based on deployment target:
-
 ```
 cinema-chat/
-├── cmd/                              # Massimo's GoodCLIPS Go API
-├── internal/                         # Massimo's Go internals
-├── migrations/                       # Massimo's DB migrations
-├── docker-compose.yml               # Massimo's Docker config
+├── CLAUDE.md                         # AI context (read this first)
+├── TWISTEDTV.md                      # This file
+├── HANDOFF.md                        # Project handoff docs
+├── docker-compose.yml                # GoodCLIPS Docker stack
+├── Dockerfile                        # GoodCLIPS API image
 │
-├── twistedtv-server/                # SERVER-SIDE COMPONENTS
-│   ├── cinema_bot/                  # Backend bot orchestration
-│   │   ├── server.py               # FastAPI server entry point
+├── cmd/                              # GoodCLIPS Go API (Massimo's)
+├── internal/                         # GoodCLIPS Go internals (Massimo's)
+├── migrations/                       # DB migrations (Massimo's)
+│
+├── cloud-ingestion/                  # CLOUD: Movie ingestion pipeline
+│   ├── process-movie.sh             # Main script — creates pod, processes, imports
+│   ├── Dockerfile                   # All-in-one RunPod image
+│   ├── entrypoint.sh               # Pod startup script
+│   ├── download-and-process.sh     # On-pod video processing
+│   └── export-db.sh                # On-pod database export
+│
+├── twistedtv-server/                 # SERVER: Bot + MCP
+│   ├── cinema_bot/                  # FastAPI server, bot logic, Whisper, GPT-4
+│   │   ├── server.py               # Entry point (port 8765)
 │   │   ├── cinema_bot.py           # Main bot logic
-│   │   ├── cinema_script.py        # Conversation flows
 │   │   ├── mcp_client.py           # MCP client integration
-│   │   ├── mcp_video_tools.py      # MCP video tools
-│   │   ├── custom_flow_manager.py  # Flow state management
-│   │   ├── status_utils.py         # Status updates
-│   │   ├── cloudwatch_logger.py    # AWS CloudWatch logging
-│   │   └── cleanup_daily_rooms.py  # Daily.co cleanup utility
-│   │
+│   │   └── .env                    # API keys (not in git)
 │   ├── mcp_server/                  # MCP server for video search
 │   │   ├── server.py               # Real MCP server (GoodCLIPS)
-│   │   ├── mock_server.py          # Mock server (keyword search)
-│   │   ├── config.py               # Configuration
-│   │   ├── goodclips_client.py     # GoodCLIPS API client
-│   │   └── video_player.py         # Video player utilities
-│   │
-│   ├── requirements.txt             # Python dependencies
-│   ├── Dockerfile                   # Docker image for server
-│   ├── build.sh                     # Build script
-│   └── .env.example                # Environment variables template
+│   │   └── mock_server.py          # Mock server (keyword search)
+│   ├── venv/                        # Python 3.12 virtual environment
+│   └── requirements.txt
 │
-├── twistedtv-pi-client/             # RASPBERRY PI COMPONENTS
-│   ├── pi_daily_client/             # Daily.co client for Pi
-│   │   ├── pi_daily_client.py      # Main RTVI client (active)
-│   │   └── test_audio.py           # Audio testing utilities
-│   │
-│   ├── video_playback/              # Video playback service
-│   │   ├── video_playback_service_mpv.py  # MPV playback (active)
-│   │   ├── video_playback_service_vlc.py  # VLC alternative
-│   │   └── video_player.py                # Shared utilities
-│   │
-│   ├── frontend/                    # Next.js UI (runs on Pi)
-│   │   ├── pages/
-│   │   │   ├── index.tsx            # Main page
-│   │   │   └── api/                 # API routes
-│   │   │       ├── connect_local.ts
-│   │   │       ├── connect_runpod.ts
-│   │   │       ├── start_pi_client.ts
-│   │   │       └── cleanup_pi.ts
-│   │   ├── components/
-│   │   │   ├── ChatLog.tsx
-│   │   │   ├── LoadingSpinner.tsx
-│   │   │   └── AudioDeviceSelector.tsx
-│   │   ├── styles/
-│   │   ├── public/
-│   │   └── package.json
-│   │
-│   ├── scripts/
-│   │   ├── deploy_to_pi.sh         # Deployment script
-│   │   └── generate-favicon.js     # Favicon generation
-│   │
-│   ├── requirements.txt             # Python dependencies for Pi
-│   └── .env.example                # Environment variables template
+├── twistedtv-video-server/           # SERVER: Video streaming
+│   └── streaming_server.py          # Flask server (port 9000)
 │
-└── twistedtv-video-server/          # VIDEO STORAGE & STREAMING
-    ├── videos/                      # Video file storage
-    ├── streaming_server.py          # Flask HTTP streaming server
-    ├── threaded_server.py           # Alternative implementation
-    └── requirements.txt             # Flask dependencies
+├── twistedtv-pi-client/              # PI: Audio + video + dashboard
+│   ├── pi_daily_client/             # Daily.co WebRTC client
+│   ├── video_playback/              # MPV playback service (port 5000)
+│   └── frontend/                    # Next.js dashboard (port 3000)
+│
+└── data/
+    └── videos/                      # Video files served by streaming server
 ```
 
 ### What Runs Where
 
-**Server (Cloud/Local Machine):**
-- `twistedtv-server/cinema_bot/server.py` - Main FastAPI backend
-- `twistedtv-server/mcp_server/mock_server.py` or `server.py` - Video search
-- `twistedtv-video-server/streaming_server.py` - Video file streaming
-
-**Raspberry Pi (Installation Site):**
-- `twistedtv-pi-client/pi_daily_client/pi_daily_client.py` - Daily.co client
-- `twistedtv-pi-client/video_playback/video_playback_service_mpv.py` - Video playback
-- `twistedtv-pi-client/frontend/` - Next.js dashboard (optional)
+| Component | Location | Entry Point |
+|-----------|----------|-------------|
+| FastAPI Backend | Server | `twistedtv-server/cinema_bot/server.py` |
+| MCP Server | Server | `twistedtv-server/mcp_server/server.py` (spawned by bot) |
+| Video Streaming | Server | `twistedtv-video-server/streaming_server.py` |
+| GoodCLIPS API | Server | `docker-compose.yml` → `goodclips-api` container |
+| PostgreSQL | Server | `docker-compose.yml` → `goodclips-postgres` container |
+| Redis | Server | `docker-compose.yml` → `goodclips-redis` container |
+| Daily Client | Pi | `twistedtv-pi-client/pi_daily_client/pi_daily_client.py` |
+| Video Playback | Pi | `twistedtv-pi-client/video_playback/video_playback_service_mpv.py` |
+| Dashboard | Pi | `twistedtv-pi-client/frontend/` |
+| Movie Ingestion | Cloud (RunPod) | `cloud-ingestion/process-movie.sh` |
 
 ---
 
 ## Component Details
 
-### 1. Cinema Bot Backend (Server)
+### 1. Cinema Bot Backend (Server, port 8765)
 
 **Location:** `twistedtv-server/cinema_bot/`
 
-**Purpose:** Main conversation orchestration and LLM integration
+FastAPI server that orchestrates the conversation:
+- Receives audio via Daily.co WebRTC (Pipecat SDK)
+- Transcribes with Whisper STT (CPU mode on this server)
+- GPT-4 understands conversation intent
+- MCP client calls `search_video_clips` tool
+- MCP server queries GoodCLIPS API at `localhost:8080`
+- Sends video playback command back to Pi via Daily.co
 
-**Key Technologies:**
-- FastAPI - Web framework
-- Pipecat - Audio pipeline framework
-- Daily.co Python SDK - WebRTC transport
-- OpenAI Whisper - Speech-to-text
-- OpenAI GPT-4 - Conversation understanding
-- MCP SDK - Tool calling protocol
-
-**Key Features:**
-- Two-conversation architecture:
-  - User-facing: User input → Video description
-  - Behind-the-scenes: User input → LLM reasoning → MCP tools → Video selection
-- Function handlers for `search_video_clips` and `play_video_by_params`
-- Status updates to frontend via RTVI protocol
-- Conversation flow management with Pipecat-Flows
-- CloudWatch logging integration
-
-**Configuration:**
-- Port: 8765 (default)
-- Environment: `.env` file with API keys
-- MCP: Communicates via stdio with mock_server.py
-
-### 2. MCP Server (Server)
+### 2. MCP Server (Server, spawned by bot)
 
 **Location:** `twistedtv-server/mcp_server/`
 
-**Purpose:** Video search and clip selection via Model Context Protocol
+Runs as a subprocess (stdio) of the cinema bot. Two modes:
+- **`server.py`** (production): Queries GoodCLIPS API for semantic search, fetches captions from Postgres
+- **`mock_server.py`** (development): Keyword-based search with hardcoded scenes
 
-**Two Modes:**
+MCP tools exposed:
+- `search_video_clips(query, top_k)` — Find matching video clips
+- `play_video_by_params(video_id, start, end)` — Select a specific clip
 
-**Mock Mode (Development):**
-- File: `mock_server.py`
-- Keyword-based search with hardcoded scenes
-- 5 test videos from educational films
-- Fast, no external dependencies
+### 3. GoodCLIPS API (Server, port 8080)
 
-**Production Mode (Future):**
-- File: `server.py`
-- Integrates with GoodCLIPS API
-- Semantic multi-modal search
-- Visual, audio, and text embeddings
+**Location:** Root `docker-compose.yml`
 
-**MCP Tools Exposed:**
-- `search_video_clips(query, top_k)` - Search for matching clips
-- `play_video_by_params(video_id, start, end)` - Select specific clip
+Massimo's Go API for multi-modal semantic video search:
+- `POST /api/v1/search/semantic` — Text query → matching scenes (uses e5-base-v2 text embeddings)
+- `GET /api/v1/stats` — Database statistics
+- `GET /api/v1/jobs` — Job queue status
+- `GET /health` — Health check
 
-**Communication:**
-- Protocol: JSON-RPC over stdin/stdout
-- Started as subprocess by cinema_bot
-- No network ports needed
+Backed by PostgreSQL + pgvector for vector similarity search.
 
-### 3. Video Playback Service (Pi)
+### 4. Video Playback Service (Pi, port 5000)
 
 **Location:** `twistedtv-pi-client/video_playback/video_playback_service_mpv.py`
 
-**Purpose:** HTTP API for playing video clips on TV via mpv
+Flask HTTP API that controls MPV on the Pi's HDMI output:
+- `POST /play` — Play a clip: `{"video_path": "http://server:9000/movie.mp4", "start": 100, "end": 105}`
+- `POST /stop` — Stop playback
+- `GET /status` — Current playback state
+- `GET /health` — Health check
 
-**Endpoints:**
-- `POST /play` - Play a video clip with start/end times
-- `POST /stop` - Stop current playback
-- `GET /status` - Get playback status
-- `GET /health` - Health check
+Shows `static.mp4` (TV static) when idle. Uses DRM/KMS rendering for Raspberry Pi.
 
-**Features:**
-- DRM/KMS rendering for Raspberry Pi
-- VT switching for framebuffer control
-- Display blanking between clips
-- Automatic cleanup on exit
-
-**Configuration:**
-- Port: 5000 (default)
-- Display: HDMI output (primary or secondary)
-- Player: mpv with hardware acceleration
-
-### 4. Pi Daily.co Client (Pi)
-
-**Location:** `twistedtv-pi-client/pi_daily_client/pi_daily_client.py`
-
-**Purpose:** Bridge between Daily.co room and local Pi services
-
-**Functions:**
-- Capture audio from phone microphone
-- Join Daily.co WebRTC room with token
-- Stream audio to server
-- Listen for video playback commands (RTVI messages)
-- Call local video playback service
-
-**Protocol Support:**
-- RTVI (Real-Time Video Intelligence)
-- Daily.co app messages
-- VAD (Voice Activity Detection) for user speaking indicator
-
-**Configuration:**
-- Environment variables: `DAILY_ROOM_URL`, `DAILY_TOKEN`
-- Backend URL: `BACKEND_URL` (for status updates)
-- Video service: `VIDEO_SERVICE_URL` (default: http://localhost:5000)
-
-### 5. Next.js Dashboard (Pi)
-
-**Location:** `twistedtv-pi-client/frontend/`
-
-**Purpose:** Web UI for monitoring and controlling the installation
-
-**Features:**
-- Start/stop conversation sessions
-- View real-time transcription
-- See selected video clips
-- Monitor bot status
-- Configure backend URL
-
-**Access:**
-- URL: `http://192.168.1.201:3000` (from local network)
-- Port: 3000
-- Mode: Development (`npm run dev`) or Production (`npm start`)
-
-**API Routes:**
-- `/api/connect_local` - Connect to local backend
-- `/api/connect_runpod` - Connect to RunPod backend
-- `/api/start_pi_client` - Spawn Pi Daily client process
-- `/api/cleanup_pi` - Kill old Pi client processes
-
-### 6. Video Streaming Server (Server)
+### 5. Video Streaming Server (Server, port 9000)
 
 **Location:** `twistedtv-video-server/streaming_server.py`
 
-**Purpose:** HTTP server for streaming video files to Pi
+Simple Flask server that serves video files from `data/videos/` over HTTP. The Pi's MPV player fetches clips from here via HTTP range requests.
 
-**Features:**
-- Serves video files over HTTP
-- Support for range requests (seeking)
-- Flask-based lightweight server
-- CORS enabled for cross-origin access
+### 6. Next.js Dashboard (Pi, port 3000)
 
-**Configuration:**
-- Port: 9000 (default)
-- Video directory: `videos/`
-- Supported formats: .mp4, .mkv, .avi, .mov
+**Location:** `twistedtv-pi-client/frontend/`
 
----
-
-## Setup & Installation
-
-### Prerequisites
-
-**Server Machine:**
-- Python 3.11+
-- NVIDIA GPU (recommended for Whisper)
-- Docker (optional, for containerized deployment)
-- OpenAI API key
-- Daily.co API key
-
-**Raspberry Pi:**
-- Raspberry Pi 4 or newer
-- Raspberry Pi OS (64-bit recommended)
-- Python 3.11+
-- Node.js 18+
-- Audio input device (USB sound card or HAT)
-- HDMI output to TV
-
-**Network:**
-- Internet connection (for Daily.co WebRTC and OpenAI API)
-- Local network for Pi communication (optional dashboard access)
-
-### Server Setup
-
-```bash
-# Navigate to server directory
-cd cinema-chat/twistedtv-server
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment
-cp .env.example .env
-nano .env  # Add your API keys
-
-# Environment variables needed:
-# OPENAI_API_KEY=sk-...
-# DAILY_API_KEY=...
-# DAILY_API_URL=https://api.daily.co/v1
-# WHISPER_DEVICE=cuda  # or 'cpu'
-# BACKEND_SERVER_URL=http://<your-ip>:8765
-```
-
-### Raspberry Pi Setup
-
-```bash
-# SSH to Pi
-ssh pi@192.168.1.201
-
-# Create twistedtv directory
-mkdir -p ~/twistedtv-pi-client
-
-# Copy files from server (run on server)
-cd cinema-chat
-./twistedtv-pi-client/scripts/deploy_to_pi.sh
-
-# Or manually with rsync:
-rsync -av twistedtv-pi-client/ pi@192.168.1.201:~/twistedtv-pi-client/
-
-# On Pi - Install Python dependencies
-cd ~/twistedtv-pi-client
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Install Node.js dependencies
-cd frontend
-npm install
-npm run build  # For production
-
-# Install system dependencies
-sudo apt-get update
-sudo apt-get install mpv python3-pyaudio portaudio19-dev
-```
-
-### Video Server Setup
-
-```bash
-# Navigate to video server directory
-cd cinema-chat/twistedtv-video-server
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Add video files to videos/ directory
-# Files should be named descriptively
-```
-
----
-
-## Deployment Guide
-
-### Local Development Deployment
-
-**Terminal 1 - MCP Server:**
-```bash
-cd twistedtv-server/mcp_server
-python3 mock_server.py
-```
-
-**Terminal 2 - Cinema Bot Backend:**
-```bash
-cd twistedtv-server/cinema_bot
-source ../venv/bin/activate
-python3 server.py
-```
-
-**Terminal 3 - Video Streaming Server:**
-```bash
-cd twistedtv-video-server
-source venv/bin/activate
-python3 streaming_server.py
-```
-
-**Terminal 4 - Pi Dashboard (optional):**
-```bash
-# On Pi
-cd ~/twistedtv-pi-client/frontend
-npm run dev
-```
-
-### Production Deployment (Docker)
-
-**Build Server Image:**
-```bash
-cd twistedtv-server
-./build.sh
-```
-
-**Run Server Container:**
-```bash
-docker run -d \
-  --name twistedtv-server \
-  --gpus all \
-  -p 8765:8765 \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
-  -e DAILY_API_KEY=$DAILY_API_KEY \
-  -e WHISPER_DEVICE=cuda \
-  twistedtv-server:latest
-```
-
-**Pi Services (systemd):**
-
-Create `/etc/systemd/system/twistedtv-video.service`:
-```ini
-[Unit]
-Description=TwistedTV Video Playback Service
-After=network.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/twistedtv-pi-client/video_playback
-ExecStart=/home/pi/twistedtv-pi-client/venv/bin/python3 video_playback_service_mpv.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Create `/etc/systemd/system/twistedtv-dashboard.service`:
-```ini
-[Unit]
-Description=TwistedTV Dashboard
-After=network.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/twistedtv-pi-client/frontend
-ExecStart=/usr/bin/npm start
-Restart=always
-RestartSec=10
-Environment="NODE_ENV=production"
-Environment="PORT=3000"
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable services:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable twistedtv-video
-sudo systemctl enable twistedtv-dashboard
-sudo systemctl start twistedtv-video
-sudo systemctl start twistedtv-dashboard
-```
-
-### Cloud Deployment (RunPod)
-
-```bash
-# Build and push Docker image
-cd twistedtv-server
-docker build -t your-registry/twistedtv-server:latest .
-docker push your-registry/twistedtv-server:latest
-
-# Deploy on RunPod with GPU
-# Use template with:
-# - GPU: RTX 3090 or better
-# - Expose port: 8765
-# - Environment variables: OPENAI_API_KEY, DAILY_API_KEY
-# - Docker image: your-registry/twistedtv-server:latest
-```
+Web UI accessible at `http://192.168.1.109:3000`:
+- Start/stop conversation sessions
+- View real-time transcription
+- Monitor bot status
+- API routes spawn the Pi Daily Client on demand
 
 ---
 
@@ -580,571 +513,167 @@ docker push your-registry/twistedtv-server:latest
 
 ### Starting a Session
 
-**1. Ensure Services Running:**
-```bash
-# Server
-curl http://your-server:8765/health
+1. **Verify server services are running:**
+   ```bash
+   systemctl is-active twistedtv-server twistedtv-video-server
+   curl -s http://localhost:8080/health | python3 -m json.tool
+   ```
 
-# Pi video service
-curl http://192.168.1.201:5000/health
+2. **Open Pi dashboard:** `http://192.168.1.109:3000`
 
-# Pi dashboard (if using)
-curl http://192.168.1.201:3000
-```
+3. **Click "Connect to Local Backend"** — This creates a Daily.co room, spawns the Pi Daily Client, and connects everything.
 
-**2. Start Session from Dashboard:**
-- Open browser: `http://192.168.1.201:3000`
-- Enter backend server URL: `http://your-server:8765/api`
-- Click "Start Experience"
-- Dashboard shows room URL and client PID
+4. **Speak into the phone** — Video clips play on the TV.
 
-**3. Or Start Session via API:**
-```bash
-# Create room
-curl -X POST http://your-server:8765/api/connect \
-  -H "Content-Type: application/json" \
-  -d '{"config":[]}' | jq
+### Monitoring
 
-# Note the room_url and token
-
-# Start Pi client (on Pi)
-export DAILY_ROOM_URL="<room_url>"
-export DAILY_TOKEN="<token>"
-export BACKEND_URL="http://your-server:8765"
-export VIDEO_SERVICE_URL="http://localhost:5000"
-cd ~/twistedtv-pi-client/pi_daily_client
-python3 pi_daily_client.py
-```
-
-**4. Monitor Logs:**
 ```bash
 # Server logs
-docker logs -f twistedtv-server
+tail -f /tmp/twistedtv-server.log
 
-# Pi client logs
-tail -f /tmp/pi_client.log
+# Video server logs
+tail -f /tmp/twistedtv-video-server.log
 
-# Pi video logs
-sudo journalctl -u twistedtv-video -f
+# Docker logs (GoodCLIPS API)
+docker compose logs -f goodclips-api
+
+# Pi video playback status
+curl -s http://192.168.1.109:5000/status
+
+# Database stats
+curl -s http://localhost:8080/api/v1/stats | python3 -m json.tool
 ```
 
-**5. Use the Installation:**
-- Speak into the phone
-- Wait for transcription and LLM processing (~2-3 seconds)
-- Video clip plays on TV
-- TV blanks (NO SIGNAL) when waiting for next input
+### Stopping
 
-### Stopping a Session
-
-**From Dashboard:**
-- Click "Stop Experience" button
-- Or refresh page (auto-cleanup on exit)
-
-**Manually:**
-```bash
-# Kill Pi client
-pkill -f pi_daily_client.py
-
-# Or use cleanup script
-bash ~/twistedtv-pi-client/scripts/cleanup_pi.sh
-```
-
-### Monitoring Status
-
-**Check Conversation Status:**
-```bash
-curl http://your-server:8765/conversation-status/<identifier> | jq
-```
-
-**Response:**
-```json
-{
-  "identifier": "uuid-here",
-  "status": "active",
-  "context": {
-    "messages": [
-      {"role": "user", "content": "hello"},
-      {"role": "assistant", "content": "greeting"}
-    ],
-    "display_messages": [
-      {"type": "video", "video_path": "hemo_1.mp4", "start": 0, "end": 5}
-    ]
-  }
-}
-```
+- Click "Stop" on the Pi dashboard, or:
+  ```bash
+  ssh twistedtv@192.168.1.109 "pkill -f pi_daily_client"
+  ```
 
 ---
 
 ## Debugging & Troubleshooting
 
-### Common Issues
+### Semantic Search Returns Error
 
-#### No Audio from Phone
+**Symptom:** `{"error": "Failed to embed query", "details": "...TimmWrapperConfig..."}`
 
-**Symptoms:** Pi client joins room but server doesn't receive audio
+**Cause:** Docker image has incompatible timm/torchvision versions.
 
-**Debug:**
+**Fix:**
 ```bash
-# On Pi - Test microphone
-arecord -l  # List devices
-arecord -D hw:1,0 -d 5 test.wav  # Record 5 seconds
-aplay test.wav  # Play back
-
-# Check Pi client logs
-tail -f /tmp/pi_client.log | grep -i audio
-
-# Check server logs
-docker logs twistedtv-server | grep -i whisper
+docker exec goodclips-api pip uninstall -y timm torchvision
 ```
 
-**Solutions:**
-- Verify audio device in Pi client configuration
-- Check USB sound card is connected and recognized
-- Ensure Daily.co room has audio enabled
-- Check firewall/network allows WebRTC
+### No Scenes in Database
 
-#### Video Commands Not Received
+**Symptom:** Search returns empty results, `GET /api/v1/stats` shows 0 scenes.
 
-**Symptoms:** LLM selects video but Pi doesn't play it
+**Fix:** Run the ingestion pipeline (see [Cloud Ingestion](#cloud-ingestion-runpod)).
+
+### Video Won't Play on Pi
 
 **Debug:**
 ```bash
-# Check Pi client receives messages
-tail -f /tmp/pi_client.log | grep -i "video-playback-command"
+# Check video server is reachable from Pi
+ssh twistedtv@192.168.1.109 "curl -s -I http://192.168.1.106:9000/carnival_of_souls.mp4 | head -3"
 
-# Check server sends commands
-docker logs twistedtv-server | grep -i "Sending video command"
+# Check video playback service on Pi
+ssh twistedtv@192.168.1.109 "curl -s http://localhost:5000/health"
 
-# Test video service directly
-curl -X POST http://192.168.1.201:5000/play \
+# Test playback directly
+ssh twistedtv@192.168.1.109 "curl -X POST http://localhost:5000/play \
   -H 'Content-Type: application/json' \
-  -d '{"video_url":"http://your-server:9000/videos/test.mp4","start":0,"end":5}'
+  -d '{\"video_path\": \"http://192.168.1.106:9000/carnival_of_souls.mp4\", \"start\": 100, \"end\": 105}'"
 ```
 
-**Solutions:**
-- Verify Pi client is connected to Daily room
-- Check RTVI message format is correct
-- Ensure video playback service is running
-- Check video URL is accessible from Pi
+### Systemd Service Won't Start (Exit Code 203)
 
-#### LLM Not Responding
+**Cause:** SELinux blocking execution from home directory.
 
-**Symptoms:** User speaks, transcription works, but no LLM response
+**Fix:** Ensure `ExecStart` is wrapped in `/bin/bash -c '...'` and that the service file is **copied** (not symlinked) to `/etc/systemd/system/`.
 
-**Debug:**
+### pg_dump Times Out During Ingestion
+
+**Cause:** Using `proxy.runpod.net` URL instead of direct IP.
+
+**Fix:** The `process-movie.sh` script handles this automatically. If doing it manually, get the pod's direct IP from the RunPod API:
 ```bash
-# Check LLM API key
-echo $OPENAI_API_KEY
-
-# Check MCP server running
-ps aux | grep mock_server
-
-# Check server logs for errors
-docker logs twistedtv-server | grep -i error
-
-# Test OpenAI directly
-curl https://api.openai.com/v1/models \
-  -H "Authorization: Bearer $OPENAI_API_KEY"
+curl -s --request POST \
+  --url "https://api.runpod.io/graphql?api_key=$RUNPOD_API_KEY" \
+  --header 'content-type: application/json' \
+  --data '{"query": "query { pod(input: {podId: \"<pod-id>\"}) { runtime { ports { ip isIpPublic privatePort publicPort } } } }"}' \
+  | python3 -m json.tool
 ```
+Use the `ip` and `publicPort` for the port with `privatePort: 5432`.
 
-**Solutions:**
-- Verify OpenAI API key is valid
-- Check MCP server process is running
-- Review server logs for function call errors
-- Ensure conversation context isn't too long
-
-#### Video Playback Stuttering
-
-**Symptoms:** Video plays but stutters or lags
-
-**Debug:**
-```bash
-# Check Pi CPU/memory
-top
-
-# Check video file location
-# Videos should be on Pi or fast network
-
-# Check mpv logs
-tail -f ~/mpv_*.log
-
-# Test mpv directly
-mpv --fs --no-audio <video_file>
-```
-
-**Solutions:**
-- Use local video files on Pi (not streaming)
-- Reduce video resolution/bitrate
-- Enable hardware acceleration in mpv
-- Close other processes on Pi
-
-### Debug Logging
-
-**Enable Verbose Logging:**
-
-Server (.env):
-```bash
-LOG_LEVEL=DEBUG
-PIPECAT_LOG_LEVEL=DEBUG
-```
-
-Pi Client:
-```python
-# In pi_daily_client.py
-logging.basicConfig(level=logging.DEBUG)
-```
-
-**View All Logs:**
-```bash
-# Server
-docker logs -f --tail 100 twistedtv-server
-
-# Pi video service
-sudo journalctl -u twistedtv-video -f --lines 100
-
-# Pi dashboard
-sudo journalctl -u twistedtv-dashboard -f --lines 100
-
-# Pi client (if manual)
-tail -f /tmp/pi_client.log
-```
-
-### Performance Monitoring
+### No Audio from Phone
 
 ```bash
-# Check server GPU usage
-nvidia-smi -l 1
-
-# Check Pi resources
-htop
-
-# Check network latency
-ping 192.168.1.201
-
-# Check Daily.co connection
-# Look for "participant_joined" in server logs
-# Look for "Successfully joined room" in Pi logs
+# On Pi — test microphone
+ssh twistedtv@192.168.1.109
+arecord -l                           # List devices
+arecord -D plughw:1,0 -d 5 test.wav # Record 5 seconds
+aplay test.wav                       # Play back
 ```
 
 ---
 
-## Development Guidelines
+## Known Gotchas
 
-### Code Organization
+1. **SELinux on Fedora** — Systemd cannot execute binaries from `/home`. Wrap `ExecStart` in `/bin/bash -c '...'`. Copy (not symlink) service files to `/etc/systemd/system/`.
 
-**Server Code:**
-- All server-side code in `twistedtv-server/`
-- Separate bot logic from MCP server
-- Use environment variables for configuration
-- Never hardcode API keys
+2. **Python 3.12 required** — Python 3.14 is too new (missing wheels for daily-python, ctranslate2). Python 3.11 not available on Fedora 43. Install: `sudo dnf install -y python3.12 python3.12-devel`
 
-**Pi Code:**
-- All Pi code in `twistedtv-pi-client/`
-- Keep Pi client stateless (no persistent storage)
-- Frontend is optional monitoring tool
-- Video playback service should auto-recover
+3. **Docker timm/torchvision mismatch** — The GoodCLIPS API container's CPU runtime has `torch==2.4.0` but pip pulls in `torchvision==0.25.0` (needs torch 2.6). Fix: `docker exec goodclips-api pip uninstall -y timm torchvision`
 
-**Video Server:**
-- All video files in `twistedtv-video-server/videos/`
-- Use descriptive filenames
-- Don't commit large video files to git
+4. **RunPod TCP proxy is HTTP-only** — `*.proxy.runpod.net` URLs only handle HTTP, not raw TCP. For `pg_dump`, use the pod's direct public IP. `process-movie.sh` handles this automatically.
 
-### Testing Strategy
+5. **SSH to Pi requires agent forwarding** — The SSH key is on the local machine, not the server. SSH to the server with `ssh -A`, then SSH to the Pi.
 
-**Unit Tests:**
-- Test MCP tools independently
-- Test conversation flows with mock LLM
-- Test video playback service endpoints
+6. **`data/videos/` may be root-owned** — Docker creates it as root. Fix: `sudo chown -R twistedtv:twistedtv /home/twistedtv/cinema-chat/data`
 
-**Integration Tests:**
-- Test full flow: audio → transcription → LLM → video
-- Test Pi client connection to Daily room
-- Test video command delivery
-
-**Hardware Tests:**
-- Test with actual phone hardware
-- Test on target Raspberry Pi model
-- Test TV display and blanking
-- Test in installation environment
-
-### Import Paths
-
-**Server imports:**
-```python
-from cinema_bot.server import CinemaBotServer
-from cinema_bot.mcp_client import MCPClient
-from mcp_server.mock_server import MockMCPServer
-```
-
-**Pi imports:**
-```python
-from pi_daily_client.pi_daily_client import PiDailyClient
-from video_playback.video_playback_service_mpv import VideoPlaybackService
-```
-
-### Environment Management
-
-**Never commit:**
-- `.env` files with real API keys
-- Large video files
-- Temporary logs
-- SSH keys
-
-**Always provide:**
-- `.env.example` with all required variables
-- `requirements.txt` with pinned versions
-- README.md with setup instructions
-- Clear error messages
-
-### File Synchronization
-
-**CRITICAL: Always edit locally first, then sync to Pi**
-
-```bash
-# Edit files locally
-vim twistedtv-pi-client/pi_daily_client/pi_daily_client.py
-
-# Sync to Pi
-rsync -av twistedtv-pi-client/ pi@192.168.1.201:~/twistedtv-pi-client/
-
-# Restart service on Pi
-ssh pi@192.168.1.201 'sudo systemctl restart twistedtv-video'
-
-# Commit changes to git
-git add twistedtv-pi-client/
-git commit -m "Update Pi client"
-```
-
-**Never:**
-- Edit files directly on Pi via SSH
-- Make changes on Pi without syncing back
-- Assume local and Pi files are in sync
+7. **Docker group needs re-login** — After `sudo usermod -aG docker twistedtv`, you must log out and back in. Until then, use `sg docker -c "docker compose up -d"`.
 
 ---
 
-## PR Preparation
+## Port Reference
 
-### Repository Context
+| Service | Port | Location | Protocol |
+|---------|------|----------|----------|
+| TwistedTV FastAPI | 8765 | Server | HTTP |
+| Video Streaming | 9000 | Server | HTTP |
+| GoodCLIPS API | 8080 | Server | HTTP |
+| PostgreSQL | 5432 | Server | TCP |
+| Redis | 6379 | Server | TCP |
+| Video Playback (MPV) | 5000 | Pi | HTTP |
+| Next.js Dashboard | 3000 | Pi | HTTP |
 
-This codebase lives in Massimo's `cinema-chat` repository:
-- **Owner:** Massimo (byron-the-bulb)
-- **Primary Purpose:** GoodCLIPS semantic video search API (Go)
-- **Our Addition:** TwistedTV art installation (Python)
+## Environment Variables
 
-**Massimo's Code (unchanged):**
-- `cmd/` - Go API entry points
-- `internal/` - Go API implementation
-- `migrations/` - Database migrations
-- `docker-compose.yml` - GoodCLIPS stack
+**Server `.env`** (at `twistedtv-server/cinema_bot/.env`):
 
-**Our Code (new directories):**
-- `twistedtv-server/` - Server-side bot + MCP
-- `twistedtv-pi-client/` - Raspberry Pi client + frontend
-- `twistedtv-video-server/` - Video storage + streaming
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4 and Whisper |
+| `DAILY_API_KEY` | Yes | Daily.co API key for WebRTC rooms |
+| `DAILY_API_URL` | Yes | `https://api.daily.co/v1` |
+| `WHISPER_DEVICE` | Yes | `cpu` (this server has no GPU) |
+| `BACKEND_SERVER_URL` | Yes | `http://192.168.1.106:8765` |
+| `GOODCLIPS_API_URL` | Yes | `http://localhost:8080` |
+| `VIDEO_SERVER_URL` | Yes | `http://192.168.1.106:9000` |
+| `PLAYBACK_SERVICE_URL` | Yes | `http://192.168.1.109:5000` |
+| `RUNPOD_API_KEY` | For ingestion | RunPod API key |
 
-### PR Summary
+**Pi `.env`** (at `twistedtv-pi-client/frontend/.env`):
 
-**Title:** Add TwistedTV Art Installation Components
-
-**Description:**
-
-This PR adds the TwistedTV art installation to the cinema-chat repository. TwistedTV is a phone-based conversational AI that responds exclusively through old movie clips, using the GoodCLIPS semantic search API for video selection.
-
-**What's Added:**
-
-Three new top-level directories with complete separation from existing codebase:
-
-1. **twistedtv-server/** - Server components (FastAPI bot + MCP server)
-   - LLM conversation management (OpenAI GPT-4)
-   - Whisper STT for speech-to-text
-   - MCP server for video search (mock + real modes)
-   - Integration with GoodCLIPS API
-   - Daily.co WebRTC for audio transport
-
-2. **twistedtv-pi-client/** - Raspberry Pi components (runs at installation)
-   - Daily.co client for audio capture and video commands
-   - Video playback service (mpv) for TV output
-   - Next.js dashboard for monitoring (optional)
-
-3. **twistedtv-video-server/** - Video storage and streaming
-   - Flask HTTP server for video file delivery
-   - Video file storage (not in git)
-
-**What's NOT Changed:**
-- Zero modifications to existing Go API code
-- Zero modifications to existing infrastructure
-- GoodCLIPS API can be used independently or with TwistedTV
-
-**Architecture:**
-
-Uses GoodCLIPS API for semantic video search via MCP (Model Context Protocol):
-- LLM generates semantic descriptions ("person nodding in agreement")
-- MCP server queries GoodCLIPS API `/api/v1/search/scenes`
-- Returns best matching video clips
-- Pi plays clips on TV via HDMI
-
-**Documentation:**
-- `TWISTEDTV.md` - Comprehensive documentation
-- Individual README.md files in each directory
-- Architecture diagrams and deployment guides
-
-**Testing:**
-- Tested with mock MCP server (keyword-based)
-- Ready for GoodCLIPS integration (semantic search)
-- Deployed and tested on Raspberry Pi 4
-
-### Removed References
-
-All code has been cleaned of previous project references:
-- ❌ Sphinx (old project name)
-- ❌ The Turning Point (reference project)
-- ❌ Hume AI (emotion detection - not used)
-- ❌ Cartesia/ElevenLabs TTS (replaced with video)
-
-### Integration Points
-
-**How TwistedTV uses GoodCLIPS:**
-
-1. User speaks into phone → Transcribed by Whisper
-2. LLM understands intent → Generates semantic description
-3. MCP server calls: `POST /api/v1/search/scenes`
-   ```json
-   {
-     "query": "person looking confused and scratching head",
-     "top_k": 5,
-     "modalities": ["visual", "text", "audio"]
-   }
-   ```
-4. GoodCLIPS returns ranked video clips
-5. Best match played on TV
-
-**Benefits for GoodCLIPS:**
-- Real-world usage example
-- Demonstrates semantic search quality
-- Provides test harness for API improvements
-- Can be showcased as reference implementation
-
-### Deployment Independence
-
-Both systems can run independently:
-- **GoodCLIPS alone:** Standard API deployment (no changes needed)
-- **TwistedTV alone:** Uses mock MCP server for testing
-- **Both together:** Full semantic video search integration
-
-### Future Work
-
-- [ ] Replace mock MCP server with real GoodCLIPS integration
-- [ ] Add caching layer for frequently used clips
-- [ ] Implement curator mode for manual clip selection
-- [ ] Add analytics/metrics for popular clips
-- [ ] Support multiple concurrent installations
+| Variable | Description |
+|----------|-------------|
+| `NEXT_PUBLIC_API_URL` | `http://192.168.1.106:8765` |
+| `NEXT_PUBLIC_API_ENDPOINT` | `/connect_local` |
+| `RUNPOD_API_KEY` | RunPod API key (for cloud connect mode) |
 
 ---
 
-## Appendix
-
-### Port Reference
-
-| Service | Port | Location |
-|---------|------|----------|
-| Cinema Bot Backend | 8765 | Server |
-| Video Playback Service | 5000 | Pi |
-| Next.js Dashboard | 3000 | Pi |
-| Video Streaming Server | 9000 | Server |
-| GoodCLIPS API | 8080 | Server |
-
-### Environment Variables Reference
-
-**Server (.env):**
-```bash
-# Required
-OPENAI_API_KEY=sk-...
-DAILY_API_KEY=...
-DAILY_API_URL=https://api.daily.co/v1
-
-# Optional
-WHISPER_DEVICE=cuda
-WHISPER_MODEL=base.en
-LLM_MODEL=gpt-4o
-BACKEND_SERVER_URL=http://localhost:8765
-HOST=0.0.0.0
-PORT=8765
-
-# CloudWatch (optional)
-CLOUDWATCH_LOG_GROUP=/twistedtv/backend
-AWS_REGION=us-east-1
-```
-
-**Pi (.env.local in frontend):**
-```bash
-NEXT_PUBLIC_API_URL=http://your-server:8765/api
-```
-
-**Pi Client (environment variables):**
-```bash
-DAILY_ROOM_URL=https://your-domain.daily.co/room-name
-DAILY_TOKEN=eyJhbGc...
-BACKEND_URL=http://your-server:8765
-VIDEO_SERVICE_URL=http://localhost:5000
-```
-
-### Network Requirements
-
-**Outbound (Server):**
-- api.openai.com:443 (OpenAI API)
-- api.daily.co:443 (Daily.co API)
-- *.daily.co:443 (Daily.co WebRTC)
-
-**Outbound (Pi):**
-- *.daily.co:443 (Daily.co WebRTC)
-- your-server:8765 (Backend API)
-- your-server:9000 (Video streaming)
-
-**Inbound (Optional):**
-- Pi:3000 (Dashboard, local network only)
-- Pi:5000 (Video service, localhost only)
-
-### Key Files Reference
-
-**Most Important Files:**
-
-| File | Purpose | Runs On |
-|------|---------|---------|
-| `twistedtv-server/cinema_bot/server.py` | Main FastAPI server | Server |
-| `twistedtv-server/mcp_server/mock_server.py` | MCP video search | Server |
-| `twistedtv-pi-client/pi_daily_client/pi_daily_client.py` | Daily.co client | Pi |
-| `twistedtv-pi-client/video_playback/video_playback_service_mpv.py` | Video playback | Pi |
-| `twistedtv-pi-client/frontend/pages/index.tsx` | Dashboard UI | Pi |
-| `twistedtv-video-server/streaming_server.py` | Video HTTP server | Server |
-
-### Version History
-
-- **2025-11-30:** Restructured into three directories, comprehensive documentation
-- **2025-11-24:** Direct spawn architecture, removed wrapper scripts
-- **2025-11-20:** Initial implementation with mock MCP server
-- **2025-11-12:** Project started, adapted from reference codebase
-
----
-
-## Support & Contact
-
-**For Issues:**
-1. Check logs (see Debugging section)
-2. Review conversation status API
-3. Verify all services are running
-4. Check environment variables
-5. Test individual components
-
-**Documentation:**
-- This file: `TWISTEDTV.md` - Comprehensive reference
-- Server: `twistedtv-server/README.md` - Server setup
-- Pi: `twistedtv-pi-client/README.md` - Pi setup
-- Video: `twistedtv-video-server/README.md` - Video server setup
-
-**Repository:**
-- https://github.com/byron-the-bulb/cinema-chat (Massimo's repo)
-- GoodCLIPS API documentation (when available)
-
----
-
-*Last updated: 2025-11-30*
+*Last updated: 2026-02-25*

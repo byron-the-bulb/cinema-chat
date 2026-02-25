@@ -111,7 +111,7 @@ This will:
 # From development machine
 rsync -av --exclude node_modules \
   twistedtv-pi-client/ \
-  twistedtv@192.168.1.201:~/twistedtv-pi-client/
+  twistedtv@192.168.1.109:~/twistedtv-pi-client/
 ```
 
 ## Running

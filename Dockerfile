@@ -28,14 +28,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
+# Note: torch 2.4.0 CPU-only; do NOT install timm or torchvision here
+# (version mismatch with torch causes TimmWrapperConfig import errors)
 RUN pip install --no-cache-dir \
       numpy \
       opencv-python-headless \
       scenedetect \
     && pip install --no-cache-dir \
       torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir --no-deps \
+      transformers==4.52.1 \
     && pip install --no-cache-dir \
-      transformers==4.52.1 einops accelerate huggingface-hub
+      einops accelerate huggingface-hub tokenizers safetensors regex
 
 WORKDIR /root/
 

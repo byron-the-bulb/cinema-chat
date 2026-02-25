@@ -45,6 +45,11 @@ class MCPClient:
         response = await self._read_response()
         logger.info(f"[MCP] Server initialized: {response}")
 
+        # Send initialized notification (required by MCP protocol)
+        notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        self.process.stdin.write(notif.encode())
+        await self.process.stdin.drain()
+
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Call an MCP tool and return the result
 

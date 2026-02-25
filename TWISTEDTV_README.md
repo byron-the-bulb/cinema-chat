@@ -218,19 +218,19 @@ CLOUDWATCH_LOG_GROUP=/twistedtv
 
 ### Test Audio Capture on Pi
 ```bash
-ssh twistedtv@192.168.1.201
+ssh twistedtv@192.168.1.109
 arecord -l  # List audio devices
 arecord -D plughw:1,0 -f cd test.wav  # Test recording
 ```
 
 ### Test Video Playback on Pi
 ```bash
-ssh twistedtv@192.168.1.201
+ssh twistedtv@192.168.1.109
 mpv http://192.168.1.XXX:9000/videos/test.mp4  # Test streaming
 ```
 
 ### Test Full Flow
-1. Open Pi dashboard: `http://192.168.1.201:3000`
+1. Open Pi dashboard: `http://192.168.1.109:3000`
 2. Click "Connect to Local Backend"
 3. Speak into phone
 4. Verify transcription appears

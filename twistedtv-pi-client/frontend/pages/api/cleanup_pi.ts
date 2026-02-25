@@ -22,7 +22,7 @@ export default async function handler(
 
     // Run the cleanup script on the Pi
     const { stdout, stderr } = await execPromise(
-      'ssh twistedtv@192.168.1.201 "bash /home/twistedtv/cleanup_pi.sh"'
+      'ssh twistedtv@192.168.1.109 "bash /home/twistedtv/cleanup_pi.sh"'
     );
 
     console.log('Cleanup stdout:', stdout);

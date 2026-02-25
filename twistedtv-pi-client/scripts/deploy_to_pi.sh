@@ -4,7 +4,7 @@
 set -e
 
 PI_USER="twistedtv"
-PI_HOST="192.168.1.201"
+PI_HOST="192.168.1.109"
 PI_PATH="/home/twistedtv/twistedtv-pi-client"
 
 echo "Deploying TwistedTV Pi Client to ${PI_USER}@${PI_HOST}..."

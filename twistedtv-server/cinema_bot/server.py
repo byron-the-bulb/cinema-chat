@@ -124,7 +124,7 @@ def cleanup_room(room_url: str) -> Dict[str, Any]:
         try:
             # Kill via SSH to avoid killing our own connection
             subprocess.run(
-                ['ssh', 'twistedtv@192.168.1.201', f'kill {pi_client_pid}'],
+                ['ssh', 'twistedtv@192.168.1.109', f'kill {pi_client_pid}'],
                 check=False,
                 timeout=5
             )
@@ -139,7 +139,7 @@ def cleanup_room(room_url: str) -> Dict[str, Any]:
         try:
             # Kill via SSH
             subprocess.run(
-                ['ssh', 'twistedtv@192.168.1.201', f'kill {video_service_pid}'],
+                ['ssh', 'twistedtv@192.168.1.109', f'kill {video_service_pid}'],
                 check=False,
                 timeout=5
             )
@@ -565,7 +565,7 @@ async def get_pi_audio_devices():
     """
     try:
         # SSH to Pi and run arecord -l to list audio capture devices
-        pi_host = os.getenv("PI_HOST", "192.168.1.201")
+        pi_host = os.getenv("PI_HOST", "192.168.1.109")
         pi_user = os.getenv("PI_USER", "twistedtv")
 
         result = subprocess.run(
@@ -649,7 +649,7 @@ async def set_pi_audio_device(request: Request):
 
         # Store the selected device in an environment variable file on the Pi
         # This will be used by the Pi client when it starts
-        pi_host = os.getenv("PI_HOST", "192.168.1.201")
+        pi_host = os.getenv("PI_HOST", "192.168.1.109")
         pi_user = os.getenv("PI_USER", "twistedtv")
 
         # Create a config file on the Pi with the selected device
