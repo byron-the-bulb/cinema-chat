@@ -174,7 +174,10 @@ func searchScenesByAnchor(c *gin.Context) {
     })
 }
 
-// searchText is a simple placeholder for keyword caption search (not implemented yet)
+// searchText finds scenes whose spoken dialog is most semantically similar to the query.
+// Unlike searchSemantic (which searches visual+dialog mixed embeddings across all scenes),
+// this only considers scenes that have real subtitle captions (language != 'iv2'), and
+// returns the matched dialog text alongside each result.
 func searchText(c *gin.Context) {
     var req struct {
         Query    string `json:"query"`
@@ -185,7 +188,66 @@ func searchText(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid search request", "details": err.Error()})
         return
     }
-    c.JSON(http.StatusNotImplemented, gin.H{"error": "caption keyword search not implemented yet"})
+
+    if strings.TrimSpace(req.Query) == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "query must not be empty"})
+        return
+    }
+
+    limit := req.Limit
+    if limit <= 0 {
+        limit = 10
+    }
+    if limit > 100 {
+        limit = 100
+    }
+
+    // Embed the query with e5-base-v2 (same model used when captions were ingested)
+    vec, err := embedTextQuery(req.Query)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error":   "Failed to embed query",
+            "details": err.Error(),
+        })
+        return
+    }
+
+    // Search against scenes that have real dialog captions only
+    scenes, dists, dialogs, err := db.SearchScenesByDialogVector(vec, limit, req.VideoIDs)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error":   "Dialog search failed",
+            "details": err.Error(),
+        })
+        return
+    }
+
+    items := make([]gin.H, 0, len(scenes))
+    for i, s := range scenes {
+        items = append(items, gin.H{
+            "scene": gin.H{
+                "id":            s.ID,
+                "uuid":          s.UUID,
+                "video_id":      s.VideoID,
+                "scene_index":   s.SceneIndex,
+                "start_time":    s.StartTime,
+                "end_time":      s.EndTime,
+                "duration":      s.Duration,
+                "has_captions":  s.HasCaptions,
+                "caption_count": s.CaptionCount,
+                "created_at":    s.CreatedAt,
+            },
+            "distance": dists[i],
+            "dialog":   dialogs[i],
+        })
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "query":   req.Query,
+        "limit":   limit,
+        "count":   len(items),
+        "results": items,
+    })
 }
 
 // getStats returns aggregate DB stats

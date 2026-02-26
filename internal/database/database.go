@@ -376,3 +376,92 @@ func (db *DB) SearchScenesByTextVector(vec []float32, k int, filterVideoIDs []ui
     }
     return scenes, dists, nil
 }
+// SearchScenesByDialogVector finds top-K scenes whose dialog (non-iv2 captions) is most
+// semantically similar to the query vector. Only scenes that have real subtitle captions
+// (language != 'iv2') are considered. Captions are matched to scenes by time overlap
+// since FFmpeg-extracted captions do not carry a scene_id FK.
+//
+// Returns: scenes, cosine distances, and the aggregated dialog text for each scene.
+func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []uint) ([]models.Scene, []float64, []string, error) {
+    v := pgvector.NewVector(vec)
+
+    type row struct {
+        ID           uint
+        UUID         string
+        VideoID      uint
+        SceneIndex   int
+        StartTime    float64
+        EndTime      float64
+        Duration     float64
+        HasCaptions  bool
+        CaptionCount int
+        CreatedAt    time.Time
+        Distance     float64 `gorm:"column:distance"`
+        DialogText   string  `gorm:"column:dialog_text"`
+    }
+
+    // Build the video-filter clause for raw SQL.
+    videoFilter := ""
+    args := []interface{}{v}
+    if len(filterVideoIDs) > 0 {
+        videoFilter = "AND s.video_id IN ("
+        for i, id := range filterVideoIDs {
+            if i > 0 {
+                videoFilter += ","
+            }
+            videoFilter += "?"
+            args = append(args, id)
+        }
+        videoFilter += ")"
+    }
+    args = append(args, k)
+
+    query := `
+        SELECT
+            s.id, s.uuid, s.video_id, s.scene_index,
+            s.start_time, s.end_time, s.duration,
+            s.has_captions, s.caption_count, s.created_at,
+            s.text_embedding <=> ? AS distance,
+            STRING_AGG(c.text, ' ' ORDER BY c.start_time) AS dialog_text
+        FROM scenes s
+        INNER JOIN captions c
+            ON  c.video_id   = s.video_id
+            AND c.language  != 'iv2'
+            AND c.start_time < s.end_time
+            AND c.end_time   > s.start_time
+        WHERE s.text_embedding IS NOT NULL
+        ` + videoFilter + `
+        GROUP BY
+            s.id, s.uuid, s.video_id, s.scene_index,
+            s.start_time, s.end_time, s.duration,
+            s.has_captions, s.caption_count, s.created_at,
+            s.text_embedding
+        ORDER BY distance ASC
+        LIMIT ?`
+
+    var rows []row
+    if err := db.Raw(query, args...).Scan(&rows).Error; err != nil {
+        return nil, nil, nil, err
+    }
+
+    scenes := make([]models.Scene, 0, len(rows))
+    dists := make([]float64, 0, len(rows))
+    dialogs := make([]string, 0, len(rows))
+    for _, r := range rows {
+        scenes = append(scenes, models.Scene{
+            ID:           r.ID,
+            UUID:         r.UUID,
+            VideoID:      r.VideoID,
+            SceneIndex:   r.SceneIndex,
+            StartTime:    r.StartTime,
+            EndTime:      r.EndTime,
+            Duration:     r.Duration,
+            HasCaptions:  r.HasCaptions,
+            CaptionCount: r.CaptionCount,
+            CreatedAt:    r.CreatedAt,
+        })
+        dists = append(dists, r.Distance)
+        dialogs = append(dialogs, r.DialogText)
+    }
+    return scenes, dists, dialogs, nil
+}
