@@ -182,6 +182,24 @@ auto_download_video() {
     echo "[Auto-download] Downloaded: ${FILESIZE} bytes"
 
     if [ "${FILESIZE}" -gt 1000000 ]; then
+        # ------------------------------------------------
+        # Transcribe audio → sidecar SRT before ingestion
+        # ------------------------------------------------
+        SRT_PATH="${FILEPATH%.*}.srt"
+        WHISPER_MODEL="${WHISPER_MODEL:-large-v3}"
+
+        if [ -f "${SRT_PATH}" ]; then
+            echo "[Auto-download] Sidecar SRT already exists: ${SRT_PATH}"
+        else
+            echo "[Auto-download] Transcribing audio (model=${WHISPER_MODEL})..."
+            python3 /root/cloud-ingestion/transcribe.py "${FILEPATH}" \
+                --output "${SRT_PATH}" \
+                --model "${WHISPER_MODEL}" \
+                --device cuda \
+                && echo "[Auto-download] Transcription complete: ${SRT_PATH}" \
+                || echo "[Auto-download] WARNING: Transcription failed, continuing without SRT"
+        fi
+
         echo "[Auto-download] Submitting for processing..."
         curl -s -X POST http://localhost:8080/api/v1/videos \
             -H "Content-Type: application/json" \

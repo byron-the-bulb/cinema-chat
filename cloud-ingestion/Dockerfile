@@ -52,7 +52,8 @@ RUN python3 -m pip install --upgrade pip \
     && pip install --no-cache-dir \
          decord av opencv-python-headless timm huggingface-hub \
          transformers==4.52.1 einops accelerate scenedetect \
-         open-clip-torch pillow safetensors librosa audioread
+         open-clip-torch pillow safetensors librosa audioread \
+         faster-whisper whisperx
 
 WORKDIR /root/
 
@@ -72,7 +73,9 @@ RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py
 COPY cloud-ingestion/entrypoint.sh /entrypoint.sh
 COPY cloud-ingestion/export-db.sh /root/export-db.sh
 COPY cloud-ingestion/download-and-process.sh /root/download-and-process.sh
-RUN chmod +x /entrypoint.sh /root/export-db.sh /root/download-and-process.sh
+COPY cloud-ingestion/transcribe.py /root/cloud-ingestion/transcribe.py
+RUN chmod +x /entrypoint.sh /root/export-db.sh /root/download-and-process.sh \
+             /root/cloud-ingestion/transcribe.py
 
 # Expose ports (API, PostgreSQL, Redis)
 EXPOSE 8080 5432 6379
