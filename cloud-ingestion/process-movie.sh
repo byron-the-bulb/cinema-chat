@@ -10,27 +10,35 @@
 #   6. The pod is terminated
 #
 # Usage:
-#   RUNPOD_API_KEY=rpa_... ./cloud-ingestion/process-movie.sh <movie_url> <filename>
+#   ./cloud-ingestion/process-movie.sh <movie_url> [filename]
 #
 # Examples:
-#   RUNPOD_API_KEY=rpa_... ./cloud-ingestion/process-movie.sh \
+#   ./cloud-ingestion/process-movie.sh \
 #     'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4' \
 #     'carnival_of_souls.mp4'
 #
 # Prerequisites:
-#   - RUNPOD_API_KEY environment variable set
+#   - RUNPOD_API_KEY in environment or in twistedtv-server/cinema_bot/.env
 #   - Local PostgreSQL running with goodclips database (via docker compose)
 #   - psql client installed locally
 
 set -e
 
-MOVIE_URL="${1}"
-MOVIE_FILENAME="${2:-movie.mp4}"
-RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
-GPU_TYPE="${GPU_TYPE:-NVIDIA RTX A4000}"
-DOCKER_IMAGE="va55/goodclips-runpod:latest"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+MOVIE_URL="${1}"
+MOVIE_FILENAME="${2:-movie.mp4}"
+# Auto-source RUNPOD_API_KEY from .env if not already set
+if [ -z "$RUNPOD_API_KEY" ]; then
+    ENV_FILE="${PROJECT_DIR}/twistedtv-server/cinema_bot/.env"
+    if [ -f "$ENV_FILE" ]; then
+        RUNPOD_API_KEY=$(grep -E '^RUNPOD_API_KEY=' "$ENV_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    fi
+fi
+RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
+GPU_TYPE="${GPU_TYPE:-NVIDIA RTX A4000}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-va55/goodclips-runpod:whisper-transcription}"
 VIDEO_DIR="${PROJECT_DIR}/data/videos"
 
 # Colors for output
@@ -283,39 +291,99 @@ except:
 done
 
 # ============================================
-# Step 5: Export database via pg_dump
+# Step 5: Export movie data from RunPod
 # ============================================
-log "Exporting database from RunPod..."
+log "Exporting movie data from RunPod..."
 
-DUMP_FILE="${PROJECT_DIR}/goodclips_$(date +%Y%m%d_%H%M%S).sql"
+REMOTE_VID=$(PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" \
+    -U goodclips -d goodclips -tA \
+    -c "SELECT id FROM videos WHERE filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
 
-PGPASSWORD=goodclips_dev_password pg_dump \
-    -h "$PG_HOST" \
-    -p "$PG_PORT" \
-    -U goodclips \
-    -d goodclips \
-    --no-owner \
-    --no-acl \
-    -f "$DUMP_FILE" 2>&1
+[ -z "$REMOTE_VID" ] && error "Movie '${MOVIE_FILENAME}' not found in RunPod database"
+log "Remote video ID: $REMOTE_VID"
 
-if [ ! -f "$DUMP_FILE" ] || [ ! -s "$DUMP_FILE" ]; then
-    error "pg_dump failed or produced empty file"
-fi
+EXPORT_DIR=$(mktemp -d)
 
-DUMP_SIZE=$(du -h "$DUMP_FILE" | cut -f1)
-log "Database exported: $DUMP_FILE ($DUMP_SIZE)"
+PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
+    -c "\copy (SELECT uuid, filename, file_hash, title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, status, metadata, error_message FROM videos WHERE id = ${REMOTE_VID}) TO '${EXPORT_DIR}/video.tsv'"
+
+PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
+    -c "\copy (SELECT id, uuid, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at FROM scenes WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/scenes.tsv'"
+
+PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
+    -c "\copy (SELECT uuid, scene_id, start_time, end_time, text, language, confidence, created_at FROM captions WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/captions.tsv'"
+
+EXPORT_SCENES=$(wc -l < "${EXPORT_DIR}/scenes.tsv")
+EXPORT_CAPTIONS=$(wc -l < "${EXPORT_DIR}/captions.tsv")
+log "Exported: ${EXPORT_SCENES} scenes, ${EXPORT_CAPTIONS} captions"
 
 # ============================================
 # Step 6: Import into local database
 # ============================================
 log "Importing into local PostgreSQL..."
 
-PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -f "$DUMP_FILE" 2>&1 | tail -5
+# Remove existing data for this movie if re-importing (CASCADE deletes scenes/captions)
+PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -c \
+    "DELETE FROM videos WHERE filename = '${MOVIE_FILENAME}';" 2>/dev/null
+
+PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips << IMPORT_SQL
+-- Staging tables for ID remapping
+CREATE TEMP TABLE _stg_video (
+    uuid uuid, filename text, file_hash text, title text, duration real,
+    scene_count int, caption_count int, embedding_model text,
+    created_at timestamptz, updated_at timestamptz, last_processed_at timestamptz,
+    tags jsonb, status text, metadata jsonb, error_message text
+);
+CREATE TEMP TABLE _stg_scenes (
+    remote_id int, uuid uuid, scene_index int, start_time real, end_time real,
+    has_captions bool, caption_count int,
+    visual_embedding vector(1024), text_embedding vector(768),
+    audio_embedding vector(512), visual_clip_embedding vector(512),
+    combined_embedding vector(768), created_at timestamptz
+);
+CREATE TEMP TABLE _stg_captions (
+    uuid uuid, remote_scene_id int, start_time real, end_time real,
+    text text, language varchar(10), confidence real, created_at timestamptz
+);
+
+\copy _stg_video FROM '${EXPORT_DIR}/video.tsv'
+\copy _stg_scenes FROM '${EXPORT_DIR}/scenes.tsv'
+\copy _stg_captions FROM '${EXPORT_DIR}/captions.tsv'
+
+-- Insert video with auto-generated local ID
+INSERT INTO videos (uuid, filename, filepath, file_hash, title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, status, metadata, error_message)
+SELECT uuid_generate_v4(), filename, '${VIDEO_DIR}/' || filename, md5(filename || now()::text), title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, 'completed', metadata, error_message
+FROM _stg_video
+RETURNING id AS new_vid_id \gset
+
+-- Insert scenes with new video_id, build remote-to-local ID map
+CREATE TEMP TABLE _scene_map AS
+WITH inserted AS (
+    INSERT INTO scenes (uuid, video_id, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at)
+    SELECT uuid_generate_v4(), :new_vid_id, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at
+    FROM _stg_scenes
+    ORDER BY remote_id
+    RETURNING id, scene_index
+)
+SELECT s.remote_id, i.id AS local_id
+FROM inserted i
+JOIN _stg_scenes s USING (scene_index);
+
+-- Insert captions with remapped scene IDs
+INSERT INTO captions (uuid, video_id, scene_id, start_time, end_time, text, language, confidence, created_at)
+SELECT uuid_generate_v4(), :new_vid_id, m.local_id, c.start_time, c.end_time, c.text, c.language, c.confidence, c.created_at
+FROM _stg_captions c
+LEFT JOIN _scene_map m ON c.remote_scene_id = m.remote_id;
+IMPORT_SQL
+
+rm -rf "$EXPORT_DIR"
 
 # Verify import
-LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -t -c \
-    "SELECT COUNT(*) FROM scenes;" 2>/dev/null | tr -d ' ')
-log "Import complete! $LOCAL_SCENES scenes in local database"
+LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA -c \
+    "SELECT COUNT(*) FROM scenes s JOIN videos v ON s.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
+LOCAL_CAPTIONS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA -c \
+    "SELECT COUNT(*) FROM captions c JOIN videos v ON c.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
+log "Import complete! ${LOCAL_SCENES} scenes, ${LOCAL_CAPTIONS} captions in local database"
 
 # ============================================
 # Step 7: Download video file for local streaming server
@@ -346,7 +414,7 @@ echo ""
 echo "=== Summary ==="
 echo "  Movie:    $MOVIE_FILENAME"
 echo "  Scenes:   $LOCAL_SCENES"
-echo "  DB dump:  $DUMP_FILE"
+echo "  Captions: $LOCAL_CAPTIONS"
 echo "  Video:    ${VIDEO_DIR}/${MOVIE_FILENAME}"
 echo "  Pod ID:   $POD_ID"
 echo ""
