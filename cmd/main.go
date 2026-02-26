@@ -174,10 +174,11 @@ func searchScenesByAnchor(c *gin.Context) {
     })
 }
 
-// searchText finds scenes whose spoken dialog is most semantically similar to the query.
-// Unlike searchSemantic (which searches visual+dialog mixed embeddings across all scenes),
-// this only considers scenes that have real subtitle captions (language != 'iv2'), and
-// returns the matched dialog text alongside each result.
+// searchText finds scenes by dialog similarity.
+// Embeds the query with e5-base-v2 and searches against scenes that have real
+// subtitle captions (language != 'iv2'), returning the matched dialog text alongside
+// each result. Intended for bot responses: find clips where characters say something
+// semantically similar to the bot's reply.
 func searchText(c *gin.Context) {
     var req struct {
         Query    string `json:"query"`
@@ -188,9 +189,8 @@ func searchText(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid search request", "details": err.Error()})
         return
     }
-
-    if strings.TrimSpace(req.Query) == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "query must not be empty"})
+    if req.Query == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "query is required"})
         return
     }
 
@@ -202,23 +202,15 @@ func searchText(c *gin.Context) {
         limit = 100
     }
 
-    // Embed the query with e5-base-v2 (same model used when captions were ingested)
     vec, err := embedTextQuery(req.Query)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{
-            "error":   "Failed to embed query",
-            "details": err.Error(),
-        })
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to embed query", "details": err.Error()})
         return
     }
 
-    // Search against scenes that have real dialog captions only
     scenes, dists, dialogs, err := db.SearchScenesByDialogVector(vec, limit, req.VideoIDs)
     if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{
-            "error":   "Dialog search failed",
-            "details": err.Error(),
-        })
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Search failed", "details": err.Error()})
         return
     }
 
@@ -237,8 +229,8 @@ func searchText(c *gin.Context) {
                 "caption_count": s.CaptionCount,
                 "created_at":    s.CreatedAt,
             },
-            "distance": dists[i],
-            "dialog":   dialogs[i],
+            "distance":    dists[i],
+            "dialog_text": dialogs[i],
         })
     }
 
