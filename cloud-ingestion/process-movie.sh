@@ -291,137 +291,20 @@ except:
 done
 
 # ============================================
-# Step 5: Export movie data from RunPod
+# Steps 5-8: Export DB, fetch SRT, download video
 # ============================================
-log "Exporting movie data from RunPod..."
+log "Pulling data from pod..."
+RUNPOD_API_KEY="$RUNPOD_API_KEY" \
+    "${SCRIPT_DIR}/pull-from-pod.sh" "$POD_ID" "$MOVIE_FILENAME" "$MOVIE_URL"
 
-REMOTE_VID=$(PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" \
-    -U goodclips -d goodclips -tA \
-    -c "SELECT id FROM videos WHERE filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
-
-[ -z "$REMOTE_VID" ] && error "Movie '${MOVIE_FILENAME}' not found in RunPod database"
-log "Remote video ID: $REMOTE_VID"
-
-EXPORT_DIR=$(mktemp -d)
-
-PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
-    -c "\copy (SELECT uuid, filename, file_hash, title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, status, metadata, error_message FROM videos WHERE id = ${REMOTE_VID}) TO '${EXPORT_DIR}/video.tsv'"
-
-PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
-    -c "\copy (SELECT id, uuid, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at FROM scenes WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/scenes.tsv'"
-
-PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
-    -c "\copy (SELECT uuid, scene_id, start_time, end_time, text, language, confidence, created_at FROM captions WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/captions.tsv'"
-
-EXPORT_SCENES=$(wc -l < "${EXPORT_DIR}/scenes.tsv")
-EXPORT_CAPTIONS=$(wc -l < "${EXPORT_DIR}/captions.tsv")
-log "Exported: ${EXPORT_SCENES} scenes, ${EXPORT_CAPTIONS} captions"
-
-# ============================================
-# Step 6: Import into local database
-# ============================================
-log "Importing into local PostgreSQL..."
-
-# Remove existing data for this movie if re-importing (CASCADE deletes scenes/captions)
-PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -c \
-    "DELETE FROM videos WHERE filename = '${MOVIE_FILENAME}';" 2>/dev/null
-
-PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips << IMPORT_SQL
--- Staging tables for ID remapping
-CREATE TEMP TABLE _stg_video (
-    uuid uuid, filename text, file_hash text, title text, duration real,
-    scene_count int, caption_count int, embedding_model text,
-    created_at timestamptz, updated_at timestamptz, last_processed_at timestamptz,
-    tags jsonb, status text, metadata jsonb, error_message text
-);
-CREATE TEMP TABLE _stg_scenes (
-    remote_id int, uuid uuid, scene_index int, start_time real, end_time real,
-    has_captions bool, caption_count int,
-    visual_embedding vector(1024), text_embedding vector(768),
-    audio_embedding vector(512), visual_clip_embedding vector(512),
-    combined_embedding vector(768), created_at timestamptz
-);
-CREATE TEMP TABLE _stg_captions (
-    uuid uuid, remote_scene_id int, start_time real, end_time real,
-    text text, language varchar(10), confidence real, created_at timestamptz
-);
-
-\copy _stg_video FROM '${EXPORT_DIR}/video.tsv'
-\copy _stg_scenes FROM '${EXPORT_DIR}/scenes.tsv'
-\copy _stg_captions FROM '${EXPORT_DIR}/captions.tsv'
-
--- Insert video with auto-generated local ID
-INSERT INTO videos (uuid, filename, filepath, file_hash, title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, status, metadata, error_message)
-SELECT uuid_generate_v4(), filename, '${VIDEO_DIR}/' || filename, md5(filename || now()::text), title, duration, scene_count, caption_count, embedding_model, created_at, updated_at, last_processed_at, tags, 'completed', metadata, error_message
-FROM _stg_video
-RETURNING id AS new_vid_id \gset
-
--- Insert scenes with new video_id, build remote-to-local ID map
-CREATE TEMP TABLE _scene_map AS
-WITH inserted AS (
-    INSERT INTO scenes (uuid, video_id, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at)
-    SELECT uuid_generate_v4(), :new_vid_id, scene_index, start_time, end_time, has_captions, caption_count, visual_embedding, text_embedding, audio_embedding, visual_clip_embedding, combined_embedding, created_at
-    FROM _stg_scenes
-    ORDER BY remote_id
-    RETURNING id, scene_index
-)
-SELECT s.remote_id, i.id AS local_id
-FROM inserted i
-JOIN _stg_scenes s USING (scene_index);
-
--- Insert captions with remapped scene IDs
-INSERT INTO captions (uuid, video_id, scene_id, start_time, end_time, text, language, confidence, created_at)
-SELECT uuid_generate_v4(), :new_vid_id, m.local_id, c.start_time, c.end_time, c.text, c.language, c.confidence, c.created_at
-FROM _stg_captions c
-LEFT JOIN _scene_map m ON c.remote_scene_id = m.remote_id;
-IMPORT_SQL
-
-rm -rf "$EXPORT_DIR"
-
-# Verify import
-LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA -c \
-    "SELECT COUNT(*) FROM scenes s JOIN videos v ON s.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
-LOCAL_CAPTIONS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA -c \
-    "SELECT COUNT(*) FROM captions c JOIN videos v ON c.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" | tr -d '[:space:]')
-log "Import complete! ${LOCAL_SCENES} scenes, ${LOCAL_CAPTIONS} captions in local database"
-
-# ============================================
-# Step 7: Download video file for local streaming server
-# ============================================
-mkdir -p "$VIDEO_DIR"
-
-if [ ! -f "${VIDEO_DIR}/${MOVIE_FILENAME}" ]; then
-    log "Downloading video file for local streaming server..."
-    curl -L -A "Mozilla/5.0 (X11; Linux x86_64)" \
-        --progress-bar \
-        -o "${VIDEO_DIR}/${MOVIE_FILENAME}" \
-        "${MOVIE_URL}"
-    FILESIZE=$(stat -c%s "${VIDEO_DIR}/${MOVIE_FILENAME}" 2>/dev/null || echo "0")
-    log "Downloaded ${MOVIE_FILENAME} ($(numfmt --to=iec ${FILESIZE} 2>/dev/null || echo ${FILESIZE} bytes))"
-else
-    log "Video file already exists: ${VIDEO_DIR}/${MOVIE_FILENAME}"
-fi
-
-# ============================================
-# Step 8: Download SRT sidecar from RunPod
-# ============================================
-SRT_FILENAME="${MOVIE_FILENAME%.*}.srt"
-SRT_LOCAL="${VIDEO_DIR}/${SRT_FILENAME}"
-
-if [ -f "${SRT_LOCAL}" ]; then
-    log "SRT already exists locally: ${SRT_LOCAL}"
-else
-    log "Fetching SRT sidecar from RunPod..."
-    HTTP_CODE=$(curl -s -o "${SRT_LOCAL}" -w "%{http_code}" \
-        "${API_URL}/api/v1/files/${SRT_FILENAME}")
-    if [ "$HTTP_CODE" = "200" ]; then
-        SRT_SIZE=$(stat -c%s "${SRT_LOCAL}" 2>/dev/null || echo "0")
-        log "Downloaded ${SRT_FILENAME} ($(numfmt --to=iec ${SRT_SIZE} 2>/dev/null || echo ${SRT_SIZE} bytes))"
-    else
-        warn "SRT not available (HTTP ${HTTP_CODE}) — film may have no dialog track"
-        rm -f "${SRT_LOCAL}"
-    fi
-fi
+# Read back counts for the summary below
+LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
+    -c "SELECT COUNT(*) FROM scenes s JOIN videos v ON s.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" \
+    | tr -d '[:space:]')
+LOCAL_CAPTIONS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
+    -c "SELECT COUNT(*) FROM captions c JOIN videos v ON c.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" \
+    | tr -d '[:space:]')
+SRT_LOCAL="${VIDEO_DIR}/${MOVIE_FILENAME%.*}.srt"
 
 # ============================================
 # Step 9: Terminate pod
