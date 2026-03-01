@@ -73,7 +73,7 @@ RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py
 COPY cloud-ingestion/entrypoint.sh /entrypoint.sh
 COPY cloud-ingestion/export-db.sh /root/export-db.sh
 COPY cloud-ingestion/download-and-process.sh /root/download-and-process.sh
-COPY cloud-ingestion/transcribe.py /root/cloud-ingestion/transcribe.py
+COPY --from=builder /app/cloud-ingestion/transcribe.py /root/cloud-ingestion/transcribe.py
 RUN chmod +x /entrypoint.sh /root/export-db.sh /root/download-and-process.sh \
              /root/cloud-ingestion/transcribe.py
 
