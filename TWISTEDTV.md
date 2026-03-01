@@ -1,6 +1,6 @@
 # TwistedTV Documentation
 
-**Last Updated:** 2026-02-25
+**Last Updated:** 2026-03-01
 
 ## Table of Contents
 
@@ -63,7 +63,7 @@ Runs permanently at the installation site. Handles audio I/O and video display.
 
 **Video ingestion does NOT run on the server.** It runs on temporary RunPod GPU pods.
 
-A GPU pod spins up, downloads the movie, detects scenes, generates embeddings + captions, then the database is exported via `pg_dump` to the server and the pod is terminated. This is fully automated by `cloud-ingestion/process-movie.sh`.
+A GPU pod spins up, downloads the movie, transcribes the audio to an SRT subtitle file (Whisper large-v3), detects scenes, generates embeddings + captions, then exports the movie's database records to the server and terminates. This is fully automated by `cloud-ingestion/process-movie.sh`. For manual export from a running pod, use `cloud-ingestion/pull-from-pod.sh`.
 
 ### Data Flow Diagram
 
@@ -101,8 +101,9 @@ A GPU pod spins up, downloads the movie, detects scenes, generates embeddings + 
 │         GPU pods — only during movie ingestion        │
 ├──────────────────────────────────────────────────────┤
 │  process-movie.sh creates pod → downloads movie →     │
-│  detects scenes → generates embeddings → pg_dump →    │
-│  imports to server Postgres → terminates pod          │
+│  transcribes audio (Whisper) → detects scenes →       │
+│  generates embeddings → exports DB + SRT to server →  │
+│  terminates pod                                       │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -280,13 +281,15 @@ RUNPOD_API_KEY="<your-runpod-key>" \
   'carnival_of_souls.mp4'
 ```
 
-This takes ~30 minutes. The script will:
+This takes ~60–90 minutes (Whisper transcription + scene detection + embeddings). The script will:
 1. Create a RunPod GPU pod
-2. Download the movie and process it (scene detection + embeddings)
-3. Export the database via `pg_dump` (using the pod's direct IP, not the HTTP proxy)
-4. Import into the local PostgreSQL
-5. Download the video file to `data/videos/`
-6. Terminate the pod
+2. Pod downloads the movie, transcribes the audio with Whisper large-v3 → `carnival_of_souls.srt`
+3. Pod runs scene detection + visual embeddings + IV2 captioning
+4. Export the movie's DB records via `\copy` TSV over direct TCP PostgreSQL
+5. Import into local PostgreSQL with ID remapping
+6. Download the Whisper SRT sidecar from the pod via HTTP
+7. Download the video file from the original Archive.org URL to `data/videos/`
+8. Terminate the pod
 
 ### Step 8: Verify Everything Works
 
@@ -345,16 +348,38 @@ RUNPOD_API_KEY="<key>" bash cloud-ingestion/process-movie.sh '<movie_url>' '<fil
 1. Creates a RunPod GPU pod (NVIDIA RTX A4000) with the `va55/goodclips-runpod:latest` Docker image
 2. Exposes ports: `8080/http` (GoodCLIPS API) and `5432/tcp` (PostgreSQL)
 3. Waits for the pod to be ready and the API to be healthy
-4. Monitors processing progress (scene detection → embeddings → captions)
-5. Exports the database using `pg_dump` via the pod's **direct public IP** (not the HTTP proxy)
-6. Imports the dump into the local PostgreSQL
-7. Downloads the video file to `data/videos/`
-8. Terminates the pod
+4. Pod downloads the movie, then **transcribes the audio with Whisper large-v3** → writes `film.srt` alongside the video
+5. Pod submits the video to GoodCLIPS for scene detection + embedding generation + IV2 captioning
+6. `process-movie.sh` monitors progress (polls embedding job status); timeout: **150 minutes**
+7. Calls `pull-from-pod.sh` to export the movie's data:
+   - Exports `scenes`, `captions`, and `videos` rows via `\copy` TSV over **direct TCP** to the pod's PostgreSQL (not the HTTP proxy — see gotcha #4)
+   - Imports into local PostgreSQL with ID remapping (so local IDs don't conflict with other movies)
+   - Downloads the Whisper SRT sidecar via `GET /api/v1/files/film.srt` over HTTP
+8. Downloads the video file to `data/videos/` from the original source URL
+9. Terminates the pod
 
 **Environment variables:**
 - `RUNPOD_API_KEY` (required) — Your RunPod API key
 - `GPU_TYPE` (optional) — Default: `NVIDIA RTX A4000`
 - `KEEP_POD` (optional) — Set to `true` to keep pod running after completion
+- `WHISPER_MODEL` (optional) — Whisper model size on the pod. Default: `large-v3`. Use `medium` to trade accuracy for ~3× speed.
+
+### Manual Export from a Running Pod
+
+If you've been working on a pod manually and want to pull the data without running the full pipeline:
+
+```bash
+# DB + SRT only (video already local or will be fetched separately)
+RUNPOD_API_KEY=rpa_... ./cloud-ingestion/pull-from-pod.sh \
+    <pod-id> carnival_of_souls.mp4
+
+# DB + SRT + video fetched from Archive.org
+RUNPOD_API_KEY=rpa_... ./cloud-ingestion/pull-from-pod.sh \
+    <pod-id> carnival_of_souls.mp4 \
+    'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'
+```
+
+Find the pod ID in the RunPod dashboard. The script resolves the PostgreSQL direct IP and HTTP API URL automatically from the RunPod API.
 
 ### Important: RunPod TCP Proxy Limitation
 
@@ -394,11 +419,13 @@ cinema-chat/
 ├── migrations/                       # DB migrations (Massimo's)
 │
 ├── cloud-ingestion/                  # CLOUD: Movie ingestion pipeline
-│   ├── process-movie.sh             # Main script — creates pod, processes, imports
+│   ├── process-movie.sh             # Main script — creates pod, processes, imports, terminates
+│   ├── pull-from-pod.sh             # Standalone export: DB + SRT from any running pod
+│   ├── transcribe.py                # Whisper audio transcription → SRT (runs on pod GPU)
 │   ├── Dockerfile                   # All-in-one RunPod image
-│   ├── entrypoint.sh               # Pod startup script
+│   ├── entrypoint.sh               # Pod startup (starts DB, Redis, API, auto-download + transcribe)
 │   ├── download-and-process.sh     # On-pod video processing
-│   └── export-db.sh                # On-pod database export
+│   └── export-db.sh                # On-pod database export (manual use)
 │
 ├── twistedtv-server/                 # SERVER: Bot + MCP
 │   ├── cinema_bot/                  # FastAPI server, bot logic, Whisper, GPT-4
@@ -471,13 +498,32 @@ MCP tools exposed:
 
 **Location:** Root `docker-compose.yml`
 
-Massimo's Go API for multi-modal semantic video search:
-- `POST /api/v1/search/semantic` — Text query → matching scenes (uses e5-base-v2 text embeddings)
+Go API for multi-modal semantic video search, backed by PostgreSQL + pgvector.
+
+**Search endpoints:**
+- `POST /api/v1/search/semantic` — Text query → scenes ranked by visual/scene description similarity (e5-base-v2 on IV2 captions + dialog mixed)
+- `POST /api/v1/search/text` — Text query → scenes ranked by **dialog similarity only** (non-iv2 captions, i.e. Whisper transcriptions). Returns `clip_start`/`clip_end` tight around the matched dialog (caption boundaries ± 0.5s), ready to pass directly to the video player.
+- `POST /api/v1/search/scenes` — Find visually similar scenes to an anchor scene (visual embeddings)
+
+**Other endpoints:**
+- `GET /api/v1/files/:filename` — Serve a file from the videos directory by name. Used by `pull-from-pod.sh` to download the Whisper SRT over HTTP.
 - `GET /api/v1/stats` — Database statistics
 - `GET /api/v1/jobs` — Job queue status
 - `GET /health` — Health check
 
-Backed by PostgreSQL + pgvector for vector similarity search.
+**Search response shape for `/search/text`:**
+```json
+{
+  "results": [{
+    "scene":       { "video_id": 3, "scene_index": 42, "start_time": 340.1, "end_time": 351.8, ... },
+    "clip_start":  342.6,
+    "clip_end":    349.1,
+    "dialog_text": "Please, not me. I'm begging you, let me go.",
+    "distance":    0.12
+  }]
+}
+```
+Use `clip_start`/`clip_end` (not `scene.start_time`/`scene.end_time`) when playing dialog clips.
 
 ### 4. Video Playback Service (Pi, port 5000)
 
