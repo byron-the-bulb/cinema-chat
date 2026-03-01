@@ -9,6 +9,7 @@ import (
     "net/http"
     "os"
     "os/exec"
+    "path/filepath"
     "strconv"
     "strings"
 
@@ -100,6 +101,10 @@ func main() {
         v1.POST("/search/scenes", searchScenesByAnchor)
         v1.POST("/search/semantic", searchSemantic)
         v1.POST("/search/text", searchText)
+
+        // File download (used by process-movie.sh to retrieve generated
+        // files such as SRT sidecars from the RunPod instance)
+        v1.GET("/files/:filename", serveFile)
 
         // Statistics
         v1.GET("/stats", getStats)
@@ -250,6 +255,25 @@ func searchText(c *gin.Context) {
         "count":   len(items),
         "results": items,
     })
+}
+
+// serveFile serves a single file from the videos directory by name.
+// Intended for process-movie.sh to pull generated files (SRT sidecars, etc.)
+// from the RunPod instance over HTTP without needing SSH/scp.
+//
+// filepath.Base() on the parameter prevents path traversal — a request for
+// "../../etc/passwd" is reduced to "passwd" and will 404 harmlessly.
+func serveFile(c *gin.Context) {
+    // Sanitise: strip any directory component from the URL parameter
+    filename := filepath.Base(c.Param("filename"))
+    videosDir := getEnvOrDefault("VIDEOS_PATH", "/data/videos")
+    fullPath := filepath.Join(videosDir, filename)
+
+    if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+        c.JSON(http.StatusNotFound, gin.H{"error": "file not found", "filename": filename})
+        return
+    }
+    c.File(fullPath)
 }
 
 // getStats returns aggregate DB stats

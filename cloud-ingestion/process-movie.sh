@@ -283,10 +283,10 @@ except:
         STALL_COUNT=0
     fi
 
-    # Safety: if we've been waiting over 90 minutes, something is wrong
+    # Safety: 150 min covers download + transcription + full ingestion
     ELAPSED=$(($(date +%s) - START_TIME))
-    if [ "$ELAPSED" -gt 5400 ]; then
-        error "Processing timed out after 90 minutes"
+    if [ "$ELAPSED" -gt 9000 ]; then
+        error "Processing timed out after 150 minutes"
     fi
 done
 
@@ -403,7 +403,28 @@ else
 fi
 
 # ============================================
-# Step 8: Terminate pod
+# Step 8: Download SRT sidecar from RunPod
+# ============================================
+SRT_FILENAME="${MOVIE_FILENAME%.*}.srt"
+SRT_LOCAL="${VIDEO_DIR}/${SRT_FILENAME}"
+
+if [ -f "${SRT_LOCAL}" ]; then
+    log "SRT already exists locally: ${SRT_LOCAL}"
+else
+    log "Fetching SRT sidecar from RunPod..."
+    HTTP_CODE=$(curl -s -o "${SRT_LOCAL}" -w "%{http_code}" \
+        "${API_URL}/api/v1/files/${SRT_FILENAME}")
+    if [ "$HTTP_CODE" = "200" ]; then
+        SRT_SIZE=$(stat -c%s "${SRT_LOCAL}" 2>/dev/null || echo "0")
+        log "Downloaded ${SRT_FILENAME} ($(numfmt --to=iec ${SRT_SIZE} 2>/dev/null || echo ${SRT_SIZE} bytes))"
+    else
+        warn "SRT not available (HTTP ${HTTP_CODE}) — film may have no dialog track"
+        rm -f "${SRT_LOCAL}"
+    fi
+fi
+
+# ============================================
+# Step 9: Terminate pod
 # ============================================
 log "Terminating pod..."
 KEEP_POD=false  # Allow cleanup trap to terminate
@@ -416,6 +437,7 @@ echo "  Movie:    $MOVIE_FILENAME"
 echo "  Scenes:   $LOCAL_SCENES"
 echo "  Captions: $LOCAL_CAPTIONS"
 echo "  Video:    ${VIDEO_DIR}/${MOVIE_FILENAME}"
+echo "  SRT:      ${SRT_LOCAL}"
 echo "  Pod ID:   $POD_ID"
 echo ""
 echo "Test search: curl -s http://localhost:8080/api/v1/search/semantic -H 'Content-Type: application/json' -d '{\"query\": \"a woman looking scared\", \"limit\": 3}'"
