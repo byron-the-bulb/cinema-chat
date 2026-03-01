@@ -21,6 +21,20 @@ class SceneResult(BaseModel):
     distance: float
 
 
+class DialogResult(BaseModel):
+    """Result from dialog search (/api/v1/search/text).
+
+    clip_start/clip_end are the dialog caption boundaries ± 0.5s pad —
+    use these (not scene start_time/end_time) when calling play_clip.
+    """
+    video_id: int
+    scene_index: int
+    clip_start: float   # first caption start_time - pad
+    clip_end: float     # last caption end_time + pad
+    dialog_text: str    # spoken lines matched in this scene
+    distance: float
+
+
 class GoodCLIPSClient:
     """Client for interacting with GoodCLIPS API."""
 
@@ -82,6 +96,55 @@ class GoodCLIPSClient:
             results.append(SceneResult(**scene_data))
 
         logger.info(f"Found {len(results)} scenes")
+        return results
+
+    async def search_dialog(
+        self,
+        query: str,
+        limit: int = 5,
+        video_ids: Optional[List[int]] = None,
+    ) -> List[DialogResult]:
+        """Search for scenes by spoken dialog similarity.
+
+        Embeds the query and finds scenes where characters say something
+        semantically similar. Returns clip_start/clip_end tight around the
+        actual dialog (not the full scene), ready to pass to play_clip.
+
+        Args:
+            query: Text to match against spoken dialog (e.g. a bot reply)
+            limit: Maximum number of results
+            video_ids: Optional list of video IDs to restrict search
+
+        Returns:
+            List of DialogResult ordered by similarity (closest first)
+        """
+        url = f"{self.base_url}/api/v1/search/text"
+        payload: dict = {"query": query, "limit": limit}
+        if video_ids:
+            payload["video_ids"] = video_ids
+
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        logger.info(f"Dialog search: '{query}' (limit={limit})")
+        response = await self.client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        results = []
+        for item in data.get("results", []):
+            scene = item.get("scene", {})
+            results.append(DialogResult(
+                video_id=scene["video_id"],
+                scene_index=scene["scene_index"],
+                clip_start=item["clip_start"],
+                clip_end=item["clip_end"],
+                dialog_text=item.get("dialog_text", ""),
+                distance=item.get("distance", 0.0),
+            ))
+
+        logger.info(f"Found {len(results)} dialog matches")
         return results
 
     async def get_video_path(self, video_id: int) -> Optional[str]:

@@ -376,13 +376,22 @@ func (db *DB) SearchScenesByTextVector(vec []float32, k int, filterVideoIDs []ui
     }
     return scenes, dists, nil
 }
+// DialogSearchResult is a single result from SearchScenesByDialogVector.
+type DialogSearchResult struct {
+    Scene       models.Scene
+    Distance    float64
+    DialogText  string  // all spoken lines in the scene, aggregated
+    DialogStart float64 // start_time of the first matched caption
+    DialogEnd   float64 // end_time of the last matched caption
+}
+
 // SearchScenesByDialogVector finds top-K scenes whose dialog (non-iv2 captions) is most
 // semantically similar to the query vector. Only scenes that have real subtitle captions
-// (language != 'iv2') are considered. Captions are matched to scenes by time overlap
-// since FFmpeg-extracted captions do not carry a scene_id FK.
+// (language != 'iv2') are considered. Captions are matched to scenes by temporal overlap.
 //
-// Returns: scenes, cosine distances, and the aggregated dialog text for each scene.
-func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []uint) ([]models.Scene, []float64, []string, error) {
+// DialogStart/DialogEnd are the actual caption boundaries (not scene boundaries), so
+// callers can play a tight clip around the spoken dialog with a small pad.
+func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []uint) ([]DialogSearchResult, error) {
     v := pgvector.NewVector(vec)
 
     type row struct {
@@ -398,6 +407,8 @@ func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []
         CreatedAt    time.Time
         Distance     float64 `gorm:"column:distance"`
         DialogText   string  `gorm:"column:dialog_text"`
+        DialogStart  float64 `gorm:"column:dialog_start"`
+        DialogEnd    float64 `gorm:"column:dialog_end"`
     }
 
     // Build the video-filter clause for raw SQL.
@@ -422,7 +433,9 @@ func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []
             s.start_time, s.end_time, s.duration,
             s.has_captions, s.caption_count, s.created_at,
             s.text_embedding <=> ? AS distance,
-            STRING_AGG(c.text, ' ' ORDER BY c.start_time) AS dialog_text
+            STRING_AGG(c.text, ' ' ORDER BY c.start_time) AS dialog_text,
+            MIN(c.start_time) AS dialog_start,
+            MAX(c.end_time)   AS dialog_end
         FROM scenes s
         INNER JOIN captions c
             ON  c.video_id   = s.video_id
@@ -441,27 +454,29 @@ func (db *DB) SearchScenesByDialogVector(vec []float32, k int, filterVideoIDs []
 
     var rows []row
     if err := db.Raw(query, args...).Scan(&rows).Error; err != nil {
-        return nil, nil, nil, err
+        return nil, err
     }
 
-    scenes := make([]models.Scene, 0, len(rows))
-    dists := make([]float64, 0, len(rows))
-    dialogs := make([]string, 0, len(rows))
+    results := make([]DialogSearchResult, 0, len(rows))
     for _, r := range rows {
-        scenes = append(scenes, models.Scene{
-            ID:           r.ID,
-            UUID:         r.UUID,
-            VideoID:      r.VideoID,
-            SceneIndex:   r.SceneIndex,
-            StartTime:    r.StartTime,
-            EndTime:      r.EndTime,
-            Duration:     r.Duration,
-            HasCaptions:  r.HasCaptions,
-            CaptionCount: r.CaptionCount,
-            CreatedAt:    r.CreatedAt,
+        results = append(results, DialogSearchResult{
+            Scene: models.Scene{
+                ID:           r.ID,
+                UUID:         r.UUID,
+                VideoID:      r.VideoID,
+                SceneIndex:   r.SceneIndex,
+                StartTime:    r.StartTime,
+                EndTime:      r.EndTime,
+                Duration:     r.Duration,
+                HasCaptions:  r.HasCaptions,
+                CaptionCount: r.CaptionCount,
+                CreatedAt:    r.CreatedAt,
+            },
+            Distance:    r.Distance,
+            DialogText:  r.DialogText,
+            DialogStart: r.DialogStart,
+            DialogEnd:   r.DialogEnd,
         })
-        dists = append(dists, r.Distance)
-        dialogs = append(dialogs, r.DialogText)
     }
-    return scenes, dists, dialogs, nil
+    return results, nil
 }

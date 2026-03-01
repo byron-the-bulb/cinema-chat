@@ -208,29 +208,39 @@ func searchText(c *gin.Context) {
         return
     }
 
-    scenes, dists, dialogs, err := db.SearchScenesByDialogVector(vec, limit, req.VideoIDs)
+    // Pad seconds added before/after the dialog timestamps for the clip boundaries.
+    // Gives a brief visual breath before the first word and after the last.
+    const clipPad = 0.5
+
+    results, err := db.SearchScenesByDialogVector(vec, limit, req.VideoIDs)
     if err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": "Search failed", "details": err.Error()})
         return
     }
 
-    items := make([]gin.H, 0, len(scenes))
-    for i, s := range scenes {
+    items := make([]gin.H, 0, len(results))
+    for _, r := range results {
+        clipStart := r.DialogStart - clipPad
+        if clipStart < 0 {
+            clipStart = 0
+        }
         items = append(items, gin.H{
             "scene": gin.H{
-                "id":            s.ID,
-                "uuid":          s.UUID,
-                "video_id":      s.VideoID,
-                "scene_index":   s.SceneIndex,
-                "start_time":    s.StartTime,
-                "end_time":      s.EndTime,
-                "duration":      s.Duration,
-                "has_captions":  s.HasCaptions,
-                "caption_count": s.CaptionCount,
-                "created_at":    s.CreatedAt,
+                "id":            r.Scene.ID,
+                "uuid":          r.Scene.UUID,
+                "video_id":      r.Scene.VideoID,
+                "scene_index":   r.Scene.SceneIndex,
+                "start_time":    r.Scene.StartTime,
+                "end_time":      r.Scene.EndTime,
+                "duration":      r.Scene.Duration,
+                "has_captions":  r.Scene.HasCaptions,
+                "caption_count": r.Scene.CaptionCount,
+                "created_at":    r.Scene.CreatedAt,
             },
-            "distance":    dists[i],
-            "dialog_text": dialogs[i],
+            "distance":    r.Distance,
+            "dialog_text": r.DialogText,
+            "clip_start":  clipStart,
+            "clip_end":    r.DialogEnd + clipPad,
         })
     }
 
