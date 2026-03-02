@@ -187,8 +187,28 @@ warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] WARNING:${NC} $1"; }
 error(){ echo -e "${RED}[$(date '+%H:%M:%S')] ERROR:${NC} $1"; exit 1; }
 info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
 
-# Cleanup function to terminate pod on script exit/error
+# Dump the last N lines of the pod's log via the HTTP API.
+# Called automatically on failure so you don't need to open the RunPod web UI.
+dump_pod_logs() {
+    [ -z "$API_URL" ] && return
+    local lines="${1:-100}"
+    echo ""
+    warn "=== POD LOGS (last ${lines} lines) ==="
+    curl -s --max-time 15 "${API_URL}/api/v1/logs?tail=${lines}" 2>/dev/null \
+        | sed 's/^/  /' \
+        || warn "Could not fetch pod logs (API may be unreachable)"
+    echo ""
+    warn "Full live log: curl -N '${API_URL}/api/v1/logs?follow=true'"
+    echo ""
+}
+
+# Cleanup function — terminates pod on script exit/error.
+# On failure (non-zero exit) dumps pod logs first so the cause is visible.
 cleanup() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ -n "$API_URL" ]; then
+        dump_pod_logs 100
+    fi
     if [ -n "$POD_ID" ] && [ "$KEEP_POD" != "true" ]; then
         warn "Cleaning up - terminating pod $POD_ID..."
         curl -s --max-time 15 --request POST \
@@ -266,7 +286,7 @@ POD_RESPONSE=$(curl -s --max-time 60 --request POST \
   --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
   --header 'content-type: application/json' \
   --data '{
-    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
+    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,9000/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
   }')
 
 POD_ID=$(echo "$POD_RESPONSE" | python3 -c "
@@ -297,7 +317,7 @@ log "Waiting for pod to be ready..."
 API_URL=""
 PG_PROXY=""
 
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
     POD_STATUS=$(curl -s --max-time 15 --request POST \
       --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
       --header 'content-type: application/json' \
@@ -311,10 +331,10 @@ print('yes' if r else 'no')
 " 2>/dev/null)
 
     if [ "$RUNTIME" = "yes" ]; then
-        log "Pod is running!"
-
-        # Extract port info
-        # HTTP port uses RunPod proxy, but TCP port (Postgres) needs direct IP
+        # Extract port info.
+        # 8080/http  → HTTP proxy URL for all API calls (health, jobs, stats, etc.)
+        # 9000/tcp   → direct IP:port for large file uploads (bypasses proxy 413 limit)
+        # 5432/tcp   → direct IP:port for PostgreSQL (proxy can't carry TCP)
         eval "$(echo "$POD_STATUS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -323,6 +343,8 @@ ports = d['data']['pod']['runtime'].get('ports', [])
 for p in ports:
     if p['privatePort'] == 8080:
         print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
+    if p['privatePort'] == 9000 and p.get('ip'):
+        print(f'UPLOAD_URL=http://{p[\"ip\"]}:{p[\"publicPort\"]}')
     if p['privatePort'] == 5432:
         ip = p.get('ip', '')
         pub_port = p.get('publicPort', 5432)
@@ -330,23 +352,32 @@ for p in ports:
             print(f'PG_HOST={ip}')
             print(f'PG_PORT={pub_port}')
         else:
-            # Fallback to proxy (may not work for TCP)
             print(f'PG_HOST={pod_id}-5432.proxy.runpod.net')
             print(f'PG_PORT=5432')
 " 2>/dev/null)"
-        break
+
+        # RunPod sometimes reports runtime=yes before ports are assigned —
+        # only break once we have an API_URL, otherwise keep polling.
+        if [ -n "$API_URL" ]; then
+            log "Pod is running, ports assigned!"
+            break
+        fi
+        echo -n "p"   # 'p' = pod running but ports not yet assigned
+    else
+        echo -n "."
     fi
 
-    echo -n "."
     sleep 10
 done
 echo ""
 
-[ -z "$API_URL" ] && error "Pod never became ready (timed out after 10 minutes)"
+[ -z "$API_URL" ] && error "Pod never became ready (timed out after 20 minutes)"
 
 PG_PORT="${PG_PORT:-5432}"
+UPLOAD_URL="${UPLOAD_URL:-$API_URL}"   # fall back to proxy if direct TCP not available
 log "API endpoint: $API_URL"
-log "PostgreSQL: $PG_HOST:$PG_PORT"
+log "Upload URL:   $UPLOAD_URL"
+log "PostgreSQL:   $PG_HOST:$PG_PORT"
 
 # ============================================
 # Step 3: Wait for API to be healthy
@@ -376,11 +407,13 @@ done
 # Step 3b: Upload local file to pod (local-file mode only)
 # ============================================
 if [ "$IS_LOCAL" = true ]; then
-    log "Uploading local file to pod (this may take a while for large files)..."
+    FILESIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
+    log "Uploading local file to pod via direct TCP ($(numfmt --to=iec $FILESIZE 2>/dev/null || echo "${FILESIZE} bytes"))..."
+    log "Upload URL: $UPLOAD_URL"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         --max-time 3600 \
         -T "$LOCAL_FILE" \
-        "$API_URL/api/v1/files/$MOVIE_FILENAME")
+        "$UPLOAD_URL/api/v1/files/$MOVIE_FILENAME")
     [ "$HTTP_CODE" = "200" ] || error "File upload failed (HTTP $HTTP_CODE)"
     log "Upload complete: $MOVIE_FILENAME"
 
@@ -389,7 +422,7 @@ if [ "$IS_LOCAL" = true ]; then
     SRT_FILENAME="${MOVIE_FILENAME%.*}.srt"
     if [ -f "$LOCAL_SRT" ]; then
         log "Uploading SRT sidecar..."
-        curl -s -o /dev/null --max-time 60 -T "$LOCAL_SRT" "$API_URL/api/v1/files/$SRT_FILENAME"
+        curl -s -o /dev/null --max-time 60 -T "$LOCAL_SRT" "$UPLOAD_URL/api/v1/files/$SRT_FILENAME"
         log "SRT uploaded: $SRT_FILENAME"
     fi
 
@@ -479,13 +512,11 @@ except:
     info "  scenes: ${TOTAL_SCENES} | embeds: ${EMBED_COUNT} | captions: ${CAPTIONS} | ${GPU_INFO}"
     info "  jobs: ${JOB_SUMMARY}"
 
-    # Abort immediately on any failed job
+    # Abort immediately on any failed job (cleanup trap will dump pod logs)
     if [ -n "$FAILED_JOB" ]; then
         echo ""
         warn "=== FAILED JOB: ${FAILED_JOB} ==="
-        warn "Check pod logs at: https://www.runpod.io/console/pods/${POD_ID}"
-        warn "Pod API: ${API_URL}/api/v1/jobs"
-        error "A job failed — see details above. Set KEEP_POD=true to inspect the pod."
+        error "A job failed — pod logs below. Set KEEP_POD=true to keep the pod running."
     fi
 
     # Check completion
