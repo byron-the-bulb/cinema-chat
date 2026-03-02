@@ -340,11 +340,15 @@ import sys, json
 d = json.load(sys.stdin)
 pod_id = d['data']['pod']['id']
 ports = d['data']['pod']['runtime'].get('ports', [])
+has_8080 = False
 for p in ports:
     if p['privatePort'] == 8080:
-        if p.get('type') == 'http' or not p.get('ip'):
+        # HTTP proxy URL is always derived from pod_id — set it once
+        if not has_8080:
             print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
-        elif p.get('ip'):
+            has_8080 = True
+        # Also grab direct TCP IP for large uploads if available
+        if p.get('ip') and p.get('type') != 'http':
             print(f'UPLOAD_URL=http://{p[\"ip\"]}:{p[\"publicPort\"]}')
     if p['privatePort'] == 5432:
         ip = p.get('ip', '')
