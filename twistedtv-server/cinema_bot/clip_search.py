@@ -53,15 +53,22 @@ def _build_video_url(filepath: str) -> str:
     return f"{VIDEO_SERVER_URL}/{filename}"
 
 
+MIN_CLIP_SECS = float(os.getenv("MIN_CLIP_SECS", "2"))
+MAX_CLIP_SECS = float(os.getenv("MAX_CLIP_SECS", "20"))
+
+
 async def search_clips(query: str, limit: int = 5) -> list[dict]:
     """
     Search for video clips matching a semantic description.
     Returns a list of clip dicts with all metadata the LLM needs to pick one.
+    Filters to clips between MIN_CLIP_SECS and MAX_CLIP_SECS.
     """
+    # Request extra results so we still have enough after duration filtering
+    fetch_limit = limit * 4
     try:
         resp = await _http_client.post(
             f"{GOODCLIPS_API_URL}/api/v1/search/semantic",
-            json={"query": query, "limit": limit},
+            json={"query": query, "limit": fetch_limit},
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
@@ -72,8 +79,24 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
     if not results:
         return []
 
+    # Pre-filter by duration before doing expensive lookups
+    filtered = []
+    for result in results:
+        scene = result.get("scene", {})
+        duration = scene.get("end_time", 0) - scene.get("start_time", 0)
+        if MIN_CLIP_SECS <= duration <= MAX_CLIP_SECS:
+            filtered.append(result)
+        if len(filtered) >= limit:
+            break
+
+    if not filtered:
+        logger.warning(f"No clips in {MIN_CLIP_SECS}-{MAX_CLIP_SECS}s range, using shortest available")
+        # Fallback: sort by duration and take shortest ones
+        results.sort(key=lambda r: abs(r.get("scene", {}).get("end_time", 0) - r.get("scene", {}).get("start_time", 0)))
+        filtered = results[:limit]
+
     clips = []
-    for i, result in enumerate(results, 1):
+    for i, result in enumerate(filtered, 1):
         scene = result.get("scene", {})
         distance = result.get("distance", 0)
         similarity = (1 - distance) * 100 if distance else 0

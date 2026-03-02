@@ -21,7 +21,6 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
-from openai import AsyncOpenAI  # Also works with Ollama's OpenAI-compat API
 
 # Support both package and direct execution
 try:
@@ -32,31 +31,6 @@ except ImportError:
 load_dotenv(override=True)
 
 # ── System prompt ──────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are the voice of a quirky, snarky art installation called Cinema Chat. You communicate ONLY through vintage movie and educational film clips from the 1930s-1970s.
-
-You are NOT a helpful assistant. You're a conversational character — witty, playful, sometimes sarcastic, and often FUNNY. The participant speaks into a vintage telephone and sees your response as video clips on an old TV.
-
-HOW TO RESPOND:
-Don't just depict what the user said — RESPOND to it with personality! Be entertaining and try to make them laugh.
-
-Bad: User says "I went to the supermarket" → searching "person shopping at supermarket" (boring, literal)
-Good: User says "I went to the supermarket" → pick a clip about "fancy restaurant dining" (playful jab) or "housewife excited about groceries" (retro humor)
-
-You will receive the user's speech and a list of available video clips with captions.
-Pick THE SINGLE BEST clip that makes a witty, funny, or emotionally resonant response.
-
-RESPOND WITH ONLY valid JSON (no markdown, no explanation):
-{"pick": <rank_number>, "reasoning": "<brief explanation>"}
-
-SELECTION CRITERIA:
-- Caption — what words are SPOKEN in the clip (often perfect for witty responses)
-- Visual — what's shown on screen
-- Tone — does it match your snarky/playful vibe?
-- Duration — prefer 5-15 second clips
-- Humor — BE FUNNY above all else
-
-All clips are already vintage — don't factor that in. Focus on the RESPONSE you want to give."""
 
 # ── Session tracking ───────────────────────────────────────────────────────
 
@@ -77,9 +51,21 @@ class Session:
             stop_secs=0.8,
         )
         self.processing = False  # Guard against overlapping requests
+        self.playback_mute_until: float = 0  # Suppress VAD during clip playback
         self.ws: WebSocket | None = None  # Reference for cleanup
         self.created_at: str = ""
         self.pi_client_pid: int | None = None
+
+    def mute_for_playback(self, clip_duration: float):
+        """Mute audio processing while a clip is playing to prevent feedback."""
+        # Add 1s buffer after clip ends for audio tail-off
+        self.playback_mute_until = time.monotonic() + clip_duration + 1.0
+        self.vad.reset()
+        logger.info(f"Muting VAD for {clip_duration + 1.0:.1f}s (clip + buffer)")
+
+    @property
+    def is_muted(self) -> bool:
+        return time.monotonic() < self.playback_mute_until
 
     def add_status(self, msg: str):
         """Add a status message visible to the dashboard."""
@@ -88,11 +74,47 @@ class Session:
 
 # ── Core pipeline ──────────────────────────────────────────────────────────
 
-openai_client: AsyncOpenAI = None
+
+async def handle_greeting(ws: WebSocket, session: Session):
+    """Play an opening greeting clip when a new session starts."""
+    session.processing = True
+    try:
+        await ws.send_json({"type": "status", "message": "Starting up..."})
+        session.add_status("[SYSTEM] Cinema Chat is waking up...")
+
+        # Brief delay to let Pi's video service finish starting
+        await asyncio.sleep(2)
+
+        greeting_query = "person waving hello, friendly greeting"
+        clips = await clip_search.search_clips(greeting_query, limit=5)
+        if not clips:
+            logger.warning("No greeting clips found")
+            return
+
+        chosen = clips[0]
+        clip_duration = chosen["end"] - chosen["start"]
+        session.mute_for_playback(clip_duration)
+
+        await ws.send_json({
+            "type": "play",
+            "video_path": chosen["file"],
+            "start": chosen["start"],
+            "end": chosen["end"],
+            "fullscreen": True,
+        })
+
+        caption_short = chosen["caption"][:80] if chosen.get("caption") else chosen["file"]
+        session.add_status(f"[VIDEO: {caption_short}]")
+        logger.info(f"Greeting: playing {chosen['file']} [{chosen['start']}-{chosen['end']}s]")
+
+    except Exception as e:
+        logger.exception(f"Greeting error: {e}")
+    finally:
+        session.processing = False
 
 
 async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
-    """Full pipeline: STT → Search → LLM pick → Play command."""
+    """Fast pipeline: STT → Search → Play top result. No LLM step."""
     if session.processing:
         logger.warning("Already processing — dropping overlapping speech")
         return
@@ -104,79 +126,33 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
         # ── 1. Transcribe ──────────────────────────────────────────────
         await ws.send_json({"type": "status", "message": "Listening..."})
         text = audio_pipeline.transcribe(pcm_audio)
+        stt_time = time.monotonic() - pipeline_start
 
         if not text or len(text.strip()) < 2:
             logger.info("Empty transcription — ignoring")
             return
 
         await ws.send_json({"type": "transcript", "text": text})
-        session.add_status(f"[USER] {text}")
         logger.info(f"[{session.session_id[:8]}] User: \"{text}\"")
 
-        # ── 2. Semantic search ─────────────────────────────────────────
+        # ── 2. Search + Play ───────────────────────────────────────────
         t0 = time.monotonic()
         clips = await clip_search.search_clips(text, limit=5)
         search_time = time.monotonic() - t0
-        logger.info(f"Search ({search_time:.2f}s): {len(clips)} clips")
 
         if not clips:
             await ws.send_json({"type": "status", "message": "No clips found"})
             return
 
-        await ws.send_json({"type": "status", "message": "Choosing clip..."})
-
-        # ── 3. LLM picks the best clip ─────────────────────────────────
-        clips_text = clip_search.format_clips_for_llm(clips)
-
-        # Build messages for this turn
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # Add conversation history (last 6 turns for context)
-        messages.extend(session.history[-6:])
-
-        # Current turn
-        messages.append({
-            "role": "user",
-            "content": f'The visitor said: "{text}"\n\nAvailable clips:\n{clips_text}',
-        })
-
-        t0 = time.monotonic()
-        llm_model = os.getenv("LLM_MODEL", "qwen2.5:3b")
-        llm_kwargs: dict = {
-            "model": llm_model,
-            "messages": messages,
-            "temperature": 0.9,
-            "max_tokens": 150,
-        }
-        # OpenAI supports response_format; Ollama uses format param via extra_body
-        if "localhost:11434" in (os.getenv("LLM_BASE_URL", "localhost:11434")):
-            llm_kwargs["extra_body"] = {"format": "json"}
-        else:
-            llm_kwargs["response_format"] = {"type": "json_object"}
-
-        response = await openai_client.chat.completions.create(**llm_kwargs)
-        llm_time = time.monotonic() - t0
-        llm_text = response.choices[0].message.content.strip()
-        logger.info(f"LLM ({llm_time:.2f}s): {llm_text}")
-
-        # Parse LLM response
-        try:
-            choice = json.loads(llm_text)
-            pick_rank = int(choice.get("pick", 1))
-            reasoning = choice.get("reasoning", "")
-        except (json.JSONDecodeError, ValueError, TypeError):
-            logger.warning(f"Failed to parse LLM response, using top result: {llm_text}")
-            pick_rank = 1
-            reasoning = "top search result"
-
-        # Find the chosen clip
-        chosen = next((c for c in clips if c["rank"] == pick_rank), clips[0])
-
-        # ── 4. Send play command ───────────────────────────────────────
+        # Play the top search result directly — no LLM needed
+        chosen = clips[0]
         total_time = time.monotonic() - pipeline_start
+        clip_duration = chosen["end"] - chosen["start"]
+        session.mute_for_playback(clip_duration)
+
         logger.info(
-            f"Pipeline complete ({total_time:.2f}s): "
-            f"playing {chosen['file']} [{chosen['start']}-{chosen['end']}s] — {reasoning}"
+            f"Pipeline ({total_time:.2f}s | stt={stt_time:.2f} search={search_time:.2f}): "
+            f"playing {chosen['file']} [{chosen['start']}-{chosen['end']}s]"
         )
 
         await ws.send_json({
@@ -192,19 +168,18 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
         session.history.append({"role": "user", "content": text})
         session.history.append({
             "role": "assistant",
-            "content": f'[VIDEO: {caption_short}] (reasoning: {reasoning})',
+            "content": f'[VIDEO: {caption_short}]',
         })
 
-        # Track for dashboard
-        session.add_status(f"[REASONING] {reasoning}")
-        session.add_status(f"[VIDEO] {caption_short}")
+        # Track for dashboard — include timing
+        session.add_status(f"[REASONING] Top match ({total_time:.1f}s)")
+        session.add_status(f"[VIDEO: {caption_short}]")
 
-        # Send timing info for debugging
         await ws.send_json({
             "type": "timing",
             "total_secs": round(total_time, 2),
+            "stt_secs": round(stt_time, 2),
             "search_secs": round(search_time, 2),
-            "llm_secs": round(llm_time, 2),
         })
 
     except Exception as e:
@@ -218,7 +193,6 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global openai_client
     logger.info("Starting TwistedTV WebSocket server...")
 
     # Initialize audio pipeline (VAD + Whisper)
@@ -227,13 +201,7 @@ async def lifespan(app: FastAPI):
     # Initialize clip search (HTTP client + DB pool)
     await clip_search.init()
 
-    # Initialize LLM client (Ollama local by default, or OpenAI if configured)
-    llm_base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
-    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "ollama"
-    openai_client = AsyncOpenAI(base_url=llm_base_url, api_key=llm_api_key)
-    logger.info(f"LLM client: {llm_base_url}")
-
-    logger.info("All services initialized — ready for connections")
+    logger.info("All services initialized — ready for connections (no-LLM fast mode)")
     yield
 
     logger.info("Shutting down...")
@@ -279,6 +247,10 @@ async def audio_websocket(ws: WebSocket):
         active_sessions[session_id] = session
         logger.info(f"Pi connected: session {session_id[:8]} (new)")
 
+    # Play opening greeting clip
+    asyncio.create_task(handle_greeting(ws, session))
+
+    frame_count = 0
     try:
         while True:
             data = await ws.receive()
@@ -289,6 +261,16 @@ async def audio_websocket(ws: WebSocket):
             if "bytes" in data:
                 # Binary frame = PCM audio
                 pcm_chunk = data["bytes"]
+                frame_count += 1
+                if frame_count == 1:
+                    logger.info(f"First audio frame received: {len(pcm_chunk)} bytes")
+                elif frame_count % 500 == 0:
+                    logger.info(f"Audio frames received: {frame_count} (VAD speaking={session.vad.is_speaking}, muted={session.is_muted})")
+
+                # Skip VAD while a clip is playing to prevent feedback loop
+                if session.is_muted:
+                    continue
+
                 speech_started, speech_ended = session.vad.process_chunk(pcm_chunk)
 
                 if speech_started:
@@ -313,39 +295,11 @@ async def audio_websocket(ws: WebSocket):
                         # Direct text input (for testing without audio)
                         text = msg.get("text", "")
                         if text:
-                            # Simulate speech pipeline but skip STT
-                            fake_session = Session(session_id)
-                            fake_session.history = session.history
-                            fake_session.processing = False
-
                             clips = await clip_search.search_clips(text, limit=5)
                             if clips:
-                                clips_text = clip_search.format_clips_for_llm(clips)
-                                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-                                messages.extend(session.history[-6:])
-                                messages.append({
-                                    "role": "user",
-                                    "content": f'The visitor said: "{text}"\n\nAvailable clips:\n{clips_text}',
-                                })
-                                llm_model = os.getenv("LLM_MODEL", "qwen2.5:3b")
-                                llm_kwargs2: dict = {
-                                    "model": llm_model,
-                                    "messages": messages,
-                                    "temperature": 0.9,
-                                    "max_tokens": 150,
-                                }
-                                if "localhost:11434" in (os.getenv("LLM_BASE_URL", "localhost:11434")):
-                                    llm_kwargs2["extra_body"] = {"format": "json"}
-                                else:
-                                    llm_kwargs2["response_format"] = {"type": "json_object"}
-                                response = await openai_client.chat.completions.create(**llm_kwargs2)
-                                llm_text = response.choices[0].message.content.strip()
-                                try:
-                                    choice = json.loads(llm_text)
-                                    pick_rank = int(choice.get("pick", 1))
-                                except (json.JSONDecodeError, ValueError, TypeError):
-                                    pick_rank = 1
-                                chosen = next((c for c in clips if c["rank"] == pick_rank), clips[0])
+                                chosen = clips[0]
+                                clip_duration = chosen["end"] - chosen["start"]
+                                session.mute_for_playback(clip_duration)
                                 await ws.send_json({
                                     "type": "play",
                                     "video_path": chosen["file"],

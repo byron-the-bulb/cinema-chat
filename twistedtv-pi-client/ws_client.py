@@ -89,25 +89,36 @@ class AudioCaptureThread(threading.Thread):
 
 
 def play_video(video_service_url: str, video_path: str, start: float, end: float, fullscreen: bool = True):
-    """Send play command to the local video playback service."""
-    try:
-        resp = httpx.post(
-            f"{video_service_url}/play",
-            json={
-                "video_path": video_path,
-                "start": start,
-                "end": end,
-                "fullscreen": fullscreen,
-            },
-            timeout=5.0,
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            logger.info(f"Playing: {os.path.basename(video_path)} [{start}-{end}s] (pid={result.get('pid')})")
-        else:
-            logger.error(f"Play failed ({resp.status_code}): {resp.text}")
-    except Exception as e:
-        logger.error(f"Play request failed: {e}")
+    """Send play command to the local video playback service (with retry for startup race)."""
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = httpx.post(
+                f"{video_service_url}/play",
+                json={
+                    "video_path": video_path,
+                    "start": start,
+                    "end": end,
+                    "fullscreen": fullscreen,
+                },
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                logger.info(f"Playing: {os.path.basename(video_path)} [{start}-{end}s] (pid={result.get('pid')})")
+                return
+            else:
+                logger.error(f"Play failed ({resp.status_code}): {resp.text}")
+                return
+        except httpx.ConnectError:
+            if attempt < max_retries:
+                logger.warning(f"Video service not ready (attempt {attempt}/{max_retries}), retrying in 1s...")
+                time.sleep(1)
+            else:
+                logger.error(f"Video service unreachable after {max_retries} attempts")
+        except Exception as e:
+            logger.error(f"Play request failed: {e}")
+            return
 
 
 def detect_audio_device() -> str:
@@ -178,7 +189,7 @@ def main():
             elif msg_type == "timing":
                 logger.info(
                     f"⏱ Pipeline: {msg.get('total_secs')}s total "
-                    f"(search={msg.get('search_secs')}s, llm={msg.get('llm_secs')}s)"
+                    f"(stt={msg.get('stt_secs')}s, search={msg.get('search_secs')}s)"
                 )
 
             elif msg_type == "error":
@@ -201,7 +212,7 @@ def main():
         logger.info(f"Disconnected (status={close_status}, msg={close_msg})")
         if audio_thread:
             audio_thread.stop()
-        shutdown.set()
+            audio_thread = None
 
     def on_error(ws_conn, error):
         logger.error(f"WebSocket error: {error}")

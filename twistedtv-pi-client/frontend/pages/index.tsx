@@ -247,6 +247,16 @@ export default function Home() {
         }
       }
 
+      // Kill Pi-side processes (ws_client, video service, mpv)
+      try {
+        const piCleanup = await fetch('/api/cleanup_pi', { method: 'POST' });
+        if (piCleanup.ok) {
+          console.log('Pi processes cleaned up');
+        }
+      } catch (e) {
+        console.warn('Pi cleanup failed:', e);
+      }
+
       // Reset UI state
       setIsConnected(false);
       setCurrentRoomUrl(null);
