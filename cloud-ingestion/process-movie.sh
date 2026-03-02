@@ -11,17 +11,18 @@
 #   7. The pod is terminated
 #
 # Usage:
-#   ./cloud-ingestion/process-movie.sh <url_or_file> [filename]
+#   ./cloud-ingestion/process-movie.sh <url_or_file> [title]
 #
 #   url_or_file: https:// URL  — pod downloads the video directly
 #                /local/path   — file is uploaded to the pod from this machine
+#   title:       optional display title (default: filename without extension)
 #
 # Examples:
 #   ./cloud-ingestion/process-movie.sh \
 #     'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'
 #
 #   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4
-#   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4 'my_movie.mp4'
+#   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4 'House on the Hill'
 #
 # Environment variables:
 #   RUNPOD_API_KEY  - Your RunPod API key (required; or in cinema_bot/.env)
@@ -40,23 +41,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 SOURCE="${1}"
-MOVIE_FILENAME="${2:-}"
+MOVIE_TITLE_ARG="${2:-}"   # optional title; filename is always derived from source
 
 # Detect local file vs remote URL
 if [[ "$SOURCE" == http://* ]] || [[ "$SOURCE" == https://* ]]; then
     IS_LOCAL=false
     MOVIE_URL="$SOURCE"
-    # Derive filename from URL (strip query string) if not given
-    MOVIE_FILENAME="${MOVIE_FILENAME:-$(basename "${MOVIE_URL%%\?*}")}"
+    MOVIE_FILENAME="$(basename "${MOVIE_URL%%\?*}")"
 else
     IS_LOCAL=true
     LOCAL_FILE="$(realpath "$SOURCE" 2>/dev/null || echo "$SOURCE")"
     MOVIE_URL=""
-    MOVIE_FILENAME="${MOVIE_FILENAME:-$(basename "$LOCAL_FILE")}"
+    MOVIE_FILENAME="$(basename "$LOCAL_FILE")"
 fi
 
-# Title defaults to filename without extension (spaces instead of underscores)
-MOVIE_TITLE="${MOVIE_TITLE:-${MOVIE_FILENAME%.*}}"
+# Title: explicit arg > MOVIE_TITLE env var > filename without extension
+MOVIE_TITLE="${MOVIE_TITLE_ARG:-${MOVIE_TITLE:-${MOVIE_FILENAME%.*}}}"
 # Auto-source RUNPOD_API_KEY from .env if not already set
 if [ -z "$RUNPOD_API_KEY" ]; then
     ENV_FILE="${PROJECT_DIR}/twistedtv-server/cinema_bot/.env"
@@ -98,15 +98,16 @@ trap cleanup EXIT
 # Validate prerequisites
 # ============================================
 if [ -z "$SOURCE" ]; then
-    echo "Usage: $0 <url_or_file> [filename]"
+    echo "Usage: $0 <url_or_file> [title]"
     echo ""
     echo "  url_or_file: https:// URL  — pod downloads the video directly"
     echo "               /local/path   — file is uploaded to the pod from this machine"
+    echo "  title:       optional display title (default: filename without extension)"
     echo ""
     echo "Examples:"
     echo "  $0 'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'"
     echo "  $0 /path/to/my_movie.mp4"
-    echo "  $0 /path/to/my_movie.mp4 'my_movie.mp4'"
+    echo "  $0 /path/to/my_movie.mp4 'House on the Hill'"
     echo ""
     echo "Environment variables:"
     echo "  RUNPOD_API_KEY  - Your RunPod API key (required)"
