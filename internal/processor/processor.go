@@ -275,16 +275,31 @@ func (vp *VideoProcessor) ProcessCaptionExtraction(payload map[string]interface{
 		log.Printf("Using sidecar SRT for captions: %s", sidecarSRT)
 		subtitlesPath = sidecarSRT
 	} else {
-		// No sidecar — fall back to extracting embedded subtitle stream via FFmpeg.
+		// No sidecar — try FFmpeg embedded subtitle extraction first.
 		info, statErr := os.Stat(subtitlesPath)
 		if os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0) {
 			if statErr == nil && info.Size() == 0 {
 				log.Printf("Existing subtitles file %s is empty; re-extracting", subtitlesPath)
 			}
 			if err := vp.ffmpegClient.ExtractSubtitlesToSRT(filepathStr, subtitlesPath); err != nil {
-				log.Printf("Warning: Failed to extract subtitles: %v", err)
-				// Not a critical error — continue without captions.
-				return nil
+				// No embedded subtitles — fall back to Whisper transcription.
+				log.Printf("No embedded subtitles (%v); running Whisper transcription...", err)
+				whisperModel := os.Getenv("WHISPER_MODEL")
+				if whisperModel == "" {
+					whisperModel = "large-v3"
+				}
+				cmd := exec.Command("python3", "/root/cloud-ingestion/transcribe.py",
+					filepathStr,
+					"--output", sidecarSRT,
+					"--model", whisperModel,
+					"--device", "cuda",
+				)
+				if out, wErr := cmd.CombinedOutput(); wErr != nil {
+					log.Printf("Warning: Whisper transcription failed: %v\n%s", wErr, string(out))
+					return nil
+				}
+				log.Printf("Whisper transcription complete: %s", sidecarSRT)
+				subtitlesPath = sidecarSRT
 			}
 		} else if statErr != nil {
 			log.Printf("Warning: Failed to stat subtitles file %s: %v", subtitlesPath, statErr)
