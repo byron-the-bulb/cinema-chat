@@ -43,13 +43,16 @@ def init_whisper():
     global _whisper_model
     from faster_whisper import WhisperModel
 
-    device = os.getenv("WHISPER_DEVICE", "cuda")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
     model_id = os.getenv("WHISPER_MODEL", "Systran/faster-distil-whisper-medium.en")
+    cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "12"))
 
-    logger.info(f"Loading Whisper model {model_id} on {device}...")
     compute_type = "float16" if device == "cuda" else "int8"
-    _whisper_model = WhisperModel(model_id, device=device, compute_type=compute_type)
-    logger.info(f"Whisper model loaded on {device}")
+    logger.info(f"Loading Whisper model {model_id} on {device} (threads={cpu_threads}, compute={compute_type})...")
+    _whisper_model = WhisperModel(
+        model_id, device=device, compute_type=compute_type, cpu_threads=cpu_threads,
+    )
+    logger.info(f"Whisper model loaded")
 
 
 def init():
@@ -170,13 +173,10 @@ def transcribe(pcm_bytes: bytes) -> str:
         beam_size=1,
         language="en",
         vad_filter=False,  # We already did VAD
-        no_speech_threshold=0.3,
+        condition_on_previous_text=False,  # Isolated utterances, skip extra pass
     )
 
-    text_parts = []
-    for seg in segments:
-        if seg.no_speech_prob < 0.3:
-            text_parts.append(seg.text.strip())
+    text_parts = [seg.text.strip() for seg in segments]
 
     text = " ".join(text_parts).strip()
     elapsed = time.monotonic() - t0

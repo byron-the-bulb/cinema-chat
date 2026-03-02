@@ -114,20 +114,29 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
         except Exception as e:
             logger.warning(f"Failed to get video info for {video_id}: {e}")
 
-        # Get caption from database
+        # Get dialogue captions from database (WhisperX audio transcriptions)
         caption = ""
+        timed_captions = []
         scene_id = scene.get("id")
         if scene_id and _db_pool:
             try:
                 async with _db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        "SELECT text FROM captions WHERE scene_id = $1 LIMIT 1",
+                    rows = await conn.fetch(
+                        """SELECT text, start_time, end_time FROM captions
+                           WHERE scene_id = $1 AND language = 'en'
+                           ORDER BY start_time""",
                         scene_id,
                     )
-                    if row:
-                        caption = row["text"]
+                    for row in rows:
+                        timed_captions.append({
+                            "text": row["text"],
+                            "start": row["start_time"],
+                            "end": row["end_time"],
+                        })
+                    if timed_captions:
+                        caption = timed_captions[0]["text"]
             except Exception as e:
-                logger.warning(f"Failed to get caption for scene {scene_id}: {e}")
+                logger.warning(f"Failed to get captions for scene {scene_id}: {e}")
 
         clips.append({
             "rank": i,
@@ -139,6 +148,7 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
             "similarity": f"{similarity:.0f}%",
             "title": title,
             "caption": caption,
+            "captions": timed_captions,
         })
 
     return clips

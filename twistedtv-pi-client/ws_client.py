@@ -88,19 +88,26 @@ class AudioCaptureThread(threading.Thread):
         self.running = False
 
 
-def play_video(video_service_url: str, video_path: str, start: float, end: float, fullscreen: bool = True):
+def play_video(video_service_url: str, video_path: str, start: float, end: float,
+               fullscreen: bool = True, transcript: str = "", captions: list = None):
     """Send play command to the local video playback service (with retry for startup race)."""
     max_retries = 5
+    payload = {
+        "video_path": video_path,
+        "start": start,
+        "end": end,
+        "fullscreen": fullscreen,
+    }
+    if transcript:
+        payload["transcript"] = transcript
+    if captions:
+        payload["captions"] = captions
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = httpx.post(
                 f"{video_service_url}/play",
-                json={
-                    "video_path": video_path,
-                    "start": start,
-                    "end": end,
-                    "fullscreen": fullscreen,
-                },
+                json=payload,
                 timeout=5.0,
             )
             if resp.status_code == 200:
@@ -119,6 +126,18 @@ def play_video(video_service_url: str, video_path: str, start: float, end: float
         except Exception as e:
             logger.error(f"Play request failed: {e}")
             return
+
+
+def show_overlay(video_service_url: str, transcript: str = "", captions: list = None):
+    """Update the text overlay on the video service (without changing video)."""
+    try:
+        httpx.post(
+            f"{video_service_url}/overlay",
+            json={"transcript": transcript, "captions": captions or []},
+            timeout=3.0,
+        )
+    except Exception as e:
+        logger.warning(f"Overlay update failed: {e}")
 
 
 def detect_audio_device() -> str:
@@ -178,10 +197,16 @@ def main():
                     msg.get("start", 0),
                     msg.get("end", 10),
                     msg.get("fullscreen", True),
+                    msg.get("transcript", ""),
+                    msg.get("captions", []),
                 )
 
             elif msg_type == "transcript":
-                logger.info(f"📝 Transcript: {msg.get('text')}")
+                # Show user's words on screen immediately (before clip plays)
+                text = msg.get("text", "")
+                logger.info(f"📝 Transcript: {text}")
+                if text:
+                    show_overlay(args.video_service, transcript=text)
 
             elif msg_type == "status":
                 logger.info(f"📊 Status: {msg.get('message')}")

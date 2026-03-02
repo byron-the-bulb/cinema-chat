@@ -89,6 +89,7 @@ async def handle_greeting(ws: WebSocket, session: Session):
         clips = await clip_search.search_clips(greeting_query, limit=5)
         if not clips:
             logger.warning("No greeting clips found")
+            session.add_status("[SYSTEM] Ready — no movies ingested yet")
             return
 
         chosen = clips[0]
@@ -101,6 +102,7 @@ async def handle_greeting(ws: WebSocket, session: Session):
             "start": chosen["start"],
             "end": chosen["end"],
             "fullscreen": True,
+            "captions": chosen.get("captions", []),
         })
 
         caption_short = chosen["caption"][:80] if chosen.get("caption") else chosen["file"]
@@ -133,6 +135,7 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
             return
 
         await ws.send_json({"type": "transcript", "text": text})
+        session.add_status(f"User: {text}")
         logger.info(f"[{session.session_id[:8]}] User: \"{text}\"")
 
         # ── 2. Search + Play ───────────────────────────────────────────
@@ -142,6 +145,7 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
 
         if not clips:
             await ws.send_json({"type": "status", "message": "No clips found"})
+            session.add_status("[SYSTEM] No clips found — database may be empty")
             return
 
         # Play the top search result directly — no LLM needed
@@ -161,6 +165,8 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
             "start": chosen["start"],
             "end": chosen["end"],
             "fullscreen": True,
+            "transcript": text,
+            "captions": chosen.get("captions", []),
         })
 
         # Update conversation history
@@ -306,6 +312,8 @@ async def audio_websocket(ws: WebSocket):
                                     "start": chosen["start"],
                                     "end": chosen["end"],
                                     "fullscreen": True,
+                                    "transcript": text,
+                                    "captions": chosen.get("captions", []),
                                 })
 
                 except json.JSONDecodeError:
