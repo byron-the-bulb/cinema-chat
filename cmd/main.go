@@ -128,6 +128,20 @@ func main() {
         port = "8080"
     }
 
+    // Start a minimal upload-only server on a separate port (default 9000).
+    // This port is exposed as direct TCP on RunPod, bypassing the HTTP proxy
+    // size limit that causes 413 on large video file uploads.
+    uploadPort := getEnvOrDefault("UPLOAD_PORT", "9000")
+    go func() {
+        uploadR := gin.New()
+        uploadR.Use(gin.Recovery())
+        uploadR.PUT("/api/v1/files/:filename", uploadFile)
+        log.Printf("📤 Upload server (direct TCP) starting on port %s\n", uploadPort)
+        if err := uploadR.Run(":" + uploadPort); err != nil {
+            log.Printf("Upload server error: %v", err)
+        }
+    }()
+
     fmt.Printf("🚀 GoodCLIPS Server starting on port %s\n", port)
     log.Fatal(r.Run(":" + port))
 }

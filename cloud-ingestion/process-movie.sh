@@ -286,7 +286,7 @@ POD_RESPONSE=$(curl -s --max-time 60 --request POST \
   --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
   --header 'content-type: application/json' \
   --data '{
-    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,8080/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
+    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,9000/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
   }')
 
 POD_ID=$(echo "$POD_RESPONSE" | python3 -c "
@@ -332,24 +332,19 @@ print('yes' if r else 'no')
 
     if [ "$RUNTIME" = "yes" ]; then
         # Extract port info.
-        # 8080/http  → HTTP proxy URL for API calls (health, jobs, stats, etc.)
-        # 8080/tcp   → direct IP:port for large file uploads (bypasses proxy 413 limit)
+        # 8080/http  → HTTP proxy URL for all API calls (health, jobs, stats, etc.)
+        # 9000/tcp   → direct IP:port for large file uploads (bypasses proxy 413 limit)
         # 5432/tcp   → direct IP:port for PostgreSQL (proxy can't carry TCP)
         eval "$(echo "$POD_STATUS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 pod_id = d['data']['pod']['id']
 ports = d['data']['pod']['runtime'].get('ports', [])
-has_8080 = False
 for p in ports:
     if p['privatePort'] == 8080:
-        # HTTP proxy URL is always derived from pod_id — set it once
-        if not has_8080:
-            print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
-            has_8080 = True
-        # Also grab direct TCP IP for large uploads if available
-        if p.get('ip') and p.get('type') != 'http':
-            print(f'UPLOAD_URL=http://{p[\"ip\"]}:{p[\"publicPort\"]}')
+        print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
+    if p['privatePort'] == 9000 and p.get('ip'):
+        print(f'UPLOAD_URL=http://{p[\"ip\"]}:{p[\"publicPort\"]}')
     if p['privatePort'] == 5432:
         ip = p.get('ip', '')
         pub_port = p.get('publicPort', 5432)
