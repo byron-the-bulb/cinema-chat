@@ -420,11 +420,15 @@ LOCAL_CAPTIONS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclip
 SRT_LOCAL="${VIDEO_DIR}/${MOVIE_FILENAME%.*}.srt"
 
 # ============================================
-# Step 9: Terminate pod
+# Step 9: Terminate pod (trap handles it)
 # ============================================
-log "Terminating pod..."
-KEEP_POD=false  # Allow cleanup trap to terminate
-# Trap will handle termination
+if [ "$KEEP_POD" = "true" ]; then
+    log "KEEP_POD=true — pod $POD_ID left running for inspection"
+    log "Terminate manually: https://www.runpod.io/console/pods"
+    log "Pod API: $API_URL"
+else
+    log "Terminating pod (set KEEP_POD=true to keep it alive)..."
+fi
 
 log "Done!"
 echo ""

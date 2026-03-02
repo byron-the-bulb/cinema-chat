@@ -184,14 +184,23 @@ func (vp *VideoProcessor) ProcessSceneDetection(payload map[string]interface{}) 
         return fmt.Errorf("missing or invalid filepath in payload")
     }
 
-    log.Printf("Processing scene detection for video ID %v", videoID)
+    log.Printf("Processing scene detection for video ID %v: %s", videoID, filepathStr)
+
+    // Verify the file is on disk before invoking PySceneDetect
+    if info, statErr := os.Stat(filepathStr); os.IsNotExist(statErr) {
+        return fmt.Errorf("video file not found: %s", filepathStr)
+    } else if statErr != nil {
+        return fmt.Errorf("failed to stat video file: %v", statErr)
+    } else {
+        log.Printf("Video file confirmed: %s (%.1f MB)", filepathStr, float64(info.Size())/1e6)
+    }
 
     // Check if scene detection tools are available
 	if err := vp.sceneDetector.CheckDependencies(); err != nil {
 		log.Printf("Warning: Scene detection dependencies not available: %v", err)
 		return fmt.Errorf("scene detection dependencies not available: %v", err)
 	}
-	
+
 	// Detect scenes
 	scenes, err := vp.sceneDetector.DetectScenes(filepathStr)
 	if err != nil {
@@ -199,6 +208,9 @@ func (vp *VideoProcessor) ProcessSceneDetection(payload map[string]interface{}) 
 	}
 	
 	log.Printf("Detected %d scenes for video ID %v", len(scenes), videoID)
+	if len(scenes) == 0 {
+		log.Printf("WARNING: 0 scenes detected in %s — check pod logs for PySceneDetect output", filepathStr)
+	}
 	
 	// Update video scene count
 	video, err := vp.db.GetVideoByID(uint(videoID.(float64)))
