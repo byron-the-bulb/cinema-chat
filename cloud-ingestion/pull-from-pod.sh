@@ -178,6 +178,11 @@ CREATE TEMP TABLE _stg_captions (
 \copy _stg_scenes  FROM '${EXPORT_DIR}/scenes.tsv'
 \copy _stg_captions FROM '${EXPORT_DIR}/captions.tsv'
 
+-- Remove any existing video with the same title (CASCADE clears scenes + captions)
+DELETE FROM videos
+WHERE title = (SELECT title FROM _stg_video LIMIT 1)
+  AND title <> '';
+
 INSERT INTO videos (uuid, filename, filepath, file_hash, title, duration, scene_count,
     caption_count, embedding_model, created_at, updated_at, last_processed_at,
     tags, status, metadata, error_message)
