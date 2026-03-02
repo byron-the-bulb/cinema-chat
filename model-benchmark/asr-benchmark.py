@@ -17,7 +17,7 @@ Options:
   --whisper-model  Whisper model size (default: large-v3)
                    Options: tiny, base, small, medium, large-v2, large-v3,
                             large-v3-turbo, distil-large-v3
-  --qwen-model     HuggingFace model ID (default: Qwen/Qwen3-ASR)
+  --qwen-model     HuggingFace model ID (default: Qwen/Qwen3-ASR-1.7B)
   --device         Force device: auto, cpu, cuda, mps  (default: auto)
   --language       Language code, e.g. 'en' (default: auto-detect)
   --max-secs       Truncate audio to N seconds for quick tests
@@ -382,9 +382,9 @@ def main() -> None:
     p.add_argument("--whisper-model", default="large-v3",
                    metavar="SIZE",
                    help="Whisper model size (default: large-v3)")
-    p.add_argument("--qwen-model", default="Qwen/Qwen3-ASR",
+    p.add_argument("--qwen-model", default="Qwen/Qwen3-ASR-1.7B",
                    metavar="MODEL_ID",
-                   help="HuggingFace model ID for Qwen ASR (default: Qwen/Qwen3-ASR)")
+                   help="HuggingFace model ID for Qwen ASR (default: Qwen/Qwen3-ASR-1.7B)")
     p.add_argument("--device", default="auto",
                    choices=["auto", "cpu", "cuda", "mps"],
                    help="Compute device (default: auto-detect)")
