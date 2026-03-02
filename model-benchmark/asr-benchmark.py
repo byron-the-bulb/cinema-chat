@@ -58,7 +58,8 @@ class BenchResult:
     model: str
     model_id: str
     device_used: str
-    elapsed_s: float
+    load_s: float        # model load + warmup time (not benchmarked)
+    elapsed_s: float     # inference time only (this is what's benchmarked)
     audio_duration_s: float
     rtf: float           # elapsed / audio_duration  (lower = faster)
     segments: List[dict]
@@ -105,6 +106,18 @@ def _srt_ts(secs: float) -> str:
     h, rem = divmod(max(secs, 0.0), 3600)
     m, s = divmod(rem, 60)
     return f"{int(h):02d}:{int(m):02d}:{s:06.3f}".replace(".", ",")
+
+
+def trim_wav(src: str, secs: int) -> str:
+    """Return a path to a temporary WAV trimmed to the first `secs` seconds."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-t", str(secs),
+         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", tmp.name],
+        capture_output=True, check=True,
+    )
+    return tmp.name
 
 
 def to_srt(segments: List[dict]) -> str:
@@ -157,44 +170,74 @@ def _rss_mb() -> float:
 # ── Model runners ─────────────────────────────────────────────────────────────
 
 def run_whisperx(wav: str, model_size: str, language: Optional[str],
-                 duration: float, device: str) -> BenchResult:
+                 duration: float, device: str, warmup_secs: int = 5) -> BenchResult:
     """
     WhisperX: faster-whisper (CTranslate2) + word-level alignment.
-    Uses CPU INT8 by default — very fast even without GPU.
+
+    Phases:
+      1. Load  — model + audio loaded into RAM (not timed)
+      2. Warmup — short inference pass to trigger JIT / BLAS init (not timed)
+      3. Time  — full transcription timed from first token to last
     """
     try:
         import whisperx
 
-        # CTranslate2: int8 on CPU, float16 on CUDA/ROCm
-        compute_type = "float16" if device in ("cuda", "mps") else "int8"
-        ct_device = "cpu" if device == "mps" else device  # CTranslate2 has no MPS
+        compute_type = "float16" if device == "cuda" else "int8"
 
-        ram0 = _rss_mb()
-        t0 = time.perf_counter()
+        # ── Phase 1: Load ─────────────────────────────────────────────────────
+        print("  [load] loading model...", end="", flush=True)
+        t_load = time.perf_counter()
 
         model = whisperx.load_model(
-            model_size, device=ct_device, compute_type=compute_type,
+            model_size, device=device, compute_type=compute_type,
             language=language,
         )
         audio = whisperx.load_audio(wav)
-        result = model.transcribe(audio, batch_size=8, language=language)
-        lang = result.get("language", "?")
 
-        # Word-level alignment improves SRT timing (optional — skip if model unavailable)
+        load_s = time.perf_counter() - t_load
+        print(f" {load_s:.1f}s", flush=True)
+
+        # ── Phase 2: Warmup ───────────────────────────────────────────────────
+        # Also detects language so the align model is ready before timing starts
+        print(f"  [warmup] {warmup_secs}s pass...", end="", flush=True)
+
+        warmup_audio = audio[:16000 * warmup_secs]
+        warmup_res = model.transcribe(warmup_audio, batch_size=8, language=language)
+        lang = warmup_res.get("language", language or "en")
+
+        # Pre-load alignment model with the detected language
+        ma, meta = None, None
         try:
-            ma, meta = whisperx.load_align_model(language_code=lang, device=ct_device)
-            result = whisperx.align(result["segments"], ma, meta, audio, ct_device,
-                                    return_char_alignments=False)
-        except Exception as align_err:
-            pass  # alignment is best-effort
+            ma, meta = whisperx.load_align_model(language_code=lang, device=device)
+            whisperx.align(warmup_res["segments"], ma, meta, warmup_audio, device,
+                           return_char_alignments=False)
+        except Exception:
+            pass
 
-        segs = result.get("segments", [])
+        print(" done", flush=True)
+
+        # ── Phase 3: Timed inference ──────────────────────────────────────────
+        ram0 = _rss_mb()
+        t0 = time.perf_counter()
+
+        result = model.transcribe(audio, batch_size=8, language=language)
+        lang = result.get("language", lang)
+
+        if ma is not None:
+            try:
+                result = whisperx.align(result["segments"], ma, meta, audio, device,
+                                        return_char_alignments=False)
+            except Exception:
+                pass
+
         elapsed = time.perf_counter() - t0
+        segs = result.get("segments", [])
 
         return BenchResult(
             model="whisperx",
             model_id=f"faster-whisper/{model_size}",
-            device_used=ct_device,
+            device_used=device,
+            load_s=load_s,
             elapsed_s=elapsed,
             audio_duration_s=duration,
             rtf=elapsed / duration if duration else 0,
@@ -208,7 +251,7 @@ def run_whisperx(wav: str, model_size: str, language: Optional[str],
     except Exception as e:
         return BenchResult(
             model="whisperx", model_id=f"faster-whisper/{model_size}",
-            device_used=device, elapsed_s=0, audio_duration_s=duration, rtf=0,
+            device_used=device, load_s=0, elapsed_s=0, audio_duration_s=duration, rtf=0,
             segments=[], word_count=0, char_count=0, peak_rss_mb=0, error=str(e),
         )
 
@@ -243,26 +286,38 @@ def _words_to_segments(words, max_words: int = 10, max_gap_s: float = 1.5) -> Li
 
 
 def run_qwen3(wav: str, model_id: str, language: Optional[str],
-              duration: float, device: str,
+              duration: float, device: str, warmup_secs: int = 5,
               aligner_id: str = "Qwen/Qwen3-ForcedAligner-0.6B") -> BenchResult:
     """
-    Qwen3-ASR via the official qwen-asr package.
-    Install: pip install qwen-asr
+    Qwen3-ASR via the official qwen-asr package (pip install qwen-asr).
 
-    Uses Qwen3-ForcedAligner-0.6B for word timestamps → proper SRT output.
+    Phases:
+      1. Load  — model + ForcedAligner loaded into RAM (not timed)
+      2. Warmup — short inference pass to warm up the LLM decoder (not timed)
+      3. Time  — full transcription timed from first token to last
+
     device: "cpu" or "cuda:0"
-    dtype:  bfloat16 (Zen5 supports AVX-512 BF16; falls back to float32 on error)
+    dtype:  bfloat16 (Zen5 AVX-512 BF16 supported; fine on CUDA too)
     """
+    # qwen_asr language names (ISO code → full name)
+    LANG_NAMES = {
+        "en": "English", "zh": "Chinese", "fr": "French",
+        "de": "German",  "es": "Spanish", "ja": "Japanese",
+        "ko": "Korean",  "it": "Italian", "pt": "Portuguese",
+        "ru": "Russian", "ar": "Arabic",  "nl": "Dutch",
+    }
+
+    warmup_wav = None
     try:
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        # bfloat16 works on Zen5 AVX-512; float32 on older CPUs
-        dtype = torch.bfloat16 if device != "cpu" else torch.bfloat16
-        device_map = device  # "cpu" or "cuda:0"
+        dtype = torch.bfloat16  # Zen5 AVX-512 BF16 and CUDA both handle this well
+        device_map = device
 
-        ram0 = _rss_mb()
-        t0 = time.perf_counter()
+        # ── Phase 1: Load ─────────────────────────────────────────────────────
+        print("  [load] loading model + aligner...", end="", flush=True)
+        t_load = time.perf_counter()
 
         model = Qwen3ASRModel.from_pretrained(
             model_id,
@@ -274,37 +329,44 @@ def run_qwen3(wav: str, model_id: str, language: Optional[str],
             forced_aligner_kwargs=dict(dtype=dtype, device_map=device_map),
         )
 
-        # qwen_asr expects a language name like "English", not a code like "en"
-        LANG_CODES = {
-            "en": "English", "zh": "Chinese", "fr": "French",
-            "de": "German",  "es": "Spanish", "ja": "Japanese",
-            "ko": "Korean",  "it": "Italian", "pt": "Portuguese",
-            "ru": "Russian", "ar": "Arabic",  "nl": "Dutch",
-        }
-        lang_name = LANG_CODES.get(language or "", language) if language else None
+        load_s = time.perf_counter() - t_load
+        print(f" {load_s:.1f}s", flush=True)
 
-        results = model.transcribe(
-            audio=wav,
-            language=lang_name,
-            return_time_stamps=True,
-        )
+        lang_name = LANG_NAMES.get(language or "", language) if language else None
+
+        # ── Phase 2: Warmup ───────────────────────────────────────────────────
+        print(f"  [warmup] {warmup_secs}s pass...", end="", flush=True)
+
+        warmup_wav = trim_wav(wav, warmup_secs)
+        model.transcribe(audio=warmup_wav, language=lang_name, return_time_stamps=True)
+        try:
+            os.unlink(warmup_wav)
+        except OSError:
+            pass
+        warmup_wav = None
+
+        print(" done", flush=True)
+
+        # ── Phase 3: Timed inference ──────────────────────────────────────────
+        ram0 = _rss_mb()
+        t0 = time.perf_counter()
+
+        results = model.transcribe(audio=wav, language=lang_name, return_time_stamps=True)
+
+        elapsed = time.perf_counter() - t0
 
         r0 = results[0]
         lang_out = getattr(r0, "language", language or "?")
-
-        # r0.time_stamps is a list of word-timestamp objects
         segs = _words_to_segments(r0.time_stamps or [])
 
-        # Fallback: no timestamps → single block with full text
         if not segs and getattr(r0, "text", ""):
             segs = [{"start": 0.0, "end": duration, "text": r0.text}]
-
-        elapsed = time.perf_counter() - t0
 
         return BenchResult(
             model="qwen3",
             model_id=model_id,
             device_used=device_map,
+            load_s=load_s,
             elapsed_s=elapsed,
             audio_duration_s=duration,
             rtf=elapsed / duration if duration else 0,
@@ -316,9 +378,14 @@ def run_qwen3(wav: str, model_id: str, language: Optional[str],
         )
 
     except Exception as e:
+        if warmup_wav:
+            try:
+                os.unlink(warmup_wav)
+            except OSError:
+                pass
         return BenchResult(
             model="qwen3", model_id=model_id,
-            device_used=device, elapsed_s=0, audio_duration_s=duration, rtf=0,
+            device_used=device, load_s=0, elapsed_s=0, audio_duration_s=duration, rtf=0,
             segments=[], word_count=0, char_count=0, peak_rss_mb=0, error=str(e),
         )
 
@@ -364,7 +431,8 @@ def print_result(r: BenchResult, ref_path: Optional[str], out_dir: Path, stem: s
     rtf_label = f"{r.rtf:.2f}x realtime" if r.rtf else "?"
     print(f"  Model:    {r.model_id}")
     print(f"  Device:   {r.device_used}")
-    print(f"  Time:     {r.elapsed_s:.1f}s  ({rtf_label})")
+    print(f"  Load+WU:  {r.load_s:.1f}s  (not benchmarked)")
+    print(f"  Infer:    {r.elapsed_s:.1f}s  ({rtf_label})")
     print(f"  Words:    {r.word_count}  ({r.char_count} chars)")
     print(f"  Language: {r.language}")
     print(f"  RAM Δ:    {r.peak_rss_mb:.0f} MB")
@@ -378,20 +446,22 @@ def print_table(results: List[BenchResult]) -> None:
     ok = [r for r in results if r.ok]
     if len(ok) < 2:
         return
-    print("=" * 80)
-    print("COMPARISON")
-    print("=" * 80)
-    H = f"{'Model':<12}  {'ID':<36}  {'Time':>7}  {'RTF':>6}  {'Words':>6}  {'RAM MB':>7}"
+    print("=" * 90)
+    print("COMPARISON  (Load+WU = model load + warmup, not benchmarked)")
+    print("=" * 90)
+    H = (f"{'Model':<12}  {'ID':<34}  {'Load+WU':>8}  {'Infer(s)':>8}  "
+         f"{'RTF':>6}  {'Words':>6}  {'RAM MB':>7}")
     if any(r.wer is not None for r in ok):
         H += f"  {'WER':>6}"
     print(H)
     print("-" * len(H))
     for r in results:
         if r.error:
-            print(f"{'  '+r.model:<12}  ERROR: {r.error[:55]}")
+            print(f"{'  '+r.model:<12}  ERROR: {r.error[:60]}")
             continue
-        line = (f"  {r.model:<10}  {r.model_id[:35]:<36}  "
-                f"{r.elapsed_s:>7.1f}  {r.rtf:>6.2f}  {r.word_count:>6}  {r.peak_rss_mb:>7.0f}")
+        line = (f"  {r.model:<10}  {r.model_id[:33]:<34}  "
+                f"{r.load_s:>7.1f}s  {r.elapsed_s:>7.1f}s  "
+                f"{r.rtf:>6.2f}  {r.word_count:>6}  {r.peak_rss_mb:>7.0f}")
         if any(x.wer is not None for x in ok):
             line += f"  {str(r.wer)+'%' if r.wer is not None else '—':>6}"
         print(line)
@@ -399,7 +469,7 @@ def print_table(results: List[BenchResult]) -> None:
     # Speed winner
     times = [(r.elapsed_s, r.model) for r in ok]
     fastest = min(times, key=lambda x: x[0])
-    print(f"\nFastest: {fastest[1]} ({fastest[0]:.1f}s)")
+    print(f"\nFastest inference: {fastest[1]} ({fastest[0]:.1f}s)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -429,6 +499,8 @@ def main() -> None:
                    help="ISO language code, e.g. 'en' (default: auto-detect)")
     p.add_argument("--max-secs", type=int, default=None, metavar="N",
                    help="Truncate audio to first N seconds (quick test mode)")
+    p.add_argument("--warmup-secs", type=int, default=5, metavar="N",
+                   help="Seconds of audio used for warmup inference (default: 5, 0 to disable)")
     p.add_argument("--ref", default=None, metavar="FILE",
                    help="Reference transcript for WER calculation")
     p.add_argument("--output-dir", default="./benchmark-out", metavar="DIR",
@@ -450,8 +522,9 @@ def main() -> None:
     print("=" * 60)
     print(f"Source:   {src.name}")
     print(f"Device:   {device}")
+    print(f"Warmup:   {args.warmup_secs}s per model (not timed)")
     if args.max_secs:
-        print(f"Duration: first {args.max_secs}s only")
+        print(f"Clip:     first {args.max_secs}s only")
 
     # Extract audio
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
@@ -477,10 +550,11 @@ def main() -> None:
         print(f"{'─' * 60}")
 
         if model_name == "whisperx":
-            r = run_whisperx(wav_path, args.whisper_model, args.language, duration, device)
+            r = run_whisperx(wav_path, args.whisper_model, args.language, duration, device,
+                             warmup_secs=args.warmup_secs)
         elif model_name == "qwen3":
             r = run_qwen3(wav_path, args.qwen_model, args.language, duration, device,
-                          aligner_id=args.aligner_model)
+                          warmup_secs=args.warmup_secs, aligner_id=args.aligner_model)
         else:
             print(f"  Unknown model '{model_name}'. Valid: whisperx, qwen3")
             continue
@@ -501,6 +575,7 @@ def main() -> None:
         "source": str(src),
         "duration_s": duration,
         "device": device,
+        "warmup_secs": args.warmup_secs,
         "whisper_model": args.whisper_model,
         "qwen_model": args.qwen_model,
         "max_secs": args.max_secs,
