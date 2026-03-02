@@ -12,17 +12,20 @@
 #
 # Usage:
 #   ./cloud-ingestion/process-movie.sh <url_or_file> [title]
+#   ./cloud-ingestion/process-movie.sh --benchmark GPU1,GPU2,... <url_or_file> [title]
 #
 #   url_or_file: https:// URL  — pod downloads the video directly
 #                /local/path   — file is uploaded to the pod from this machine
 #   title:       optional display title (default: filename without extension)
 #
+# GPU shorthands: 3090, 4090, 5090, L4, A4000, A5000, A6000
+#
 # Examples:
 #   ./cloud-ingestion/process-movie.sh \
 #     'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'
 #
-#   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4
 #   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4 'House on the Hill'
+#   ./cloud-ingestion/process-movie.sh --benchmark 3090,4090,A5000 data/videos/clip.mp4
 #
 # Environment variables:
 #   RUNPOD_API_KEY  - Your RunPod API key (required; or in cinema_bot/.env)
@@ -39,6 +42,109 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# ============================================
+# Benchmark mode: --benchmark GPU1,GPU2,...
+# ============================================
+resolve_gpu() {
+    case "${1,,}" in
+        3080)   echo "NVIDIA GeForce RTX 3080" ;;
+        3090)   echo "NVIDIA GeForce RTX 3090" ;;
+        4080)   echo "NVIDIA GeForce RTX 4080" ;;
+        4090)   echo "NVIDIA GeForce RTX 4090" ;;
+        5090)   echo "NVIDIA GeForce RTX 5090" ;;
+        l4)     echo "NVIDIA L4" ;;
+        a4000)  echo "NVIDIA RTX A4000" ;;
+        a5000)  echo "NVIDIA RTX A5000" ;;
+        a6000)  echo "NVIDIA RTX A6000" ;;
+        *)      echo "$1" ;;
+    esac
+}
+
+if [ "${1}" = "--benchmark" ]; then
+    BENCH_GPU_LIST="${2}"
+    BENCH_SOURCE="${3}"
+    BENCH_TITLE="${4:-}"
+
+    if [ -z "$BENCH_GPU_LIST" ] || [ -z "$BENCH_SOURCE" ]; then
+        echo "Usage: $0 --benchmark GPU1,GPU2,... <url_or_file> [title]"
+        echo ""
+        echo "GPU shorthands: 3090, 4090, 5090, L4, A4000, A5000, A6000"
+        echo "Example: $0 --benchmark 3090,4090,A5000 /path/to/movie.mp4 'My Movie'"
+        exit 1
+    fi
+
+    # Auto-source RUNPOD_API_KEY
+    if [ -z "$RUNPOD_API_KEY" ]; then
+        ENV_FILE="${PROJECT_DIR}/twistedtv-server/cinema_bot/.env"
+        [ -f "$ENV_FILE" ] && RUNPOD_API_KEY=$(grep -E '^RUNPOD_API_KEY=' "$ENV_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    fi
+    [ -z "$RUNPOD_API_KEY" ] && { echo "ERROR: RUNPOD_API_KEY not set"; exit 1; }
+
+    LOG_DIR="${PROJECT_DIR}/data/benchmark_logs"
+    mkdir -p "$LOG_DIR"
+    BENCH_RUN_ID="$(date '+%Y%m%d_%H%M%S')"
+
+    # Derive filename for DB lookups
+    if [[ "$BENCH_SOURCE" == http://* ]] || [[ "$BENCH_SOURCE" == https://* ]]; then
+        BENCH_FILENAME="$(basename "${BENCH_SOURCE%%\?*}")"
+    else
+        BENCH_FILENAME="$(basename "$BENCH_SOURCE")"
+    fi
+
+    echo "=== BENCHMARK MODE ==="
+    echo "Source: $BENCH_SOURCE"
+    echo "File:   $BENCH_FILENAME"
+    echo "GPUs:   $BENCH_GPU_LIST"
+    echo "Logs:   ${LOG_DIR}/${BENCH_RUN_ID}_*.log"
+    echo ""
+
+    IFS=',' read -ra BENCH_GPUS <<< "$BENCH_GPU_LIST"
+    BENCH_RESULTS=()
+
+    for BENCH_SHORT in "${BENCH_GPUS[@]}"; do
+        BENCH_SHORT="${BENCH_SHORT// /}"
+        BENCH_FULL="$(resolve_gpu "$BENCH_SHORT")"
+        LOG_FILE="${LOG_DIR}/${BENCH_RUN_ID}_${BENCH_SHORT}.log"
+
+        printf "%-8s  %-32s  " "$BENCH_SHORT" "${BENCH_FULL:0:32}"
+
+        BENCH_START=$(date +%s)
+        BENCH_EXIT=0
+        RUNPOD_API_KEY="$RUNPOD_API_KEY" GPU_TYPE="$BENCH_FULL" \
+            "$0" "$BENCH_SOURCE" "$BENCH_TITLE" > "$LOG_FILE" 2>&1 || BENCH_EXIT=$?
+        BENCH_ELAPSED=$(( $(date +%s) - BENCH_START ))
+
+        if [ "$BENCH_EXIT" -eq 0 ]; then
+            B_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
+                -c "SELECT COUNT(*) FROM scenes s JOIN videos v ON s.video_id = v.id WHERE v.filename = '${BENCH_FILENAME}'" \
+                2>/dev/null | tr -d '[:space:]' || echo "?")
+            B_CAPTS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
+                -c "SELECT COUNT(*) FROM captions c JOIN videos v ON c.video_id = v.id WHERE v.filename = '${BENCH_FILENAME}'" \
+                2>/dev/null | tr -d '[:space:]' || echo "?")
+            B_STATUS="OK"
+            printf "%6ds  %6s scenes  %6s captions  OK\n" "$BENCH_ELAPSED" "$B_SCENES" "$B_CAPTS"
+        else
+            B_SCENES="-"; B_CAPTS="-"; B_STATUS="FAILED"
+            printf "%6ds  FAILED (see log)\n" "$BENCH_ELAPSED"
+        fi
+
+        BENCH_RESULTS+=("${BENCH_SHORT}|${BENCH_FULL}|${BENCH_ELAPSED}|${B_SCENES}|${B_CAPTS}|${B_STATUS}")
+    done
+
+    echo ""
+    echo "=== RESULTS ==="
+    printf "%-8s  %-32s  %8s  %8s  %10s  %8s\n" "GPU" "Type" "Time(s)" "Scenes" "Captions" "Status"
+    printf "%-8s  %-32s  %8s  %8s  %10s  %8s\n" \
+        "--------" "--------------------------------" "--------" "--------" "----------" "--------"
+    for r in "${BENCH_RESULTS[@]}"; do
+        IFS='|' read -r S F E SC CA ST <<< "$r"
+        printf "%-8s  %-32s  %8s  %8s  %10s  %8s\n" "$S" "${F:0:32}" "$E" "$SC" "$CA" "$ST"
+    done
+    echo ""
+    echo "Full logs: ${LOG_DIR}/${BENCH_RUN_ID}_*.log"
+    exit 0
+fi
 
 SOURCE="${1}"
 MOVIE_TITLE_ARG="${2:-}"   # optional title; filename is always derived from source
@@ -65,7 +171,7 @@ if [ -z "$RUNPOD_API_KEY" ]; then
     fi
 fi
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
-GPU_TYPE="${GPU_TYPE:-NVIDIA RTX A4000}"
+GPU_TYPE="${GPU_TYPE:-NVIDIA RTX 3090}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-va55/goodclips-runpod:whisper-transcription}"
 VIDEO_DIR="${PROJECT_DIR}/data/videos"
 
@@ -99,19 +205,22 @@ trap cleanup EXIT
 # ============================================
 if [ -z "$SOURCE" ]; then
     echo "Usage: $0 <url_or_file> [title]"
+    echo "       $0 --benchmark GPU1,GPU2,... <url_or_file> [title]"
     echo ""
     echo "  url_or_file: https:// URL  — pod downloads the video directly"
     echo "               /local/path   — file is uploaded to the pod from this machine"
     echo "  title:       optional display title (default: filename without extension)"
     echo ""
+    echo "GPU shorthands for --benchmark: 3090, 4090, 5090, L4, A4000, A5000, A6000"
+    echo ""
     echo "Examples:"
     echo "  $0 'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'"
-    echo "  $0 /path/to/my_movie.mp4"
     echo "  $0 /path/to/my_movie.mp4 'House on the Hill'"
+    echo "  $0 --benchmark 3090,4090,A5000 /path/to/clip.mp4"
     echo ""
     echo "Environment variables:"
     echo "  RUNPOD_API_KEY  - Your RunPod API key (required)"
-    echo "  GPU_TYPE        - GPU type (default: NVIDIA RTX A4000)"
+    echo "  GPU_TYPE        - GPU type (default: NVIDIA RTX 3090)"
     echo "  KEEP_POD        - Set to 'true' to keep pod running after completion"
     echo "  MOVIE_TITLE     - Video title (default: filename without extension)"
     exit 1
