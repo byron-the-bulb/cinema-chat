@@ -3,19 +3,31 @@
 #
 # This script automates the full ingestion pipeline:
 #   1. Spins up a GPU pod on RunPod with the goodclips-runpod Docker image
-#   2. The pod downloads the movie, detects scenes, generates embeddings + captions
-#   3. When done, pg_dump is used to export the database via the exposed port 5432
-#   4. The dump is imported into the local PostgreSQL database
-#   5. The video file is downloaded locally for the streaming server
-#   6. The pod is terminated
+#   2. The pod downloads (URL) or receives (local file) the movie
+#   3. The pod transcribes audio, detects scenes, generates embeddings + captions
+#   4. Results are exported from the pod's PostgreSQL into the local database
+#   5. The SRT sidecar is downloaded from the pod via HTTP
+#   6. The video file is ensured locally (downloaded or already present)
+#   7. The pod is terminated
 #
 # Usage:
-#   ./cloud-ingestion/process-movie.sh <movie_url> [filename]
+#   ./cloud-ingestion/process-movie.sh <url_or_file> [filename]
+#
+#   url_or_file: https:// URL  — pod downloads the video directly
+#                /local/path   — file is uploaded to the pod from this machine
 #
 # Examples:
 #   ./cloud-ingestion/process-movie.sh \
-#     'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4' \
-#     'carnival_of_souls.mp4'
+#     'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'
+#
+#   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4
+#   ./cloud-ingestion/process-movie.sh /path/to/my_movie.mp4 'my_movie.mp4'
+#
+# Environment variables:
+#   RUNPOD_API_KEY  - Your RunPod API key (required; or in cinema_bot/.env)
+#   GPU_TYPE        - GPU type (default: NVIDIA RTX A4000)
+#   KEEP_POD        - Set to 'true' to keep pod running after completion
+#   MOVIE_TITLE     - Video title (default: filename without extension)
 #
 # Prerequisites:
 #   - RUNPOD_API_KEY in environment or in twistedtv-server/cinema_bot/.env
@@ -27,8 +39,24 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-MOVIE_URL="${1}"
-MOVIE_FILENAME="${2:-movie.mp4}"
+SOURCE="${1}"
+MOVIE_FILENAME="${2:-}"
+
+# Detect local file vs remote URL
+if [[ "$SOURCE" == http://* ]] || [[ "$SOURCE" == https://* ]]; then
+    IS_LOCAL=false
+    MOVIE_URL="$SOURCE"
+    # Derive filename from URL (strip query string) if not given
+    MOVIE_FILENAME="${MOVIE_FILENAME:-$(basename "${MOVIE_URL%%\?*}")}"
+else
+    IS_LOCAL=true
+    LOCAL_FILE="$(realpath "$SOURCE" 2>/dev/null || echo "$SOURCE")"
+    MOVIE_URL=""
+    MOVIE_FILENAME="${MOVIE_FILENAME:-$(basename "$LOCAL_FILE")}"
+fi
+
+# Title defaults to filename without extension (spaces instead of underscores)
+MOVIE_TITLE="${MOVIE_TITLE:-${MOVIE_FILENAME%.*}}"
 # Auto-source RUNPOD_API_KEY from .env if not already set
 if [ -z "$RUNPOD_API_KEY" ]; then
     ENV_FILE="${PROJECT_DIR}/twistedtv-server/cinema_bot/.env"
@@ -69,19 +97,26 @@ trap cleanup EXIT
 # ============================================
 # Validate prerequisites
 # ============================================
-if [ -z "$MOVIE_URL" ]; then
-    echo "Usage: $0 <movie_url> [filename]"
+if [ -z "$SOURCE" ]; then
+    echo "Usage: $0 <url_or_file> [filename]"
+    echo ""
+    echo "  url_or_file: https:// URL  — pod downloads the video directly"
+    echo "               /local/path   — file is uploaded to the pod from this machine"
     echo ""
     echo "Examples:"
-    echo "  $0 'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4' 'carnival_of_souls.mp4'"
-    echo "  $0 'https://archive.org/download/night_of_the_living_dead_dvd/Night.mp4' 'notld.mp4'"
+    echo "  $0 'https://archive.org/download/carnival_of_souls/carnival_of_souls.mp4'"
+    echo "  $0 /path/to/my_movie.mp4"
+    echo "  $0 /path/to/my_movie.mp4 'my_movie.mp4'"
     echo ""
     echo "Environment variables:"
     echo "  RUNPOD_API_KEY  - Your RunPod API key (required)"
     echo "  GPU_TYPE        - GPU type (default: NVIDIA RTX A4000)"
     echo "  KEEP_POD        - Set to 'true' to keep pod running after completion"
+    echo "  MOVIE_TITLE     - Video title (default: filename without extension)"
     exit 1
 fi
+
+[ "$IS_LOCAL" = true ] && [ ! -f "$LOCAL_FILE" ] && error "Local file not found: $LOCAL_FILE"
 
 [ -z "$RUNPOD_API_KEY" ] && error "RUNPOD_API_KEY environment variable not set"
 which psql > /dev/null 2>&1 || error "psql not installed. Run: sudo dnf install -y postgresql"
@@ -92,8 +127,25 @@ PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -c
     || error "Cannot connect to local PostgreSQL. Is the goodclips docker compose stack running?"
 
 log "Starting movie processing pipeline"
-log "Movie URL: $MOVIE_URL"
+if [ "$IS_LOCAL" = true ]; then
+    log "Source:   $LOCAL_FILE (local file)"
+else
+    log "Source:   $MOVIE_URL"
+fi
 log "Filename: $MOVIE_FILENAME"
+log "Title:    $MOVIE_TITLE"
+
+# For local files: copy to videos dir now so it's available after processing
+if [ "$IS_LOCAL" = true ]; then
+    mkdir -p "$VIDEO_DIR"
+    VIDEO_LOCAL_COPY="${VIDEO_DIR}/${MOVIE_FILENAME}"
+    if [ ! -f "$VIDEO_LOCAL_COPY" ]; then
+        log "Copying local file to videos directory..."
+        cp "$LOCAL_FILE" "$VIDEO_LOCAL_COPY"
+    else
+        log "File already in videos directory: $VIDEO_LOCAL_COPY"
+    fi
+fi
 
 # ============================================
 # Step 1: Create RunPod with all required ports
@@ -104,7 +156,7 @@ POD_RESPONSE=$(curl -s --max-time 60 --request POST \
   --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
   --header 'content-type: application/json' \
   --data '{
-    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}] }) { id machineId } }"
+    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
   }')
 
 POD_ID=$(echo "$POD_RESPONSE" | python3 -c "
@@ -209,6 +261,35 @@ except:
 done
 
 [ "$HEALTH" != "ok" ] && error "API never became healthy"
+
+# ============================================
+# Step 3b: Upload local file to pod (local-file mode only)
+# ============================================
+if [ "$IS_LOCAL" = true ]; then
+    log "Uploading local file to pod (this may take a while for large files)..."
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 3600 \
+        -T "$LOCAL_FILE" \
+        "$API_URL/api/v1/files/$MOVIE_FILENAME")
+    [ "$HTTP_CODE" = "200" ] || error "File upload failed (HTTP $HTTP_CODE)"
+    log "Upload complete: $MOVIE_FILENAME"
+
+    # Also upload a sidecar SRT if one already exists alongside the source file
+    LOCAL_SRT="${LOCAL_FILE%.*}.srt"
+    SRT_FILENAME="${MOVIE_FILENAME%.*}.srt"
+    if [ -f "$LOCAL_SRT" ]; then
+        log "Uploading SRT sidecar..."
+        curl -s -o /dev/null --max-time 60 -T "$LOCAL_SRT" "$API_URL/api/v1/files/$SRT_FILENAME"
+        log "SRT uploaded: $SRT_FILENAME"
+    fi
+
+    log "Submitting video for processing..."
+    curl -s -X POST "$API_URL/api/v1/videos" \
+        -H "Content-Type: application/json" \
+        -d "{\"filename\": \"${MOVIE_FILENAME}\", \"filepath\": \"/data/videos/${MOVIE_FILENAME}\", \"title\": \"${MOVIE_TITLE}\"}" \
+        > /dev/null
+    log "Video submitted"
+fi
 
 # ============================================
 # Step 4: Wait for processing to complete
@@ -317,6 +398,7 @@ log "Done!"
 echo ""
 echo "=== Summary ==="
 echo "  Movie:    $MOVIE_FILENAME"
+echo "  Title:    $MOVIE_TITLE"
 echo "  Scenes:   $LOCAL_SCENES"
 echo "  Captions: $LOCAL_CAPTIONS"
 echo "  Video:    ${VIDEO_DIR}/${MOVIE_FILENAME}"

@@ -154,6 +154,7 @@ echo ""
 auto_download_video() {
     AUTO_DOWNLOAD_URL="${AUTO_DOWNLOAD_URL:-}"
     AUTO_DOWNLOAD_FILENAME="${AUTO_DOWNLOAD_FILENAME:-video.mp4}"
+    AUTO_TITLE="${AUTO_TITLE:-${AUTO_DOWNLOAD_FILENAME%.*}}"
 
     if [ -z "${AUTO_DOWNLOAD_URL}" ]; then
         return
@@ -203,7 +204,7 @@ auto_download_video() {
         echo "[Auto-download] Submitting for processing..."
         curl -s -X POST http://localhost:8080/api/v1/videos \
             -H "Content-Type: application/json" \
-            -d "{\"filename\": \"${AUTO_DOWNLOAD_FILENAME}\", \"filepath\": \"${FILEPATH}\"}"
+            -d "{\"filename\": \"${AUTO_DOWNLOAD_FILENAME}\", \"filepath\": \"${FILEPATH}\", \"title\": \"${AUTO_TITLE}\"}"
         echo "[Auto-download] Video submitted!"
     else
         echo "[Auto-download] WARNING: Download failed (file too small)"

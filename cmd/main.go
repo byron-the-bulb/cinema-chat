@@ -102,9 +102,10 @@ func main() {
         v1.POST("/search/semantic", searchSemantic)
         v1.POST("/search/text", searchText)
 
-        // File download (used by process-movie.sh to retrieve generated
-        // files such as SRT sidecars from the RunPod instance)
+        // File transfer — GET lets process-movie.sh pull SRT sidecars from
+        // the RunPod instance; PUT lets it upload local video files to the pod.
         v1.GET("/files/:filename", serveFile)
+        v1.PUT("/files/:filename", uploadFile)
 
         // Statistics
         v1.GET("/stats", getStats)
@@ -255,6 +256,32 @@ func searchText(c *gin.Context) {
         "count":   len(items),
         "results": items,
     })
+}
+
+// uploadFile accepts a raw PUT body and saves it to the videos directory.
+// Used by process-movie.sh to stream a local video file to a RunPod pod
+// (pods have no SSH; the HTTP API is the only upload path).
+func uploadFile(c *gin.Context) {
+    filename := filepath.Base(c.Param("filename"))
+    videosDir := getEnvOrDefault("VIDEOS_PATH", "/data/videos")
+    if err := os.MkdirAll(videosDir, 0755); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create directory", "details": err.Error()})
+        return
+    }
+    fullPath := filepath.Join(videosDir, filename)
+    f, err := os.Create(fullPath)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create file", "details": err.Error()})
+        return
+    }
+    defer f.Close()
+    written, err := io.Copy(f, c.Request.Body)
+    if err != nil {
+        os.Remove(fullPath)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "upload failed", "details": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"filename": filename, "bytes": written})
 }
 
 // serveFile serves a single file from the videos directory by name.
