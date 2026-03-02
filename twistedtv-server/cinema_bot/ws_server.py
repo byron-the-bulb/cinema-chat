@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI  # Also works with Ollama's OpenAI-compat API
 
 # Support both package and direct execution
 try:
@@ -141,13 +141,20 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
         })
 
         t0 = time.monotonic()
-        response = await openai_client.chat.completions.create(
-            model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
-            messages=messages,
-            temperature=0.9,
-            max_tokens=150,
-            response_format={"type": "json_object"},
-        )
+        llm_model = os.getenv("LLM_MODEL", "qwen2.5:3b")
+        llm_kwargs: dict = {
+            "model": llm_model,
+            "messages": messages,
+            "temperature": 0.9,
+            "max_tokens": 150,
+        }
+        # OpenAI supports response_format; Ollama uses format param via extra_body
+        if "localhost:11434" in (os.getenv("LLM_BASE_URL", "localhost:11434")):
+            llm_kwargs["extra_body"] = {"format": "json"}
+        else:
+            llm_kwargs["response_format"] = {"type": "json_object"}
+
+        response = await openai_client.chat.completions.create(**llm_kwargs)
         llm_time = time.monotonic() - t0
         llm_text = response.choices[0].message.content.strip()
         logger.info(f"LLM ({llm_time:.2f}s): {llm_text}")
@@ -220,8 +227,11 @@ async def lifespan(app: FastAPI):
     # Initialize clip search (HTTP client + DB pool)
     await clip_search.init()
 
-    # Initialize OpenAI client
-    openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Initialize LLM client (Ollama local by default, or OpenAI if configured)
+    llm_base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "ollama"
+    openai_client = AsyncOpenAI(base_url=llm_base_url, api_key=llm_api_key)
+    logger.info(f"LLM client: {llm_base_url}")
 
     logger.info("All services initialized — ready for connections")
     yield
@@ -306,13 +316,18 @@ async def audio_websocket(ws: WebSocket):
                                     "role": "user",
                                     "content": f'The visitor said: "{text}"\n\nAvailable clips:\n{clips_text}',
                                 })
-                                response = await openai_client.chat.completions.create(
-                                    model=os.getenv("LLM_MODEL", "gpt-4.1-mini"),
-                                    messages=messages,
-                                    temperature=0.9,
-                                    max_tokens=150,
-                                    response_format={"type": "json_object"},
-                                )
+                                llm_model = os.getenv("LLM_MODEL", "qwen2.5:3b")
+                                llm_kwargs2: dict = {
+                                    "model": llm_model,
+                                    "messages": messages,
+                                    "temperature": 0.9,
+                                    "max_tokens": 150,
+                                }
+                                if "localhost:11434" in (os.getenv("LLM_BASE_URL", "localhost:11434")):
+                                    llm_kwargs2["extra_body"] = {"format": "json"}
+                                else:
+                                    llm_kwargs2["response_format"] = {"type": "json_object"}
+                                response = await openai_client.chat.completions.create(**llm_kwargs2)
                                 llm_text = response.choices[0].message.content.strip()
                                 try:
                                     choice = json.loads(llm_text)
