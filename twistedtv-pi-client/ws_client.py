@@ -72,7 +72,7 @@ class AudioCaptureThread(threading.Thread):
         while self.running:
             try:
                 length, data = mic.read()
-                if length > 0 and self.ws.connected:
+                if length > 0 and self.ws.sock and self.ws.sock.connected:
                     self.ws.send(data, opcode=websocket.ABNF.OPCODE_BINARY)
             except alsaaudio.ALSAAudioError as e:
                 logger.error(f"Audio read error: {e}")
