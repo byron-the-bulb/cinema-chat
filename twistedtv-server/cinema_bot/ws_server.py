@@ -261,12 +261,23 @@ async def audio_websocket(ws: WebSocket):
         Server → Pi: JSON messages (play, status, transcript, timing, error)
     """
     await ws.accept()
-    session_id = str(uuid.uuid4())
-    session = Session(session_id)
-    session.ws = ws
-    session.created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-    active_sessions[session_id] = session
-    logger.info(f"Pi connected: session {session_id[:8]}")
+
+    # Reuse session from /connect if identifier provided, otherwise create new
+    session_id = ws.query_params.get("session", "")
+    session = active_sessions.get(session_id) if session_id else None
+
+    if session:
+        # Link the pre-created session to this WebSocket
+        session.ws = ws
+        logger.info(f"Pi connected: session {session_id[:8]} (linked to /connect)")
+    else:
+        # Direct connection without /connect — create a fresh session
+        session_id = session_id or str(uuid.uuid4())
+        session = Session(session_id)
+        session.ws = ws
+        session.created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        active_sessions[session_id] = session
+        logger.info(f"Pi connected: session {session_id[:8]} (new)")
 
     try:
         while True:
@@ -379,7 +390,7 @@ async def connect():
     active_sessions[identifier] = session
 
     return {
-        "ws_url": f"ws://{ws_host}:{ws_port}/ws/audio",
+        "ws_url": f"ws://{ws_host}:{ws_port}/ws/audio?session={identifier}",
         "identifier": identifier,
     }
 
