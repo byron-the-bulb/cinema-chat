@@ -8,7 +8,6 @@ import (
     "log"
     "net/http"
     "os"
-    "os/exec"
     "path/filepath"
     "strconv"
     "strings"
@@ -737,37 +736,38 @@ func getEnvOrDefault(key, defaultValue string) string {
 
 // embedTextQuery runs the e5-base-v2 text embedding runner to obtain a 768-D vector for the query
 func embedTextQuery(query string) ([]float32, error) {
+    embeddingURL := os.Getenv("EMBEDDING_SERVICE_URL")
+    if embeddingURL == "" {
+        embeddingURL = "http://localhost:8090"
+    }
+
     payload := map[string]any{
         "text": query,
         "mode": "query",
     }
     b, _ := json.Marshal(payload)
-    cmd := exec.Command("python3", "/root/internal/embeddings/text_embed_runner.py")
-    cmd.Stdin = bytes.NewReader(b)
-    stdout, _ := cmd.StdoutPipe()
-    stderr, _ := cmd.StderrPipe()
-    if err := cmd.Start(); err != nil {
-        return nil, fmt.Errorf("failed to start text_embed_runner: %w", err)
+
+    resp, err := http.Post(embeddingURL+"/embed", "application/json", bytes.NewReader(b))
+    if err != nil {
+        return nil, fmt.Errorf("embedding service request failed: %w", err)
     }
-    outBytes, _ := io.ReadAll(stdout)
-    errBytes, _ := io.ReadAll(stderr)
-    if err := cmd.Wait(); err != nil {
-        return nil, fmt.Errorf("text_embed_runner failed: %v; stderr: %s", err, string(errBytes))
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    if resp.StatusCode != 200 {
+        return nil, fmt.Errorf("embedding service returned %d: %s", resp.StatusCode, string(body))
     }
-    var resp struct {
-        Model        string     `json:"model"`
-        EmbeddingDim int        `json:"embedding_dim"`
-        Vector       []float32  `json:"vector"`
-        Error        string     `json:"error"`
+
+    var result struct {
+        Model        string    `json:"model"`
+        EmbeddingDim int       `json:"embedding_dim"`
+        Vector       []float32 `json:"vector"`
     }
-    if err := json.Unmarshal(outBytes, &resp); err != nil {
-        return nil, fmt.Errorf("failed to parse text_embed_runner output: %v; raw: %s", err, string(outBytes))
+    if err := json.Unmarshal(body, &result); err != nil {
+        return nil, fmt.Errorf("failed to parse embedding response: %v; raw: %s", err, string(body))
     }
-    if resp.Error != "" {
-        return nil, fmt.Errorf("runner error: %s", resp.Error)
-    }
-    if len(resp.Vector) == 0 {
+    if len(result.Vector) == 0 {
         return nil, fmt.Errorf("empty embedding returned")
     }
-    return resp.Vector, nil
+    return result.Vector, nil
 }

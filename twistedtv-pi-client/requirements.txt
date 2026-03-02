@@ -1,9 +1,13 @@
-# Daily.co and WebRTC
+# WebSocket client (new fast path)
+websocket-client==1.8.0
+
+# Daily.co and WebRTC (legacy, kept for fallback)
 daily-python==0.10.1
 pydantic==2.7.1
 
 # Audio processing
 pyaudio==0.2.14
+pyalsaaudio==0.10.0
 soundfile==0.12.1
 
 # HTTP

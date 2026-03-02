@@ -1,6 +1,25 @@
 version: '3.8'
 
 services:
+  # Text Embedding Service (persistent e5-base-v2)
+  embedding-service:
+    build: ./embedding-service
+    container_name: goodclips-embedding
+    ports:
+      - "8090:8090"
+    environment:
+      - E5_MODEL_ID=intfloat/e5-base-v2
+      - E5_DEVICE=cpu
+    restart: unless-stopped
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   # GoodCLIPS API Server
   goodclips-api:
     build: .
@@ -18,10 +37,13 @@ services:
       - PORT=8080
       - SCENEDETECT_TIMEOUT_SECS=300
       - KEYFRAME_TIMEOUT_SECS=60
+      - EMBEDDING_SERVICE_URL=http://embedding-service:8090
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      embedding-service:
         condition: service_healthy
     restart: unless-stopped
     networks:

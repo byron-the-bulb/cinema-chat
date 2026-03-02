@@ -145,36 +145,39 @@ export default function Home() {
       const data = await response.json();
       console.log('Session created:', data);
 
+      // Support both WebSocket (new) and Daily (legacy) response formats
+      const wsUrl = data.ws_url;
       const roomUrl = data.room_url;
       const token = data.token;
       const identifier = data.identifier;
+      const sessionRef = wsUrl || roomUrl;
 
-      if (!roomUrl) {
-        throw new Error('No room URL returned from backend');
+      if (!sessionRef) {
+        throw new Error('No connection URL returned from backend');
       }
 
-      setCurrentRoomUrl(roomUrl);
+      setCurrentRoomUrl(sessionRef);
       setSessionIdentifier(identifier);
       setIsConnected(true);
       setExistingRoom(null);
       setStatusText('Session active - Pi client connecting...');
       addChatMessage('Session started successfully', 'system');
-      addChatMessage(`Room: ${roomUrl}`, 'system');
+      addChatMessage(`Mode: ${wsUrl ? 'WebSocket (fast)' : 'Daily.co'}`, 'system');
       console.log(`Session identifier: ${identifier}`);
 
-      // Start Pi client for this room
+      // Start Pi client
       try {
         const startClientResponse = await fetch('/api/start_pi_client', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ roomUrl, token, backendUrl: baseUrl })
+          body: JSON.stringify({ wsUrl, roomUrl, token, backendUrl: baseUrl })
         });
 
         const clientData = await startClientResponse.json();
         if (clientData.success) {
-          addChatMessage(`Pi client started (PID: ${clientData.pid})`, 'system');
+          addChatMessage(`Pi client started — ${clientData.mode} mode (PID: ${clientData.pid})`, 'system');
         } else {
           addChatMessage(`Error: ${clientData.error}`, 'system');
         }
@@ -242,6 +245,16 @@ export default function Home() {
         } else {
           console.error('Cleanup request failed:', cleanupResponse.statusText);
         }
+      }
+
+      // Kill Pi-side processes (ws_client, video service, mpv)
+      try {
+        const piCleanup = await fetch('/api/cleanup_pi', { method: 'POST' });
+        if (piCleanup.ok) {
+          console.log('Pi processes cleaned up');
+        }
+      } catch (e) {
+        console.warn('Pi cleanup failed:', e);
       }
 
       // Reset UI state
