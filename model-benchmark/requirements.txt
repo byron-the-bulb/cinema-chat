@@ -1,0 +1,24 @@
+# WhisperX — faster-whisper (CTranslate2) + forced word alignment
+# CTranslate2 uses INT8 quantization on CPU: fast even without a GPU
+whisperx>=3.1.0
+
+# HuggingFace stack for Qwen3-ASR (and any other transformers-based model)
+transformers>=4.45.0
+accelerate>=0.34.0
+
+# PyTorch — base install (CPU). For ROCm/CUDA, replace with the appropriate
+# wheel from https://pytorch.org/get-started/locally/
+# AMD ROCm example:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.1
+torch>=2.4.0
+torchaudio>=2.4.0
+
+# Audio I/O (used by transformers pipeline and whisperx)
+soundfile>=0.12.1
+librosa>=0.10.2
+
+# Optional: Word Error Rate calculation (--ref flag)
+jiwer>=3.0.0
+
+# Optional: better memory accounting (falls back to resource.getrusage if absent)
+psutil>=5.9.8
