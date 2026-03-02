@@ -329,12 +329,25 @@ except:
     TOTAL_SCENES=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_scenes',0))" 2>/dev/null || echo 0)
     CAPTIONS=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('total_captions',0))" 2>/dev/null || echo 0)
 
-    # Check embedding job status
+    # Parse all job statuses and surface any failures
+    JOB_SUMMARY=$(echo "$JOBS" | python3 -c "
+import sys, json
+try:
+    jobs = json.load(sys.stdin).get('jobs', [])
+    parts = []
+    for j in jobs:
+        t = j.get('type','?').replace('_generation','_gen').replace('_extraction','_ext').replace('_detection','_det').replace('_ingestion','_ingest')
+        s = j.get('status','?')
+        parts.append(f'{t}:{s}')
+    print(' | '.join(parts))
+except:
+    print('(no jobs)')
+" 2>/dev/null || echo "(error)")
+
     EMBED_STATUS=$(echo "$JOBS" | python3 -c "
 import sys, json
 try:
-    d = json.load(sys.stdin)
-    for j in d.get('jobs', []):
+    for j in json.load(sys.stdin).get('jobs', []):
         if j.get('type') == 'embedding_generation':
             print(j.get('status',''))
             break
@@ -342,17 +355,35 @@ except:
     pass
 " 2>/dev/null || true)
 
-    info "  embeddings: ${EMBED_COUNT}/${TOTAL_SCENES} | captions: ${CAPTIONS} | job: ${EMBED_STATUS} | ${GPU_INFO}"
+    FAILED_JOB=$(echo "$JOBS" | python3 -c "
+import sys, json
+try:
+    for j in json.load(sys.stdin).get('jobs', []):
+        if j.get('status') == 'failed':
+            err = j.get('error') or j.get('error_message') or '(no error message)'
+            print(f\"{j.get('type','?')}: {err}\")
+            break
+except:
+    pass
+" 2>/dev/null || true)
+
+    info "  scenes: ${TOTAL_SCENES} | embeds: ${EMBED_COUNT} | captions: ${CAPTIONS} | ${GPU_INFO}"
+    info "  jobs: ${JOB_SUMMARY}"
+
+    # Abort immediately on any failed job
+    if [ -n "$FAILED_JOB" ]; then
+        echo ""
+        warn "=== FAILED JOB: ${FAILED_JOB} ==="
+        warn "Check pod logs at: https://www.runpod.io/console/pods/${POD_ID}"
+        warn "Pod API: ${API_URL}/api/v1/jobs"
+        error "A job failed — see details above. Set KEEP_POD=true to inspect the pod."
+    fi
 
     # Check completion
     if [ "$EMBED_STATUS" = "completed" ]; then
         echo ""
         log "All processing complete!"
         break
-    fi
-
-    if [ "$EMBED_STATUS" = "failed" ]; then
-        error "Embedding job failed! Check pod logs."
     fi
 
     # Stall detection: if GPU is at 0% for too long after initial startup
