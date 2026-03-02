@@ -2,18 +2,17 @@
 # CTranslate2 uses INT8 quantization on CPU: fast even without a GPU
 whisperx>=3.1.0
 
-# HuggingFace stack for Qwen3-ASR (and any other transformers-based model)
-transformers>=4.45.0
-accelerate>=0.34.0
+# Qwen3-ASR — official package (includes Qwen3-ForcedAligner for timestamps)
+# https://huggingface.co/Qwen/Qwen3-ASR-1.7B
+qwen-asr>=0.1.0
 
-# PyTorch — base install (CPU). For ROCm/CUDA, replace with the appropriate
-# wheel from https://pytorch.org/get-started/locally/
-# AMD ROCm example:
+# PyTorch — base install (CPU bfloat16 works on Zen5/AVX-512).
+# For AMD ROCm GPU acceleration, swap this wheel:
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.1
 torch>=2.4.0
 torchaudio>=2.4.0
 
-# Audio I/O (used by transformers pipeline and whisperx)
+# Audio I/O
 soundfile>=0.12.1
 librosa>=0.10.2
 

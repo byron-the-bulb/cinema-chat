@@ -18,7 +18,8 @@ Options:
                    Options: tiny, base, small, medium, large-v2, large-v3,
                             large-v3-turbo, distil-large-v3
   --qwen-model     HuggingFace model ID (default: Qwen/Qwen3-ASR-1.7B)
-  --device         Force device: auto, cpu, cuda, mps  (default: auto)
+  --aligner-model  ForcedAligner for word timestamps (default: Qwen/Qwen3-ForcedAligner-0.6B)
+  --device         Force device: auto, cpu, cuda  (default: auto)
   --language       Language code, e.g. 'en' (default: auto-detect)
   --max-secs       Truncate audio to N seconds for quick tests
   --ref            Reference transcript file for WER calculation
@@ -212,65 +213,98 @@ def run_whisperx(wav: str, model_size: str, language: Optional[str],
         )
 
 
-def run_qwen3(wav: str, model_id: str, language: Optional[str],
-              duration: float, device: str) -> BenchResult:
+def _words_to_segments(words, max_words: int = 10, max_gap_s: float = 1.5) -> List[dict]:
     """
-    Qwen3-ASR via HuggingFace transformers pipeline.
-    Uses MPS/CUDA for GPU acceleration, falls back to CPU.
+    Group word-level timestamps (from Qwen3-ForcedAligner) into SRT segments.
+    Splits on silence gaps > max_gap_s or after max_words words.
+    Each word object has .text, .start_time, .end_time attributes.
+    """
+    if not words:
+        return []
+    segments, group = [], []
+    for w in words:
+        if group and (
+            len(group) >= max_words
+            or (w.start_time - group[-1].end_time) > max_gap_s
+        ):
+            segments.append(group)
+            group = []
+        group.append(w)
+    if group:
+        segments.append(group)
+    return [
+        {
+            "start": g[0].start_time,
+            "end":   g[-1].end_time,
+            "text":  " ".join(w.text for w in g).strip(),
+        }
+        for g in segments
+    ]
 
-    If Qwen3-ASR uses a different API than standard ASR pipeline,
-    adjust model_id or the pipeline invocation below.
+
+def run_qwen3(wav: str, model_id: str, language: Optional[str],
+              duration: float, device: str,
+              aligner_id: str = "Qwen/Qwen3-ForcedAligner-0.6B") -> BenchResult:
+    """
+    Qwen3-ASR via the official qwen-asr package.
+    Install: pip install qwen-asr
+
+    Uses Qwen3-ForcedAligner-0.6B for word timestamps → proper SRT output.
+    device: "cpu" or "cuda:0"
+    dtype:  bfloat16 (Zen5 supports AVX-512 BF16; falls back to float32 on error)
     """
     try:
         import torch
-        from transformers import pipeline as hf_pipeline
+        from qwen_asr import Qwen3ASRModel
 
-        dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
+        # bfloat16 works on Zen5 AVX-512; float32 on older CPUs
+        dtype = torch.bfloat16 if device != "cpu" else torch.bfloat16
+        device_map = device  # "cpu" or "cuda:0"
 
         ram0 = _rss_mb()
         t0 = time.perf_counter()
 
-        pipe = hf_pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            torch_dtype=dtype,
-            device=device,
-            # "eager" avoids flash-attention on machines without it
-            model_kwargs={"attn_implementation": "eager"},
+        model = Qwen3ASRModel.from_pretrained(
+            model_id,
+            dtype=dtype,
+            device_map=device_map,
+            max_inference_batch_size=4,
+            max_new_tokens=256,
+            forced_aligner=aligner_id,
+            forced_aligner_kwargs=dict(dtype=dtype, device_map=device_map),
         )
 
-        gen_kwargs: dict = {"task": "transcribe"}
-        if language:
-            gen_kwargs["language"] = language
+        # qwen_asr expects a language name like "English", not a code like "en"
+        LANG_CODES = {
+            "en": "English", "zh": "Chinese", "fr": "French",
+            "de": "German",  "es": "Spanish", "ja": "Japanese",
+            "ko": "Korean",  "it": "Italian", "pt": "Portuguese",
+            "ru": "Russian", "ar": "Arabic",  "nl": "Dutch",
+        }
+        lang_name = LANG_CODES.get(language or "", language) if language else None
 
-        result = pipe(
-            wav,
-            chunk_length_s=30,
-            batch_size=4,
-            return_timestamps=True,
-            generate_kwargs=gen_kwargs,
+        results = model.transcribe(
+            audio=wav,
+            language=lang_name,
+            return_time_stamps=True,
         )
 
-        # Normalise output to a list of {start, end, text} segments
-        segs: List[dict] = []
-        for chunk in result.get("chunks", []):
-            ts = chunk.get("timestamp") or (0.0, 0.0)
-            segs.append({
-                "start": ts[0] or 0.0,
-                "end":   ts[1] or ts[0] or 0.0,
-                "text":  chunk.get("text", ""),
-            })
+        r0 = results[0]
+        lang_out = getattr(r0, "language", language or "?")
 
-        # Fallback: no chunks, just raw text (some models return this)
-        if not segs and result.get("text"):
-            segs = [{"start": 0.0, "end": duration, "text": result["text"]}]
+        # r0.time_stamps is a list of word-timestamp objects
+        segs = _words_to_segments(r0.time_stamps or [])
+
+        # Fallback: no timestamps → single block with full text
+        if not segs and getattr(r0, "text", ""):
+            segs = [{"start": 0.0, "end": duration, "text": r0.text}]
 
         elapsed = time.perf_counter() - t0
 
         return BenchResult(
             model="qwen3",
             model_id=model_id,
-            device_used=device,
+            device_used=device_map,
             elapsed_s=elapsed,
             audio_duration_s=duration,
             rtf=elapsed / duration if duration else 0,
@@ -278,7 +312,7 @@ def run_qwen3(wav: str, model_id: str, language: Optional[str],
             word_count=_wc(segs),
             char_count=_cc(segs),
             peak_rss_mb=max(0, _rss_mb() - ram0),
-            language=language or "?",
+            language=str(lang_out),
         )
 
     except Exception as e:
@@ -385,8 +419,11 @@ def main() -> None:
     p.add_argument("--qwen-model", default="Qwen/Qwen3-ASR-1.7B",
                    metavar="MODEL_ID",
                    help="HuggingFace model ID for Qwen ASR (default: Qwen/Qwen3-ASR-1.7B)")
+    p.add_argument("--aligner-model", default="Qwen/Qwen3-ForcedAligner-0.6B",
+                   metavar="MODEL_ID",
+                   help="ForcedAligner model for word timestamps (default: Qwen/Qwen3-ForcedAligner-0.6B)")
     p.add_argument("--device", default="auto",
-                   choices=["auto", "cpu", "cuda", "mps"],
+                   choices=["auto", "cpu", "cuda"],
                    help="Compute device (default: auto-detect)")
     p.add_argument("--language", default=None,
                    help="ISO language code, e.g. 'en' (default: auto-detect)")
@@ -442,7 +479,8 @@ def main() -> None:
         if model_name == "whisperx":
             r = run_whisperx(wav_path, args.whisper_model, args.language, duration, device)
         elif model_name == "qwen3":
-            r = run_qwen3(wav_path, args.qwen_model, args.language, duration, device)
+            r = run_qwen3(wav_path, args.qwen_model, args.language, duration, device,
+                          aligner_id=args.aligner_model)
         else:
             print(f"  Unknown model '{model_name}'. Valid: whisperx, qwen3")
             continue
