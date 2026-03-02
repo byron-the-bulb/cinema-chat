@@ -187,8 +187,28 @@ warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] WARNING:${NC} $1"; }
 error(){ echo -e "${RED}[$(date '+%H:%M:%S')] ERROR:${NC} $1"; exit 1; }
 info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"; }
 
-# Cleanup function to terminate pod on script exit/error
+# Dump the last N lines of the pod's log via the HTTP API.
+# Called automatically on failure so you don't need to open the RunPod web UI.
+dump_pod_logs() {
+    [ -z "$API_URL" ] && return
+    local lines="${1:-100}"
+    echo ""
+    warn "=== POD LOGS (last ${lines} lines) ==="
+    curl -s --max-time 15 "${API_URL}/api/v1/logs?tail=${lines}" 2>/dev/null \
+        | sed 's/^/  /' \
+        || warn "Could not fetch pod logs (API may be unreachable)"
+    echo ""
+    warn "Full live log: curl -N '${API_URL}/api/v1/logs?follow=true'"
+    echo ""
+}
+
+# Cleanup function — terminates pod on script exit/error.
+# On failure (non-zero exit) dumps pod logs first so the cause is visible.
 cleanup() {
+    local exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ -n "$API_URL" ]; then
+        dump_pod_logs 100
+    fi
     if [ -n "$POD_ID" ] && [ "$KEEP_POD" != "true" ]; then
         warn "Cleaning up - terminating pod $POD_ID..."
         curl -s --max-time 15 --request POST \
@@ -479,13 +499,11 @@ except:
     info "  scenes: ${TOTAL_SCENES} | embeds: ${EMBED_COUNT} | captions: ${CAPTIONS} | ${GPU_INFO}"
     info "  jobs: ${JOB_SUMMARY}"
 
-    # Abort immediately on any failed job
+    # Abort immediately on any failed job (cleanup trap will dump pod logs)
     if [ -n "$FAILED_JOB" ]; then
         echo ""
         warn "=== FAILED JOB: ${FAILED_JOB} ==="
-        warn "Check pod logs at: https://www.runpod.io/console/pods/${POD_ID}"
-        warn "Pod API: ${API_URL}/api/v1/jobs"
-        error "A job failed — see details above. Set KEEP_POD=true to inspect the pod."
+        error "A job failed — pod logs below. Set KEEP_POD=true to keep the pod running."
     fi
 
     # Check completion
