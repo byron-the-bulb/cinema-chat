@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bufio"
     "bytes"
     "encoding/json"
     "fmt"
@@ -11,6 +12,7 @@ import (
     "path/filepath"
     "strconv"
     "strings"
+    "time"
 
     "goodclips-server/internal/database"
     "goodclips-server/internal/models"
@@ -105,6 +107,11 @@ func main() {
         // the RunPod instance; PUT lets it upload local video files to the pod.
         v1.GET("/files/:filename", serveFile)
         v1.PUT("/files/:filename", uploadFile)
+
+        // Pod log streaming — tail /workspace/goodclips.log written by entrypoint.sh
+        // ?tail=N   return last N lines (default 200)
+        // ?follow=true  stream new lines as they arrive (like tail -f)
+        v1.GET("/logs", streamLogs)
 
         // Statistics
         v1.GET("/stats", getStats)
@@ -300,6 +307,79 @@ func serveFile(c *gin.Context) {
         return
     }
     c.File(fullPath)
+}
+
+// streamLogs serves the pod's stdout log written by entrypoint.sh.
+//
+//   GET /api/v1/logs           — last 200 lines, plain text
+//   GET /api/v1/logs?tail=500  — last 500 lines
+//   GET /api/v1/logs?follow=true — stream new lines as they arrive (tail -f)
+//
+// The log file path is controlled by LOG_PATH (default /workspace/goodclips.log).
+func streamLogs(c *gin.Context) {
+    logPath := getEnvOrDefault("LOG_PATH", "/workspace/goodclips.log")
+
+    tail := 200
+    if t := c.Query("tail"); t != "" {
+        if n, err := strconv.Atoi(t); err == nil && n > 0 {
+            tail = n
+        }
+    }
+    follow := c.Query("follow") == "true"
+
+    f, err := os.Open(logPath)
+    if err != nil {
+        c.String(http.StatusNotFound, "log file not found: %s\n", logPath)
+        return
+    }
+    defer f.Close()
+
+    // Collect last `tail` lines efficiently using a circular line buffer
+    var lines []string
+    scanner := bufio.NewScanner(f)
+    scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1 MB line buffer
+    for scanner.Scan() {
+        lines = append(lines, scanner.Text())
+        if len(lines) > tail {
+            lines = lines[1:]
+        }
+    }
+
+    c.Header("Content-Type", "text/plain; charset=utf-8")
+    c.Header("X-Content-Type-Options", "nosniff")
+
+    if !follow {
+        c.String(http.StatusOK, "%s\n", strings.Join(lines, "\n"))
+        return
+    }
+
+    // follow=true: stream the tail then keep sending new lines
+    c.Stream(func(w io.Writer) bool {
+        // Flush the buffered tail first
+        if len(lines) > 0 {
+            fmt.Fprintln(w, strings.Join(lines, "\n"))
+            lines = nil
+        }
+
+        // Seek to end and poll for new content every second
+        offset, _ := f.Seek(0, io.SeekCurrent)
+        ticker := time.NewTicker(time.Second)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-c.Request.Context().Done():
+                return false
+            case <-ticker.C:
+                buf := make([]byte, 64*1024)
+                n, _ := f.ReadAt(buf, offset)
+                if n > 0 {
+                    w.Write(buf[:n])
+                    offset += int64(n)
+                }
+            }
+        }
+    })
 }
 
 // getStats returns aggregate DB stats

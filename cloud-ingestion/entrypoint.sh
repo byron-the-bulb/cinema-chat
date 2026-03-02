@@ -7,9 +7,16 @@ PGDATA="/var/lib/postgresql/14/main"
 REDIS_DIR="${WORKSPACE}/redis"
 VIDEOS_DIR="${WORKSPACE}/videos"
 PG_BACKUP="${WORKSPACE}/postgres_backup.sql"
+LOG_FILE="${WORKSPACE}/goodclips.log"
+
+# Tee all output (stdout + stderr) to a log file so the HTTP API can serve it.
+# The log is accessible at GET /api/v1/logs while the pod is running.
+mkdir -p "${WORKSPACE}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "=== GoodCLIPS RunPod Entrypoint ==="
 echo "Workspace: ${WORKSPACE}"
+echo "Log file:  ${LOG_FILE}"
 
 # Create directories
 mkdir -p "${REDIS_DIR}" "${VIDEOS_DIR}"
