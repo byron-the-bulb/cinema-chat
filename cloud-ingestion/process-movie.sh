@@ -286,7 +286,7 @@ POD_RESPONSE=$(curl -s --max-time 60 --request POST \
   --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
   --header 'content-type: application/json' \
   --data '{
-    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
+    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,8080/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
   }')
 
 POD_ID=$(echo "$POD_RESPONSE" | python3 -c "
@@ -333,8 +333,10 @@ print('yes' if r else 'no')
     if [ "$RUNTIME" = "yes" ]; then
         log "Pod is running!"
 
-        # Extract port info
-        # HTTP port uses RunPod proxy, but TCP port (Postgres) needs direct IP
+        # Extract port info.
+        # 8080/http  → HTTP proxy URL for API calls (health, jobs, stats, etc.)
+        # 8080/tcp   → direct IP:port for large file uploads (bypasses proxy 413 limit)
+        # 5432/tcp   → direct IP:port for PostgreSQL (proxy can't carry TCP)
         eval "$(echo "$POD_STATUS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -342,7 +344,10 @@ pod_id = d['data']['pod']['id']
 ports = d['data']['pod']['runtime'].get('ports', [])
 for p in ports:
     if p['privatePort'] == 8080:
-        print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
+        if p.get('type') == 'http' or not p.get('ip'):
+            print(f'API_URL=https://{pod_id}-8080.proxy.runpod.net')
+        elif p.get('ip'):
+            print(f'UPLOAD_URL=http://{p[\"ip\"]}:{p[\"publicPort\"]}')
     if p['privatePort'] == 5432:
         ip = p.get('ip', '')
         pub_port = p.get('publicPort', 5432)
@@ -350,7 +355,6 @@ for p in ports:
             print(f'PG_HOST={ip}')
             print(f'PG_PORT={pub_port}')
         else:
-            # Fallback to proxy (may not work for TCP)
             print(f'PG_HOST={pod_id}-5432.proxy.runpod.net')
             print(f'PG_PORT=5432')
 " 2>/dev/null)"
@@ -365,8 +369,10 @@ echo ""
 [ -z "$API_URL" ] && error "Pod never became ready (timed out after 10 minutes)"
 
 PG_PORT="${PG_PORT:-5432}"
+UPLOAD_URL="${UPLOAD_URL:-$API_URL}"   # fall back to proxy if direct TCP not available
 log "API endpoint: $API_URL"
-log "PostgreSQL: $PG_HOST:$PG_PORT"
+log "Upload URL:   $UPLOAD_URL"
+log "PostgreSQL:   $PG_HOST:$PG_PORT"
 
 # ============================================
 # Step 3: Wait for API to be healthy
@@ -396,11 +402,13 @@ done
 # Step 3b: Upload local file to pod (local-file mode only)
 # ============================================
 if [ "$IS_LOCAL" = true ]; then
-    log "Uploading local file to pod (this may take a while for large files)..."
+    FILESIZE=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
+    log "Uploading local file to pod via direct TCP ($(numfmt --to=iec $FILESIZE 2>/dev/null || echo "${FILESIZE} bytes"))..."
+    log "Upload URL: $UPLOAD_URL"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         --max-time 3600 \
         -T "$LOCAL_FILE" \
-        "$API_URL/api/v1/files/$MOVIE_FILENAME")
+        "$UPLOAD_URL/api/v1/files/$MOVIE_FILENAME")
     [ "$HTTP_CODE" = "200" ] || error "File upload failed (HTTP $HTTP_CODE)"
     log "Upload complete: $MOVIE_FILENAME"
 
@@ -409,7 +417,7 @@ if [ "$IS_LOCAL" = true ]; then
     SRT_FILENAME="${MOVIE_FILENAME%.*}.srt"
     if [ -f "$LOCAL_SRT" ]; then
         log "Uploading SRT sidecar..."
-        curl -s -o /dev/null --max-time 60 -T "$LOCAL_SRT" "$API_URL/api/v1/files/$SRT_FILENAME"
+        curl -s -o /dev/null --max-time 60 -T "$LOCAL_SRT" "$UPLOAD_URL/api/v1/files/$SRT_FILENAME"
         log "SRT uploaded: $SRT_FILENAME"
     fi
 
