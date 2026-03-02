@@ -317,7 +317,7 @@ log "Waiting for pod to be ready..."
 API_URL=""
 PG_PROXY=""
 
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
     POD_STATUS=$(curl -s --max-time 15 --request POST \
       --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
       --header 'content-type: application/json' \
@@ -331,8 +331,6 @@ print('yes' if r else 'no')
 " 2>/dev/null)
 
     if [ "$RUNTIME" = "yes" ]; then
-        log "Pod is running!"
-
         # Extract port info.
         # 8080/http  → HTTP proxy URL for API calls (health, jobs, stats, etc.)
         # 8080/tcp   → direct IP:port for large file uploads (bypasses proxy 413 limit)
@@ -358,15 +356,23 @@ for p in ports:
             print(f'PG_HOST={pod_id}-5432.proxy.runpod.net')
             print(f'PG_PORT=5432')
 " 2>/dev/null)"
-        break
+
+        # RunPod sometimes reports runtime=yes before ports are assigned —
+        # only break once we have an API_URL, otherwise keep polling.
+        if [ -n "$API_URL" ]; then
+            log "Pod is running, ports assigned!"
+            break
+        fi
+        echo -n "p"   # 'p' = pod running but ports not yet assigned
+    else
+        echo -n "."
     fi
 
-    echo -n "."
     sleep 10
 done
 echo ""
 
-[ -z "$API_URL" ] && error "Pod never became ready (timed out after 10 minutes)"
+[ -z "$API_URL" ] && error "Pod never became ready (timed out after 20 minutes)"
 
 PG_PORT="${PG_PORT:-5432}"
 UPLOAD_URL="${UPLOAD_URL:-$API_URL}"   # fall back to proxy if direct TCP not available
