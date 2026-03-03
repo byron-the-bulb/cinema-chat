@@ -7,8 +7,9 @@ Outputs JSON to stdout with generated clips (without embeddings — those are
 computed separately by the existing embedding runners).
 
 Dialog clips:  Each 'en' caption becomes a clip with padded boundaries.
-Visual clips:  Lighthouse detects clip boundaries across the ENTIRE movie,
-               chunked by scene boundaries to respect the 150s input limit.
+Visual clips:  PySceneDetect scenes are the primary boundaries. Short scenes
+               (< 5s) become clips directly. Longer scenes are fed individually
+               to Lighthouse for highlight detection (respects 150s input limit).
                Clips that overlap >80% with dialog clips are deduplicated.
 
 Usage (called by processor.go):
@@ -215,24 +216,26 @@ def generate_dialog_clips(captions, scenes):
 # ---------------------------------------------------------------------------
 
 
-MIN_SCENE_FOR_LIGHTHOUSE = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "5.0"))
+MIN_SCENE_FOR_LIGHTHOUSE = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "3.0"))
 MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "150.0"))
 
 
 def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
     """
-    Run Lighthouse on each scene individually to detect highlights.
-    This ensures detected clips never cross scene boundaries (visual cuts).
-    Short scenes (< MIN_SCENE_FOR_LIGHTHOUSE) are skipped since they're
-    already clip-sized. Long scenes (> 150s) are split into sub-segments.
+    Run Lighthouse on each PySceneDetect scene to detect highlights.
+    Scenes < MIN_SCENE_FOR_LIGHTHOUSE (3s) are discarded. All remaining
+    scenes go through Lighthouse. Long scenes (> 150s) are split into
+    sub-segments for Lighthouse's input limit.
     """
     sorted_scenes = sorted(scenes, key=lambda s: s["start_time"])
 
     # Build per-scene segments (split long scenes for Lighthouse's 150s limit)
     segments = []
+    skipped = 0
     for s in sorted_scenes:
         dur = s["end_time"] - s["start_time"]
         if dur < MIN_SCENE_FOR_LIGHTHOUSE:
+            skipped += 1
             continue
         if dur <= MAX_LIGHTHOUSE_INPUT:
             segments.append((s["start_time"], s["end_time"], s["id"]))
@@ -246,11 +249,12 @@ def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
                 pos = seg_end
 
     print(f"  {len(segments)} scenes >= {MIN_SCENE_FOR_LIGHTHOUSE}s for Lighthouse "
-          f"(skipped {len(sorted_scenes) - len(segments)} short scenes)",
+          f"(skipped {skipped} short scenes)",
           file=sys.stderr, flush=True)
 
+    clips = []
+
     if not check_lighthouse():
-        clips = []
         for s_start, s_end, scene_id in segments:
             clips.append({
                 "clip_type": "visual",
@@ -264,7 +268,6 @@ def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
         return clips
 
     # Run Lighthouse on each scene individually
-    clips = []
     for i, (s_start, s_end, scene_id) in enumerate(segments):
         print(f"  Lighthouse scene {i+1}/{len(segments)}: "
               f"{s_start:.1f}s - {s_end:.1f}s ({s_end - s_start:.1f}s)",

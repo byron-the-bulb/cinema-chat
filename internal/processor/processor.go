@@ -462,18 +462,11 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         })
     }
 
-    // Separate visual and dialog clips
-    var visualClips []models.Clip
-    var visualClipRanges []clipRange
+    // Collect dialog clips for dialog_embedding (step 3)
     var dialogClips []models.Clip
     var dialogTexts []string
     for _, c := range clips {
-        if c.ClipType == "visual" {
-            visualClips = append(visualClips, c)
-            visualClipRanges = append(visualClipRanges, clipRange{
-                SceneIndex: int(c.ID), Start: c.StartTime, End: c.EndTime,
-            })
-        } else if c.ClipType == "dialog" && c.Label != "" {
+        if c.ClipType == "dialog" && c.Label != "" {
             dialogClips = append(dialogClips, c)
             dialogTexts = append(dialogTexts, c.Label)
         }
