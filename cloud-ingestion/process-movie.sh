@@ -536,10 +536,10 @@ except:
         STALL_COUNT=0
     fi
 
-    # Safety: 150 min covers download + transcription + full ingestion
+    # Safety: 300 min covers download + transcription + full ingestion for long movies
     ELAPSED=$(($(date +%s) - START_TIME))
-    if [ "$ELAPSED" -gt 9000 ]; then
-        error "Processing timed out after 150 minutes"
+    if [ "$ELAPSED" -gt 18000 ]; then
+        error "Processing timed out after 300 minutes"
     fi
 done
 
