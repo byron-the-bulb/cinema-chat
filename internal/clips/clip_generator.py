@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-clip_generator.py — Generate dialog + visual clips from existing scenes and captions.
+clip_generator.py — Generate dialog + visual clips from scenes and captions.
 
 Reads JSON from stdin with video metadata, scenes, and captions.
 Outputs JSON to stdout with generated clips (without embeddings — those are
 computed separately by the existing embedding runners).
 
 Dialog clips:  Each 'en' caption becomes a clip with padded boundaries.
-Visual clips:  Non-speech gaps are cut at scene boundaries, then scored by
-               Lighthouse highlight detection. Only salient moments become clips.
+Visual clips:  Lighthouse detects clip boundaries across the ENTIRE movie,
+               chunked by scene boundaries to respect the 150s input limit.
+               Clips that overlap >80% with dialog clips are deduplicated.
 
 Usage (called by processor.go):
     echo '{"video_id": 1, "video_path": "/data/videos/film.mp4", ...}' | \
@@ -37,7 +38,7 @@ def check_lighthouse():
             _lighthouse_available = True
         except ImportError:
             _lighthouse_available = False
-            print("WARNING: lighthouse not installed, visual clip scoring disabled",
+            print("WARNING: lighthouse not installed, visual clip detection disabled",
                   file=sys.stderr, flush=True)
     return _lighthouse_available
 
@@ -55,7 +56,7 @@ def get_lighthouse_model(device="cuda"):
 
     weights = os.environ.get("LIGHTHOUSE_WEIGHTS", "")
     if not weights:
-        print("WARNING: LIGHTHOUSE_WEIGHTS not set, skipping visual scoring",
+        print("WARNING: LIGHTHOUSE_WEIGHTS not set, skipping visual clip detection",
               file=sys.stderr, flush=True)
         return None
 
@@ -94,9 +95,9 @@ def extract_segment(video_path, start, end, output_path):
     return True
 
 
-def score_with_lighthouse(video_path, start, end, device="cuda"):
+def detect_with_lighthouse(video_path, start, end, device="cuda"):
     """
-    Run Lighthouse highlight detection on a video segment.
+    Run Lighthouse on a video segment to detect clip boundaries.
     Extracts the segment to a temp file (Lighthouse processes whole files),
     runs CG-DETR, and maps returned windows back to absolute movie time.
     Returns list of (abs_start, abs_end, confidence) tuples.
@@ -105,7 +106,6 @@ def score_with_lighthouse(video_path, start, end, device="cuda"):
     if model is None:
         return []
 
-    # Lighthouse processes the entire video file, so extract the segment
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -135,7 +135,7 @@ def score_with_lighthouse(video_path, start, end, device="cuda"):
         return results
 
     except Exception as e:
-        print(f"WARNING: Lighthouse scoring failed: {e}", file=sys.stderr, flush=True)
+        print(f"WARNING: Lighthouse detection failed: {e}", file=sys.stderr, flush=True)
         return []
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -143,14 +143,19 @@ def score_with_lighthouse(video_path, start, end, device="cuda"):
 
 
 # ---------------------------------------------------------------------------
-# Dialog clip generation
+# Configuration
 # ---------------------------------------------------------------------------
 
 DIALOG_PAD_SECS = float(os.environ.get("DIALOG_PAD_SECS", "0.3"))
 MIN_CLIP_DURATION = float(os.environ.get("MIN_CLIP_DURATION", "0.5"))
-MIN_VISUAL_GAP = float(os.environ.get("MIN_VISUAL_GAP", "1.0"))
+MIN_CHUNK_DURATION = float(os.environ.get("MIN_CHUNK_DURATION", "1.0"))
 VISUAL_SALIENCE_THRESHOLD = float(os.environ.get("VISUAL_SALIENCE_THRESHOLD", "0.1"))
+DEDUP_OVERLAP_THRESHOLD = float(os.environ.get("DEDUP_OVERLAP_THRESHOLD", "0.8"))
 
+
+# ---------------------------------------------------------------------------
+# Dialog clip generation
+# ---------------------------------------------------------------------------
 
 def generate_dialog_clips(captions, scenes):
     """
@@ -196,145 +201,134 @@ def generate_dialog_clips(captions, scenes):
 
 
 # ---------------------------------------------------------------------------
-# Visual clip generation
+# Visual clip generation — Lighthouse on full movie
 # ---------------------------------------------------------------------------
 
-def find_nonspeech_gaps(captions, video_duration):
+def chunk_by_scene_boundaries(scenes, video_duration, max_chunk=150.0):
     """
-    Invert the speech timeline to find non-speech gaps.
-    Returns list of (start, end) tuples.
-    """
-    # Collect speech regions from 'en' captions
-    speech_regions = []
-    for cap in captions:
-        if cap.get("language") != "en":
-            continue
-        speech_regions.append((cap["start_time"], cap["end_time"]))
-
-    if not speech_regions:
-        # No speech at all — entire video is a gap
-        return [(0, video_duration)]
-
-    # Sort and merge overlapping speech regions
-    speech_regions.sort()
-    merged = [speech_regions[0]]
-    for start, end in speech_regions[1:]:
-        if start <= merged[-1][1] + 0.1:  # merge within 100ms
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-
-    # Find gaps between merged speech regions
-    gaps = []
-    if merged[0][0] > MIN_VISUAL_GAP:
-        gaps.append((0, merged[0][0]))
-    for i in range(len(merged) - 1):
-        gap_start = merged[i][1]
-        gap_end = merged[i + 1][0]
-        if gap_end - gap_start >= MIN_VISUAL_GAP:
-            gaps.append((gap_start, gap_end))
-    if merged[-1][1] < video_duration - MIN_VISUAL_GAP:
-        gaps.append((merged[-1][1], video_duration))
-
-    return gaps
-
-
-def cut_gaps_at_scene_boundaries(gaps, scenes, max_chunk=150.0):
-    """
-    Split gaps at scene boundaries so each chunk is under max_chunk seconds
-    (Lighthouse's input limit).
+    Split the full movie timeline into chunks at scene boundaries,
+    each under max_chunk seconds (Lighthouse's input limit).
     Returns list of (start, end, scene_id) tuples.
     """
-    # Sort scenes by start time
     sorted_scenes = sorted(scenes, key=lambda s: s["start_time"])
 
+    if not sorted_scenes:
+        # No scenes — chunk the entire video by max_chunk
+        chunks = []
+        pos = 0.0
+        while pos < video_duration:
+            chunk_end = min(pos + max_chunk, video_duration)
+            if chunk_end - pos >= MIN_CHUNK_DURATION:
+                chunks.append((round(pos, 3), round(chunk_end, 3), None))
+            pos = chunk_end
+        return chunks
+
+    # Collect all scene boundaries as potential chunk split points
+    boundaries = [0.0]
+    for s in sorted_scenes:
+        boundaries.append(s["start_time"])
+        boundaries.append(s["end_time"])
+    boundaries.append(video_duration)
+    boundaries = sorted(set(boundaries))
+
+    # Walk through boundaries, accumulating into chunks up to max_chunk
     chunks = []
-    for gap_start, gap_end in gaps:
-        # Find scene boundaries within this gap
-        boundaries = [gap_start]
-        for s in sorted_scenes:
-            # Scene boundary falls within gap
-            if gap_start < s["start_time"] < gap_end:
-                boundaries.append(s["start_time"])
-            if gap_start < s["end_time"] < gap_end:
-                boundaries.append(s["end_time"])
-        boundaries.append(gap_end)
-        boundaries = sorted(set(boundaries))
+    chunk_start = boundaries[0]
 
-        # Create chunks from consecutive boundaries
-        for i in range(len(boundaries) - 1):
-            c_start = boundaries[i]
-            c_end = boundaries[i + 1]
-            duration = c_end - c_start
+    for i in range(1, len(boundaries)):
+        boundary = boundaries[i]
+        chunk_duration = boundary - chunk_start
 
-            if duration < MIN_VISUAL_GAP:
-                continue
+        if chunk_duration >= max_chunk:
+            # This chunk would be too long — finalize at the previous boundary
+            # or split the current segment if it's a single long scene
+            prev_boundary = boundaries[i - 1] if i > 1 else chunk_start
+            if prev_boundary > chunk_start:
+                # Finalize up to previous boundary
+                if prev_boundary - chunk_start >= MIN_CHUNK_DURATION:
+                    scene_id = _find_scene_id(sorted_scenes, chunk_start, prev_boundary)
+                    chunks.append((round(chunk_start, 3), round(prev_boundary, 3), scene_id))
+                chunk_start = prev_boundary
 
-            # Further split if still over max_chunk
-            if duration > max_chunk:
-                n_splits = int(duration / max_chunk) + 1
-                split_dur = duration / n_splits
+            # Handle the remaining segment (may still be >max_chunk for very long scenes)
+            remaining = boundary - chunk_start
+            if remaining > max_chunk:
+                # Split long scene into sequential sub-chunks
+                n_splits = int(remaining / max_chunk) + 1
+                split_dur = remaining / n_splits
                 for j in range(n_splits):
-                    s = c_start + j * split_dur
-                    e = c_start + (j + 1) * split_dur
-                    if e - s >= MIN_VISUAL_GAP:
-                        # Find containing scene
-                        scene_id = None
-                        for sc in sorted_scenes:
-                            if sc["start_time"] <= s and sc["end_time"] >= e:
-                                scene_id = sc["id"]
-                                break
+                    s = chunk_start + j * split_dur
+                    e = chunk_start + (j + 1) * split_dur
+                    if e - s >= MIN_CHUNK_DURATION:
+                        scene_id = _find_scene_id(sorted_scenes, s, e)
                         chunks.append((round(s, 3), round(e, 3), scene_id))
-            else:
-                scene_id = None
-                for sc in sorted_scenes:
-                    if sc["start_time"] <= c_start and sc["end_time"] >= c_end:
-                        scene_id = sc["id"]
-                        break
-                chunks.append((round(c_start, 3), round(c_end, 3), scene_id))
+                chunk_start = boundary
+            # else: let it accumulate more
+
+    # Finalize the last chunk
+    if video_duration - chunk_start >= MIN_CHUNK_DURATION:
+        scene_id = _find_scene_id(sorted_scenes, chunk_start, video_duration)
+        chunks.append((round(chunk_start, 3), round(video_duration, 3), scene_id))
 
     return chunks
 
 
-def generate_visual_clips(captions, scenes, video_path, video_duration, device="cuda"):
-    """
-    Find non-speech gaps, cut at scene boundaries, score with Lighthouse.
-    """
-    gaps = find_nonspeech_gaps(captions, video_duration)
-    if not gaps:
-        print("  No non-speech gaps found", file=sys.stderr, flush=True)
-        return []
+def _find_scene_id(sorted_scenes, start, end):
+    """Find the scene that best contains the given time range."""
+    mid = (start + end) / 2
+    for s in sorted_scenes:
+        if s["start_time"] <= mid <= s["end_time"]:
+            return s["id"]
+    # Fallback: find closest scene
+    for s in sorted_scenes:
+        if s["start_time"] < end and s["end_time"] > start:
+            return s["id"]
+    return None
 
-    chunks = cut_gaps_at_scene_boundaries(gaps, scenes)
-    print(f"  Found {len(gaps)} non-speech gaps → {len(chunks)} chunks for scoring",
+
+def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
+    """
+    Run Lighthouse on the entire movie (chunked by scene boundaries) to detect
+    clip boundaries. Each Lighthouse-detected highlight becomes a visual clip.
+    """
+    chunks = chunk_by_scene_boundaries(scenes, video_duration)
+    print(f"  Split movie into {len(chunks)} chunks for Lighthouse",
           file=sys.stderr, flush=True)
 
     if not check_lighthouse():
-        # Without Lighthouse, create clips from chunks using the full gap as the clip
-        # (no saliency scoring — all chunks become clips)
+        # Without Lighthouse, create one clip per chunk (fallback)
         clips = []
         for c_start, c_end, scene_id in chunks:
             clips.append({
                 "clip_type": "visual",
                 "start_time": c_start,
                 "end_time": c_end,
-                "label": "",  # IV2 descriptions added later
-                "salience_score": 0.5,  # neutral score without Lighthouse
+                "label": "",
+                "salience_score": 0.5,
                 "source_scene_id": scene_id,
                 "source_caption_id": None,
             })
         return clips
 
-    # Score each chunk with Lighthouse
+    # Run Lighthouse on each chunk to detect clip boundaries
     clips = []
     for i, (c_start, c_end, scene_id) in enumerate(chunks):
-        print(f"  Scoring chunk {i+1}/{len(chunks)}: {c_start:.1f}s - {c_end:.1f}s",
+        print(f"  Lighthouse chunk {i+1}/{len(chunks)}: {c_start:.1f}s - {c_end:.1f}s",
               file=sys.stderr, flush=True)
 
-        highlights = score_with_lighthouse(video_path, c_start, c_end, device=device)
+        highlights = detect_with_lighthouse(video_path, c_start, c_end, device=device)
 
         if not highlights:
-            # No highlights detected — skip this chunk
+            # No highlights detected — create one fallback clip for the whole chunk
+            clips.append({
+                "clip_type": "visual",
+                "start_time": c_start,
+                "end_time": c_end,
+                "label": "",
+                "salience_score": 0.5,
+                "source_scene_id": scene_id,
+                "source_caption_id": None,
+            })
             continue
 
         for h_start, h_end, score in highlights:
@@ -347,13 +341,60 @@ def generate_visual_clips(captions, scenes, video_path, video_duration, device="
                 "clip_type": "visual",
                 "start_time": round(h_start, 3),
                 "end_time": round(h_end, 3),
-                "label": "",  # IV2 descriptions added later
+                "label": "",
                 "salience_score": round(score, 4),
                 "source_scene_id": scene_id,
                 "source_caption_id": None,
             })
 
     return clips
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def compute_overlap(clip_a, clip_b):
+    """
+    Compute temporal overlap ratio (IoU-style) between two clips.
+    Returns overlap_duration / min(duration_a, duration_b).
+    """
+    a_start, a_end = clip_a["start_time"], clip_a["end_time"]
+    b_start, b_end = clip_b["start_time"], clip_b["end_time"]
+
+    overlap_start = max(a_start, b_start)
+    overlap_end = min(a_end, b_end)
+    overlap_duration = max(0, overlap_end - overlap_start)
+
+    min_duration = min(a_end - a_start, b_end - b_start)
+    if min_duration <= 0:
+        return 0.0
+    return overlap_duration / min_duration
+
+
+def deduplicate_clips(dialog_clips, visual_clips):
+    """
+    Remove visual clips that overlap significantly with dialog clips.
+    A visual clip is removed if it overlaps >DEDUP_OVERLAP_THRESHOLD with
+    any dialog clip (same moment already covered by dialog).
+    """
+    deduped = []
+    removed = 0
+    for vc in visual_clips:
+        dominated = False
+        for dc in dialog_clips:
+            if compute_overlap(vc, dc) > DEDUP_OVERLAP_THRESHOLD:
+                dominated = True
+                break
+        if dominated:
+            removed += 1
+        else:
+            deduped.append(vc)
+
+    if removed > 0:
+        print(f"  Deduplication: removed {removed} visual clips overlapping with dialog",
+              file=sys.stderr, flush=True)
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -383,17 +424,23 @@ def main():
           f"{len(scenes)} scenes, {len(captions)} captions",
           file=sys.stderr, flush=True)
 
-    # Generate dialog clips
+    # Generate dialog clips from captions
     dialog_clips = generate_dialog_clips(captions, scenes)
     print(f"  Generated {len(dialog_clips)} dialog clips", file=sys.stderr, flush=True)
 
-    # Generate visual clips
+    # Generate visual clips — Lighthouse on full movie
     visual_clips = []
     if video_path and video_duration > 0:
         visual_clips = generate_visual_clips(
-            captions, scenes, video_path, video_duration, device=device
+            scenes, video_path, video_duration, device=device
         )
-        print(f"  Generated {len(visual_clips)} visual clips", file=sys.stderr, flush=True)
+        print(f"  Generated {len(visual_clips)} visual clips (before dedup)",
+              file=sys.stderr, flush=True)
+
+        # Deduplicate visual clips that overlap with dialog clips
+        visual_clips = deduplicate_clips(dialog_clips, visual_clips)
+        print(f"  {len(visual_clips)} visual clips after dedup",
+              file=sys.stderr, flush=True)
     else:
         print("  Skipping visual clips (no video_path or duration)",
               file=sys.stderr, flush=True)

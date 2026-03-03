@@ -160,17 +160,7 @@ func (vp *VideoProcessor) createSubsequentJobs(video *models.Video) error {
         log.Printf("Enqueued caption extraction job for video ID %d", video.ID)
     }
 
-    // Optionally enqueue embedding generation after others
-    embedPayload := map[string]interface{}{
-        "video_id": video.ID,
-    }
-    if _, err := vp.jobQueue.Enqueue(queue.JobTypeEmbeddingGeneration, embedPayload); err != nil {
-        log.Printf("Warning: Failed to enqueue embedding generation job for video %d: %v", video.ID, err)
-    } else {
-        log.Printf("Enqueued embedding generation job for video ID %d", video.ID)
-    }
-
-    // Enqueue clip generation (runs after embeddings since it needs scenes + captions)
+    // Enqueue clip generation (runs after scenes + captions, detects clip boundaries)
     clipPayload := map[string]interface{}{
         "video_id": video.ID,
     }
@@ -178,6 +168,16 @@ func (vp *VideoProcessor) createSubsequentJobs(video *models.Video) error {
         log.Printf("Warning: Failed to enqueue clip generation job for video %d: %v", video.ID, err)
     } else {
         log.Printf("Enqueued clip generation job for video ID %d", video.ID)
+    }
+
+    // Enqueue embedding generation (runs after clips, embeds clips not scenes)
+    embedPayload := map[string]interface{}{
+        "video_id": video.ID,
+    }
+    if _, err := vp.jobQueue.Enqueue(queue.JobTypeEmbeddingGeneration, embedPayload); err != nil {
+        log.Printf("Warning: Failed to enqueue embedding generation job for video %d: %v", video.ID, err)
+    } else {
+        log.Printf("Enqueued embedding generation job for video ID %d", video.ID)
     }
 
     return nil
@@ -369,14 +369,15 @@ func (vp *VideoProcessor) ProcessCaptionExtraction(payload map[string]interface{
 	return nil
 }
 
-// ProcessEmbeddingGeneration handles embedding generation jobs
+// ProcessEmbeddingGeneration handles embedding generation jobs.
+// Operates on CLIPS (not scenes) — generates IV2 captions for visual clips,
+// then computes all embeddings (InternVL, e5, CLIP ViT-B/32, CLAP) for each clip.
 func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interface{}) error {
     videoID, ok := payload["video_id"]
     if !ok {
         return fmt.Errorf("missing video_id in payload")
     }
 
-    // Resolve numeric ID from JSON payload (float64)
     var id uint
     switch v := videoID.(type) {
     case float64:
@@ -389,17 +390,17 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         return fmt.Errorf("unsupported video_id type: %T", videoID)
     }
 
-    // Load video & scenes
     video, err := vp.db.GetVideoByID(id)
     if err != nil {
         return fmt.Errorf("failed to get video: %v", err)
     }
-    scenes, err := vp.db.GetScenesByVideoID(video.ID)
+
+    clips, err := vp.db.GetClipsByVideoID(video.ID)
     if err != nil {
-        return fmt.Errorf("failed to load scenes: %v", err)
+        return fmt.Errorf("failed to load clips: %v", err)
     }
-    if len(scenes) == 0 {
-        log.Printf("No scenes for video %d; skipping embeddings.", video.ID)
+    if len(clips) == 0 {
+        log.Printf("[embeddings] video_id=%d: no clips to embed", video.ID)
         return nil
     }
 
@@ -408,61 +409,180 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         backend = "iv2"
     }
 
-    log.Printf("[embeddings] video_id=%d: starting embedding generation with backend=%s for %d scenes", video.ID, backend, len(scenes))
+    log.Printf("[embeddings] video_id=%d: starting clip embedding generation with backend=%s for %d clips", video.ID, backend, len(clips))
 
-    switch backend {
-    case "iv2", "internvl35":
-        // Prepare IV2 runner input
-        getIntEnv := func(key string, def int) int {
-            if v := os.Getenv(key); v != "" {
-                if n, err := strconv.Atoi(v); err == nil {
-                    return n
+    // --- Shared config ---
+    getIntEnv := func(key string, def int) int {
+        if v := os.Getenv(key); v != "" {
+            if n, err := strconv.Atoi(v); err == nil {
+                return n
+            }
+        }
+        return def
+    }
+
+    defaultFrames := 16
+    defaultRes := 224
+    if backend == "internvl35" {
+        defaultFrames = 8
+        defaultRes = 448
+    }
+    frames := getIntEnv("IV2_FRAMES", defaultFrames)
+    stride := getIntEnv("IV2_STRIDE", 4)
+    res := getIntEnv("IV2_RES", defaultRes)
+    device := os.Getenv("IV2_DEVICE")
+    if device == "" {
+        if os.Getenv("CUDA_VISIBLE_DEVICES") != "" {
+            device = "cuda:0"
+        } else {
+            device = "cpu"
+        }
+    }
+    modelID := os.Getenv("IV2_MODEL_ID")
+    if modelID == "" {
+        if backend == "internvl35" {
+            modelID = "OpenGVLab/InternVL3_5-2B"
+        } else {
+            modelID = "OpenGVLab/InternVideo2-Stage2_1B-224p-f4"
+        }
+    }
+
+    // Build clip ranges — use clip.ID as scene_index for mapping back
+    type clipRange struct {
+        SceneIndex int     `json:"scene_index"`
+        Start      float64 `json:"start"`
+        End        float64 `json:"end"`
+    }
+    var allClipRanges []clipRange
+    for _, c := range clips {
+        allClipRanges = append(allClipRanges, clipRange{
+            SceneIndex: int(c.ID),
+            Start:      c.StartTime,
+            End:        c.EndTime,
+        })
+    }
+
+    // Separate visual and dialog clips
+    var visualClips []models.Clip
+    var visualClipRanges []clipRange
+    var dialogClips []models.Clip
+    var dialogTexts []string
+    for _, c := range clips {
+        if c.ClipType == "visual" {
+            visualClips = append(visualClips, c)
+            visualClipRanges = append(visualClipRanges, clipRange{
+                SceneIndex: int(c.ID), Start: c.StartTime, End: c.EndTime,
+            })
+        } else if c.ClipType == "dialog" && c.Label != "" {
+            dialogClips = append(dialogClips, c)
+            dialogTexts = append(dialogTexts, c.Label)
+        }
+    }
+
+    // --- 1. IV2 captioning on visual clips (generates label text) ---
+    if len(visualClips) > 0 {
+        log.Printf("[embeddings] video_id=%d: generating IV2 captions for %d visual clips (backend=%s, model=%s)",
+            video.ID, len(visualClips), backend, modelID)
+
+        captionReq := map[string]interface{}{
+            "video_path": video.Filepath,
+            "scenes":     visualClipRanges,
+            "prompt":     os.Getenv("IV2_CAPTION_PROMPT"),
+            "sampling": map[string]int{
+                "frames":     frames,
+                "stride":     stride,
+                "resolution": res,
+            },
+            "device":   device,
+            "model_id": modelID,
+        }
+        captionPayload, _ := json.Marshal(captionReq)
+        captionCmd := exec.Command("python3", "/root/internal/embeddings/iv2_caption_runner.py")
+        captionCmd.Stdin = bytes.NewReader(captionPayload)
+        captionStdout, _ := captionCmd.StdoutPipe()
+        captionStderr, _ := captionCmd.StderrPipe()
+        if err := captionCmd.Start(); err != nil {
+            log.Printf("Warning: failed to start iv2_caption_runner for clips: %v", err)
+        } else {
+            go func() {
+                if _, err := io.Copy(os.Stderr, captionStderr); err != nil {
+                    log.Printf("Warning: failed to read iv2_caption_runner stderr: %v", err)
+                }
+            }()
+            captionOut, _ := io.ReadAll(captionStdout)
+            if err := captionCmd.Wait(); err != nil {
+                log.Printf("Warning: iv2_caption_runner (clips) failed: %v", err)
+            } else {
+                var captionResp struct {
+                    Model    string `json:"model"`
+                    Captions []struct {
+                        SceneIndex int    `json:"scene_index"`
+                        Text       string `json:"text"`
+                    } `json:"captions"`
+                    Error string `json:"error"`
+                }
+                if err := json.Unmarshal(captionOut, &captionResp); err != nil {
+                    log.Printf("Warning: failed to parse iv2_caption_runner output: %v", err)
+                } else if captionResp.Error != "" {
+                    log.Printf("Warning: iv2_caption_runner error: %s", captionResp.Error)
+                } else {
+                    savedCaptions := 0
+                    for _, cap := range captionResp.Captions {
+                        text := strings.TrimSpace(cap.Text)
+                        if text == "" {
+                            continue
+                        }
+                        clipID := uint(cap.SceneIndex) // we used clip.ID as scene_index
+                        if err := vp.db.UpdateClipLabel(clipID, text); err != nil {
+                            log.Printf("Warning: failed to update label for clip %d: %v", clipID, err)
+                            continue
+                        }
+                        savedCaptions++
+                    }
+                    log.Printf("[embeddings] video_id=%d: persisted %d/%d IV2 captions for visual clips",
+                        video.ID, savedCaptions, len(captionResp.Captions))
+
+                    // Reload clips to get updated labels for text embedding
+                    clips, err = vp.db.GetClipsByVideoID(video.ID)
+                    if err != nil {
+                        log.Printf("Warning: failed to reload clips after IV2 captioning: %v", err)
+                    } else {
+                        // Rebuild visual clip lists with updated labels
+                        visualClips = nil
+                        var visualTexts []string
+                        for _, c := range clips {
+                            if c.ClipType == "visual" && c.Label != "" {
+                                visualClips = append(visualClips, c)
+                                visualTexts = append(visualTexts, c.Label)
+                            }
+                        }
+
+                        // --- 2. Text embedding (e5) on visual clip labels → text_embedding ---
+                        if len(visualTexts) > 0 {
+                            log.Printf("[embeddings] video_id=%d: computing text embeddings for %d visual clip labels",
+                                video.ID, len(visualTexts))
+                            vp.embedTextsToClips(video.ID, visualTexts, visualClips, "text_embedding")
+                        }
+                    }
                 }
             }
-            return def
         }
+    }
 
-        // Defaults vary by backend
-        defaultFrames := 16
-        defaultRes := 224
-        if backend == "internvl35" {
-            defaultFrames = 8
-            defaultRes = 448
-        }
-        frames := getIntEnv("IV2_FRAMES", defaultFrames)
-        stride := getIntEnv("IV2_STRIDE", 4)
-        res := getIntEnv("IV2_RES", defaultRes)
-        device := os.Getenv("IV2_DEVICE")
-        if device == "" {
-            if os.Getenv("CUDA_VISIBLE_DEVICES") != "" {
-                device = "cuda:0"
-            } else {
-                device = "cpu"
-            }
-        }
-        modelID := os.Getenv("IV2_MODEL_ID")
-        if modelID == "" {
-            if backend == "internvl35" {
-                modelID = "OpenGVLab/InternVL3_5-2B"
-            } else {
-                modelID = "OpenGVLab/InternVideo2-Stage2_1B-224p-f4"
-            }
-        }
+    // --- 3. Dialog embedding (e5) on dialog clip labels → dialog_embedding ---
+    if len(dialogTexts) > 0 {
+        log.Printf("[embeddings] video_id=%d: computing dialog embeddings for %d dialog clips", video.ID, len(dialogTexts))
+        vp.embedTextsToClips(video.ID, dialogTexts, dialogClips, "dialog_embedding")
+    }
 
-        // Build scenes payload
-        type sceneRange struct {
-            SceneIndex int     `json:"scene_index"`
-            Start      float64 `json:"start"`
-            End        float64 `json:"end"`
-        }
-        var srs []sceneRange
-        for _, s := range scenes {
-            srs = append(srs, sceneRange{SceneIndex: s.SceneIndex, Start: s.StartTime, End: s.EndTime})
-        }
+    // --- 4. InternVL visual embedding on ALL clips → visual_embedding ---
+    if backend == "iv2" || backend == "internvl35" {
+        log.Printf("[embeddings] video_id=%d: starting InternVL visual embedding for %d clips (model=%s)",
+            video.ID, len(clips), modelID)
 
-        req := map[string]interface{}{
+        ivReq := map[string]interface{}{
             "video_path": video.Filepath,
-            "scenes":     srs,
+            "scenes":     allClipRanges,
             "sampling": map[string]int{
                 "frames":     frames,
                 "stride":     stride,
@@ -472,277 +592,231 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             "model_id": modelID,
             "backend":  backend,
         }
-
-        log.Printf("[embeddings] video_id=%d: starting IV2 visual embedding runner (backend=%s, model=%s)", video.ID, backend, modelID)
-
-        payloadBytes, _ := json.Marshal(req)
-        cmd := exec.Command("python3", "/root/internal/embeddings/iv2_runner.py")
-        cmd.Stdin = bytes.NewReader(payloadBytes)
-        stdout, _ := cmd.StdoutPipe()
-        stderr, _ := cmd.StderrPipe()
-        if err := cmd.Start(); err != nil {
-            return fmt.Errorf("failed to start runner: %v", err)
-        }
-        outBytes, _ := io.ReadAll(stdout)
-        errBytes, _ := io.ReadAll(stderr)
-        if err := cmd.Wait(); err != nil {
-            return fmt.Errorf("iv2 runner failed: %v; stderr: %s", err, string(errBytes))
-        }
-        out := outBytes
-
-        var resp struct {
-            Model        string `json:"model"`
-            EmbeddingDim int    `json:"embedding_dim"`
-            Vectors      []struct {
-                SceneIndex int       `json:"scene_index"`
-                Vector     []float32 `json:"vector"`
-            } `json:"vectors"`
-            Error string `json:"error"`
-        }
-        if err := json.Unmarshal(out, &resp); err != nil {
-            return fmt.Errorf("failed to parse iv2 runner output: %v; raw: %s", err, string(out))
-        }
-        if resp.Error != "" {
-            return fmt.Errorf("iv2 runner error: %s", resp.Error)
-        }
-
-        log.Printf("Embedding runner (backend=%s) model=%s returned dim=%d for %d scenes", backend, resp.Model, resp.EmbeddingDim, len(resp.Vectors))
-
-        // Persist vectors only if embedding dim matches our schema
-        expectedDim := 768
-        if backend == "internvl35" {
-            expectedDim = 1024
-        }
-        if resp.EmbeddingDim != expectedDim {
-            log.Printf("Warning: embedding_dim=%d != %d; skipping persistence (update schema or backend)", resp.EmbeddingDim, expectedDim)
-            return nil
-        }
-
-        saved := 0
-        for _, v := range resp.Vectors {
-            if err := vp.db.UpdateSceneVisualEmbeddingByIndex(video.ID, v.SceneIndex, v.Vector); err != nil {
-                log.Printf("Failed to persist embedding for scene_index=%d: %v", v.SceneIndex, err)
-                continue
-            }
-            saved++
-        }
-        // Update video's embedding model
-        video.EmbeddingModel = resp.Model
-        if err := vp.db.UpdateVideo(video); err != nil {
-            log.Printf("Warning: failed to update video embedding_model: %v", err)
-        }
-        log.Printf("Persisted %d/%d scene embeddings for video %d", saved, len(resp.Vectors), video.ID)
-
-        log.Printf("[embeddings] video_id=%d: starting IV2 caption generation for %d scenes", video.ID, len(scenes))
-        if err := vp.generateIV2Captions(video, scenes, frames, stride, res, device, modelID); err != nil {
-            log.Printf("Warning: IV2 caption generation failed for video %d: %v", video.ID, err)
+        ivPayload, _ := json.Marshal(ivReq)
+        ivCmd := exec.Command("python3", "/root/internal/embeddings/iv2_runner.py")
+        ivCmd.Stdin = bytes.NewReader(ivPayload)
+        ivStdout, _ := ivCmd.StdoutPipe()
+        ivStderr, _ := ivCmd.StderrPipe()
+        if err := ivCmd.Start(); err != nil {
+            log.Printf("Warning: failed to start iv2_runner for clips: %v", err)
         } else {
-            log.Printf("[embeddings] video_id=%d: completed IV2 caption generation", video.ID)
-        }
-
-        // --- Compute text embeddings for scenes from captions (e5-base-v2) ---
-        captions, err := vp.db.GetCaptionsByVideoID(video.ID)
-        if err != nil {
-            log.Printf("Warning: failed to load captions for video %d: %v", video.ID, err)
-            return nil
-        }
-        // Aggregate captions per scene time window
-        texts := make([]string, len(scenes))
-        hasText := make([]bool, len(scenes))
-        for i, s := range scenes {
-            var b strings.Builder
-            for _, c := range captions {
-                if c.StartTime < s.EndTime && c.EndTime > s.StartTime { // overlap
-                    if b.Len() > 0 {
-                        b.WriteString(" ")
+            ivOut, _ := io.ReadAll(ivStdout)
+            ivErrBytes, _ := io.ReadAll(ivStderr)
+            if err := ivCmd.Wait(); err != nil {
+                log.Printf("Warning: iv2_runner (clips) failed: %v; stderr: %s", err, string(ivErrBytes))
+            } else {
+                var ivResp struct {
+                    Model        string `json:"model"`
+                    EmbeddingDim int    `json:"embedding_dim"`
+                    Vectors      []struct {
+                        SceneIndex int       `json:"scene_index"`
+                        Vector     []float32 `json:"vector"`
+                    } `json:"vectors"`
+                    Error string `json:"error"`
+                }
+                if err := json.Unmarshal(ivOut, &ivResp); err != nil {
+                    log.Printf("Warning: failed to parse iv2_runner (clips) output: %v", err)
+                } else if ivResp.Error != "" {
+                    log.Printf("Warning: iv2_runner (clips) error: %s", ivResp.Error)
+                } else {
+                    expectedDim := 768
+                    if backend == "internvl35" {
+                        expectedDim = 1024
                     }
-                    b.WriteString(c.Text)
+                    if ivResp.EmbeddingDim != expectedDim {
+                        log.Printf("Warning: IV2 embedding_dim=%d != %d; skipping", ivResp.EmbeddingDim, expectedDim)
+                    } else {
+                        savedIV := 0
+                        for _, v := range ivResp.Vectors {
+                            clipID := uint(v.SceneIndex)
+                            if err := vp.db.UpdateClipVisualEmbedding(clipID, v.Vector); err != nil {
+                                log.Printf("Warning: failed to persist visual embedding for clip %d: %v", clipID, err)
+                                continue
+                            }
+                            savedIV++
+                        }
+                        log.Printf("[embeddings] video_id=%d: persisted %d/%d InternVL visual embeddings",
+                            video.ID, savedIV, len(ivResp.Vectors))
+
+                        // Update video's embedding model
+                        video.EmbeddingModel = ivResp.Model
+                        if err := vp.db.UpdateVideo(video); err != nil {
+                            log.Printf("Warning: failed to update video embedding_model: %v", err)
+                        }
+                    }
                 }
             }
-            txt := strings.TrimSpace(b.String())
-            texts[i] = txt
-            hasText[i] = txt != ""
         }
-        // Prepare payload for runner with only non-empty texts, but we need ordering; simplest: send all and skip empty on persist
-        treq := map[string]interface{}{
-            "texts": texts,
-            "mode":  "passage",
-        }
-        payloadBytes, _ = json.Marshal(treq)
-        tcmd := exec.Command("python3", "/root/internal/embeddings/text_embed_runner.py")
-        tcmd.Stdin = bytes.NewReader(payloadBytes)
-        tStdout, _ := tcmd.StdoutPipe()
-        tStderr, _ := tcmd.StderrPipe()
-        if err := tcmd.Start(); err != nil {
-            log.Printf("Warning: failed to start text_embed_runner: %v", err)
-            return nil
-        }
-        tOut, _ := io.ReadAll(tStdout)
-        tErr, _ := io.ReadAll(tStderr)
-        if err := tcmd.Wait(); err != nil {
-            log.Printf("Warning: text_embed_runner failed: %v; stderr: %s", err, string(tErr))
-            return nil
-        }
-        var tResp struct {
-            Model        string       `json:"model"`
-            EmbeddingDim int          `json:"embedding_dim"`
-            Vectors      [][]float32  `json:"vectors"`
-            Vector       []float32    `json:"vector"`
-            Error        string       `json:"error"`
-        }
-        if err := json.Unmarshal(tOut, &tResp); err != nil {
-            log.Printf("Warning: failed to parse text_embed_runner output: %v; raw: %s", err, string(tOut))
-            return nil
-        }
-        if tResp.Error != "" {
-            log.Printf("Warning: text_embed_runner error: %s", tResp.Error)
-            return nil
-        }
-        // Normalize single-vector vs vectors output
-        var tVectors [][]float32
-        if len(tResp.Vectors) > 0 {
-            tVectors = tResp.Vectors
-        } else if len(tResp.Vector) > 0 && len(texts) == 1 {
-            tVectors = [][]float32{tResp.Vector}
-        }
-        // Persist per scene
-        savedText := 0
-        for i := range scenes {
-            if !hasText[i] {
-                continue
-            }
-            if i >= len(tVectors) || len(tVectors[i]) == 0 {
-                continue
-            }
-            if err := vp.db.UpdateSceneTextEmbeddingByIndex(video.ID, scenes[i].SceneIndex, tVectors[i]); err != nil {
-                log.Printf("Failed to persist text embedding for scene_index=%d: %v", scenes[i].SceneIndex, err)
-                continue
-            }
-            savedText++
-        }
-        log.Printf("Persisted %d/%d text embeddings for video %d", savedText, len(scenes), video.ID)
-        log.Printf("[embeddings] video_id=%d: completed text embedding stage (saved=%d/%d)", video.ID, savedText, len(scenes))
+    }
 
-        // --- Compute CLIP image embeddings for scenes (ViT-B/32) ---
-        log.Printf("[embeddings] video_id=%d: starting CLIP embedding stage for %d scenes", video.ID, len(scenes))
-        // Use the same scene ranges (srs) built earlier.
-        creq := map[string]interface{}{
-            "video_path": video.Filepath,
-            "scenes":     srs,
-            "mode":       "image",
-        }
-        payloadBytes, _ = json.Marshal(creq)
-        ccmd := exec.Command("python3", "/root/internal/embeddings/clip_runner.py")
-        ccmd.Stdin = bytes.NewReader(payloadBytes)
-        cStdout, _ := ccmd.StdoutPipe()
-        cStderr, _ := ccmd.StderrPipe()
-        if err := ccmd.Start(); err != nil {
-            log.Printf("Warning: failed to start clip_runner: %v", err)
-            return nil
-        }
-        cOut, _ := io.ReadAll(cStdout)
-        cErr, _ := io.ReadAll(cStderr)
-        if err := ccmd.Wait(); err != nil {
-            log.Printf("Warning: clip_runner failed: %v; stderr: %s", err, string(cErr))
-            return nil
-        }
-        var cResp struct {
-            Model        string `json:"model"`
-            EmbeddingDim int    `json:"embedding_dim"`
-            Vectors      []struct {
-                SceneIndex int       `json:"scene_index"`
-                Vector     []float32 `json:"vector"`
-            } `json:"vectors"`
-            Error string `json:"error"`
-        }
-        if err := json.Unmarshal(cOut, &cResp); err != nil {
-            log.Printf("Warning: failed to parse clip_runner output: %v; raw: %s", err, string(cOut))
-            return nil
-        }
-        if cResp.Error != "" {
-            log.Printf("Warning: clip_runner error: %s", cResp.Error)
-            return nil
-        }
-        if cResp.EmbeddingDim != 512 {
-            log.Printf("Warning: CLIP embedding_dim=%d != 512; skipping persistence", cResp.EmbeddingDim)
-            return nil
-        }
-        savedClip := 0
-        for _, v := range cResp.Vectors {
-            if err := vp.db.UpdateSceneVisualClipEmbeddingByIndex(video.ID, v.SceneIndex, v.Vector); err != nil {
-                log.Printf("Failed to persist CLIP embedding for scene_index=%d: %v", v.SceneIndex, err)
-                continue
+    // --- 5. CLIP image embedding (ViT-B/32) on ALL clips → clip_embedding ---
+    log.Printf("[embeddings] video_id=%d: computing CLIP image embeddings for %d clips", video.ID, len(clips))
+    clipReq := map[string]interface{}{
+        "video_path": video.Filepath,
+        "scenes":     allClipRanges,
+        "mode":       "image",
+    }
+    clipPayload, _ := json.Marshal(clipReq)
+    clipCmd := exec.Command("python3", "/root/internal/embeddings/clip_runner.py")
+    clipCmd.Stdin = bytes.NewReader(clipPayload)
+    clipStdout, _ := clipCmd.StdoutPipe()
+    clipStderr, _ := clipCmd.StderrPipe()
+    if err := clipCmd.Start(); err != nil {
+        log.Printf("Warning: failed to start clip_runner for clips: %v", err)
+    } else {
+        clipOut, _ := io.ReadAll(clipStdout)
+        clipErrBytes, _ := io.ReadAll(clipStderr)
+        if err := clipCmd.Wait(); err != nil {
+            log.Printf("Warning: clip_runner (clips) failed: %v; stderr: %s", err, string(clipErrBytes))
+        } else {
+            var clipResp struct {
+                EmbeddingDim int `json:"embedding_dim"`
+                Vectors      []struct {
+                    SceneIndex int       `json:"scene_index"`
+                    Vector     []float32 `json:"vector"`
+                } `json:"vectors"`
+                Error string `json:"error"`
             }
-            savedClip++
+            if err := json.Unmarshal(clipOut, &clipResp); err != nil {
+                log.Printf("Warning: failed to parse clip_runner output: %v", err)
+            } else if clipResp.Error != "" {
+                log.Printf("Warning: clip_runner error: %s", clipResp.Error)
+            } else if clipResp.EmbeddingDim != 512 {
+                log.Printf("Warning: CLIP embedding_dim=%d != 512; skipping", clipResp.EmbeddingDim)
+            } else {
+                savedCE := 0
+                for _, v := range clipResp.Vectors {
+                    clipID := uint(v.SceneIndex)
+                    if err := vp.db.UpdateClipClipEmbedding(clipID, v.Vector); err != nil {
+                        log.Printf("Warning: failed to persist CLIP embedding for clip %d: %v", clipID, err)
+                        continue
+                    }
+                    savedCE++
+                }
+                log.Printf("[embeddings] video_id=%d: persisted %d/%d CLIP embeddings", video.ID, savedCE, len(clipResp.Vectors))
+            }
         }
-        log.Printf("Persisted %d/%d CLIP embeddings for video %d", savedClip, len(cResp.Vectors), video.ID)
-        log.Printf("[embeddings] video_id=%d: completed CLIP embedding stage (saved=%d/%d)", video.ID, savedClip, len(cResp.Vectors))
+    }
 
-        // --- Compute CLAP audio embeddings per scene ---
-        if strings.EqualFold(os.Getenv("ENABLE_AUDIO_EMBEDDINGS"), "false") || os.Getenv("ENABLE_AUDIO_EMBEDDINGS") == "0" {
-            log.Printf("Skipping audio embeddings for video %d due to ENABLE_AUDIO_EMBEDDINGS", video.ID)
-            return nil
-        }
-        areq := map[string]interface{}{
+    // --- 6. CLAP audio embedding on ALL clips → audio_embedding ---
+    if !(strings.EqualFold(os.Getenv("ENABLE_AUDIO_EMBEDDINGS"), "false") || os.Getenv("ENABLE_AUDIO_EMBEDDINGS") == "0") {
+        log.Printf("[embeddings] video_id=%d: computing audio embeddings for %d clips", video.ID, len(clips))
+        audioReq := map[string]interface{}{
             "video_path":  video.Filepath,
-            "scenes":      srs,
+            "scenes":      allClipRanges,
             "sample_rate": 48000,
         }
-        payloadBytes, _ = json.Marshal(areq)
-        acmd := exec.Command("python3", "/root/internal/embeddings/audio_embed_runner.py")
-        acmd.Stdin = bytes.NewReader(payloadBytes)
-        aStdout, _ := acmd.StdoutPipe()
-        aStderr, _ := acmd.StderrPipe()
-        if err := acmd.Start(); err != nil {
-            log.Printf("Warning: failed to start audio_embed_runner: %v", err)
-            return nil
-        }
-        aOut, _ := io.ReadAll(aStdout)
-        aErr, _ := io.ReadAll(aStderr)
-        if err := acmd.Wait(); err != nil {
-            log.Printf("Warning: audio_embed_runner failed: %v; stderr: %s", err, string(aErr))
-            return nil
-        }
-        var aResp struct {
-            Model        string `json:"model"`
-            EmbeddingDim int    `json:"embedding_dim"`
-            Vectors      []struct {
-                SceneIndex int       `json:"scene_index"`
-                Vector     []float32 `json:"vector"`
-            } `json:"vectors"`
-            Error string `json:"error"`
-        }
-        if err := json.Unmarshal(aOut, &aResp); err != nil {
-            log.Printf("Warning: failed to parse audio_embed_runner output: %v; raw: %s", err, string(aOut))
-            return nil
-        }
-        if aResp.Error != "" {
-            log.Printf("Warning: audio_embed_runner error: %s", aResp.Error)
-            return nil
-        }
-        if aResp.EmbeddingDim != 512 {
-            log.Printf("Warning: CLAP embedding_dim=%d != 512; skipping persistence", aResp.EmbeddingDim)
-            return nil
-        }
-        savedAudio := 0
-        for _, v := range aResp.Vectors {
-            if err := vp.db.UpdateSceneAudioEmbeddingByIndex(video.ID, v.SceneIndex, v.Vector); err != nil {
-                log.Printf("Failed to persist audio embedding for scene_index=%d: %v", v.SceneIndex, err)
-                continue
+        audioPayload, _ := json.Marshal(audioReq)
+        audioCmd := exec.Command("python3", "/root/internal/embeddings/audio_embed_runner.py")
+        audioCmd.Stdin = bytes.NewReader(audioPayload)
+        audioStdout, _ := audioCmd.StdoutPipe()
+        audioStderr, _ := audioCmd.StderrPipe()
+        if err := audioCmd.Start(); err != nil {
+            log.Printf("Warning: failed to start audio_embed_runner for clips: %v", err)
+        } else {
+            audioOut, _ := io.ReadAll(audioStdout)
+            audioErrBytes, _ := io.ReadAll(audioStderr)
+            if err := audioCmd.Wait(); err != nil {
+                log.Printf("Warning: audio_embed_runner (clips) failed: %v; stderr: %s", err, string(audioErrBytes))
+            } else {
+                var audioResp struct {
+                    EmbeddingDim int `json:"embedding_dim"`
+                    Vectors      []struct {
+                        SceneIndex int       `json:"scene_index"`
+                        Vector     []float32 `json:"vector"`
+                    } `json:"vectors"`
+                    Error string `json:"error"`
+                }
+                if err := json.Unmarshal(audioOut, &audioResp); err != nil {
+                    log.Printf("Warning: failed to parse audio_embed_runner output: %v", err)
+                } else if audioResp.Error != "" {
+                    log.Printf("Warning: audio_embed_runner error: %s", audioResp.Error)
+                } else if audioResp.EmbeddingDim != 512 {
+                    log.Printf("Warning: CLAP embedding_dim=%d != 512; skipping", audioResp.EmbeddingDim)
+                } else {
+                    savedAudio := 0
+                    for _, v := range audioResp.Vectors {
+                        clipID := uint(v.SceneIndex)
+                        if err := vp.db.UpdateClipAudioEmbedding(clipID, v.Vector); err != nil {
+                            log.Printf("Warning: failed to persist audio embedding for clip %d: %v", clipID, err)
+                            continue
+                        }
+                        savedAudio++
+                    }
+                    log.Printf("[embeddings] video_id=%d: persisted %d/%d audio embeddings", video.ID, savedAudio, len(audioResp.Vectors))
+                }
             }
-            savedAudio++
         }
-        log.Printf("Persisted %d/%d audio embeddings for video %d", savedAudio, len(aResp.Vectors), video.ID)
-
-        return nil
-
-    case "clip":
-        log.Printf("CLIP embedding backend not implemented yet; skipping.")
-        return nil
-
-    default:
-        return fmt.Errorf("unknown EMBEDDING_BACKEND: %s", backend)
+    } else {
+        log.Printf("[embeddings] video_id=%d: skipping audio embeddings (disabled)", video.ID)
     }
+
+    log.Printf("[embeddings] video_id=%d: clip embedding generation complete", video.ID)
+    return nil
+}
+
+// embedTextsToClips runs text_embed_runner.py on a list of texts and persists to the specified embedding column.
+func (vp *VideoProcessor) embedTextsToClips(videoID uint, texts []string, targetClips []models.Clip, embeddingType string) {
+    treq := map[string]interface{}{
+        "texts": texts,
+        "mode":  "passage",
+    }
+    tPayload, _ := json.Marshal(treq)
+    tcmd := exec.Command("python3", "/root/internal/embeddings/text_embed_runner.py")
+    tcmd.Stdin = bytes.NewReader(tPayload)
+    tStdout, _ := tcmd.StdoutPipe()
+    tStderr, _ := tcmd.StderrPipe()
+    if err := tcmd.Start(); err != nil {
+        log.Printf("Warning: failed to start text_embed_runner for %s: %v", embeddingType, err)
+        return
+    }
+    tOut, _ := io.ReadAll(tStdout)
+    tErrBytes, _ := io.ReadAll(tStderr)
+    if err := tcmd.Wait(); err != nil {
+        log.Printf("Warning: text_embed_runner (%s) failed: %v; stderr: %s", embeddingType, err, string(tErrBytes))
+        return
+    }
+
+    var tResp struct {
+        Vectors [][]float32 `json:"vectors"`
+        Vector  []float32   `json:"vector"`
+        Error   string      `json:"error"`
+    }
+    if err := json.Unmarshal(tOut, &tResp); err != nil {
+        log.Printf("Warning: failed to parse text_embed_runner (%s) output: %v", embeddingType, err)
+        return
+    }
+    if tResp.Error != "" {
+        log.Printf("Warning: text_embed_runner (%s) error: %s", embeddingType, tResp.Error)
+        return
+    }
+
+    var tVectors [][]float32
+    if len(tResp.Vectors) > 0 {
+        tVectors = tResp.Vectors
+    } else if len(tResp.Vector) > 0 && len(texts) == 1 {
+        tVectors = [][]float32{tResp.Vector}
+    }
+
+    saved := 0
+    for i, c := range targetClips {
+        if i >= len(tVectors) || len(tVectors[i]) == 0 {
+            continue
+        }
+        var err error
+        switch embeddingType {
+        case "dialog_embedding":
+            err = vp.db.UpdateClipDialogEmbedding(c.ID, tVectors[i])
+        case "text_embedding":
+            err = vp.db.UpdateClipTextEmbedding(c.ID, tVectors[i])
+        }
+        if err != nil {
+            log.Printf("Warning: failed to persist %s for clip %d: %v", embeddingType, c.ID, err)
+            continue
+        }
+        saved++
+    }
+    log.Printf("[embeddings] video_id=%d: persisted %d/%d %s embeddings", videoID, saved, len(targetClips), embeddingType)
 }
 
 // generateIV2Captions generates one synthetic caption per scene using an external runner
@@ -981,193 +1055,6 @@ func (vp *VideoProcessor) ProcessClipGeneration(payload map[string]interface{}) 
         saved++
     }
     log.Printf("[clips] video_id=%d: persisted %d/%d clips", video.ID, saved, len(resp.Clips))
-
-    // Reload persisted clips (they now have IDs assigned by the database)
-    clips, err := vp.db.GetClipsByVideoID(video.ID)
-    if err != nil {
-        return fmt.Errorf("failed to reload clips: %v", err)
-    }
-    if len(clips) == 0 {
-        log.Printf("[clips] video_id=%d: no clips to embed", video.ID)
-        return nil
-    }
-
-    // --- 1. Dialog embeddings (e5-base-v2) for dialog clips ---
-    var dialogClips []models.Clip
-    var dialogTexts []string
-    for _, c := range clips {
-        if c.ClipType == "dialog" && c.Label != "" {
-            dialogClips = append(dialogClips, c)
-            dialogTexts = append(dialogTexts, c.Label)
-        }
-    }
-    if len(dialogTexts) > 0 {
-        log.Printf("[clips] video_id=%d: computing dialog embeddings for %d clips", video.ID, len(dialogTexts))
-        treq := map[string]interface{}{
-            "texts": dialogTexts,
-            "mode":  "passage",
-        }
-        tPayload, _ := json.Marshal(treq)
-        tcmd := exec.Command("python3", "/root/internal/embeddings/text_embed_runner.py")
-        tcmd.Stdin = bytes.NewReader(tPayload)
-        tStdout, _ := tcmd.StdoutPipe()
-        tStderr, _ := tcmd.StderrPipe()
-        if err := tcmd.Start(); err != nil {
-            log.Printf("Warning: failed to start text_embed_runner for clips: %v", err)
-        } else {
-            tOut, _ := io.ReadAll(tStdout)
-            tErrBytes, _ := io.ReadAll(tStderr)
-            if err := tcmd.Wait(); err != nil {
-                log.Printf("Warning: text_embed_runner (clips) failed: %v; stderr: %s", err, string(tErrBytes))
-            } else {
-                var tResp struct {
-                    Vectors [][]float32 `json:"vectors"`
-                    Vector  []float32   `json:"vector"`
-                    Error   string      `json:"error"`
-                }
-                if err := json.Unmarshal(tOut, &tResp); err != nil {
-                    log.Printf("Warning: failed to parse text_embed_runner (clips) output: %v", err)
-                } else if tResp.Error != "" {
-                    log.Printf("Warning: text_embed_runner (clips) error: %s", tResp.Error)
-                } else {
-                    var tVectors [][]float32
-                    if len(tResp.Vectors) > 0 {
-                        tVectors = tResp.Vectors
-                    } else if len(tResp.Vector) > 0 && len(dialogTexts) == 1 {
-                        tVectors = [][]float32{tResp.Vector}
-                    }
-                    savedDialog := 0
-                    for i, c := range dialogClips {
-                        if i >= len(tVectors) || len(tVectors[i]) == 0 {
-                            continue
-                        }
-                        if err := vp.db.UpdateClipDialogEmbedding(c.ID, tVectors[i]); err != nil {
-                            log.Printf("Warning: failed to persist dialog embedding for clip %d: %v", c.ID, err)
-                            continue
-                        }
-                        savedDialog++
-                    }
-                    log.Printf("[clips] video_id=%d: persisted %d/%d dialog embeddings", video.ID, savedDialog, len(dialogClips))
-                }
-            }
-        }
-    }
-
-    // --- 2. CLIP image embeddings (ViT-B/32) for ALL clips ---
-    type clipScene struct {
-        SceneIndex int     `json:"scene_index"`
-        Start      float64 `json:"start"`
-        End        float64 `json:"end"`
-    }
-    var clipScenes []clipScene
-    for _, c := range clips {
-        clipScenes = append(clipScenes, clipScene{
-            SceneIndex: int(c.ID), // use clip ID as scene_index for mapping
-            Start:      c.StartTime,
-            End:        c.EndTime,
-        })
-    }
-    log.Printf("[clips] video_id=%d: computing CLIP image embeddings for %d clips", video.ID, len(clips))
-    creq := map[string]interface{}{
-        "video_path": video.Filepath,
-        "scenes":     clipScenes,
-        "mode":       "image",
-    }
-    cPayload, _ := json.Marshal(creq)
-    ccmd := exec.Command("python3", "/root/internal/embeddings/clip_runner.py")
-    ccmd.Stdin = bytes.NewReader(cPayload)
-    cStdout, _ := ccmd.StdoutPipe()
-    cStderr, _ := ccmd.StderrPipe()
-    if err := ccmd.Start(); err != nil {
-        log.Printf("Warning: failed to start clip_runner for clips: %v", err)
-    } else {
-        cOut, _ := io.ReadAll(cStdout)
-        cErrBytes, _ := io.ReadAll(cStderr)
-        if err := ccmd.Wait(); err != nil {
-            log.Printf("Warning: clip_runner (clips) failed: %v; stderr: %s", err, string(cErrBytes))
-        } else {
-            var cResp struct {
-                EmbeddingDim int `json:"embedding_dim"`
-                Vectors      []struct {
-                    SceneIndex int       `json:"scene_index"`
-                    Vector     []float32 `json:"vector"`
-                } `json:"vectors"`
-                Error string `json:"error"`
-            }
-            if err := json.Unmarshal(cOut, &cResp); err != nil {
-                log.Printf("Warning: failed to parse clip_runner (clips) output: %v", err)
-            } else if cResp.Error != "" {
-                log.Printf("Warning: clip_runner (clips) error: %s", cResp.Error)
-            } else if cResp.EmbeddingDim != 512 {
-                log.Printf("Warning: CLIP embedding_dim=%d != 512; skipping", cResp.EmbeddingDim)
-            } else {
-                savedClipEmb := 0
-                for _, v := range cResp.Vectors {
-                    clipID := uint(v.SceneIndex) // we used clip ID as scene_index
-                    if err := vp.db.UpdateClipClipEmbedding(clipID, v.Vector); err != nil {
-                        log.Printf("Warning: failed to persist CLIP embedding for clip %d: %v", clipID, err)
-                        continue
-                    }
-                    savedClipEmb++
-                }
-                log.Printf("[clips] video_id=%d: persisted %d/%d CLIP embeddings", video.ID, savedClipEmb, len(cResp.Vectors))
-            }
-        }
-    }
-
-    // --- 3. CLAP audio embeddings for ALL clips ---
-    if !(strings.EqualFold(os.Getenv("ENABLE_AUDIO_EMBEDDINGS"), "false") || os.Getenv("ENABLE_AUDIO_EMBEDDINGS") == "0") {
-        log.Printf("[clips] video_id=%d: computing audio embeddings for %d clips", video.ID, len(clips))
-        areq := map[string]interface{}{
-            "video_path":  video.Filepath,
-            "scenes":      clipScenes, // reuse same scene_index=clipID mapping
-            "sample_rate": 48000,
-        }
-        aPayload, _ := json.Marshal(areq)
-        acmd := exec.Command("python3", "/root/internal/embeddings/audio_embed_runner.py")
-        acmd.Stdin = bytes.NewReader(aPayload)
-        aStdout, _ := acmd.StdoutPipe()
-        aStderr, _ := acmd.StderrPipe()
-        if err := acmd.Start(); err != nil {
-            log.Printf("Warning: failed to start audio_embed_runner for clips: %v", err)
-        } else {
-            aOut, _ := io.ReadAll(aStdout)
-            aErrBytes, _ := io.ReadAll(aStderr)
-            if err := acmd.Wait(); err != nil {
-                log.Printf("Warning: audio_embed_runner (clips) failed: %v; stderr: %s", err, string(aErrBytes))
-            } else {
-                var aResp struct {
-                    EmbeddingDim int `json:"embedding_dim"`
-                    Vectors      []struct {
-                        SceneIndex int       `json:"scene_index"`
-                        Vector     []float32 `json:"vector"`
-                    } `json:"vectors"`
-                    Error string `json:"error"`
-                }
-                if err := json.Unmarshal(aOut, &aResp); err != nil {
-                    log.Printf("Warning: failed to parse audio_embed_runner (clips) output: %v", err)
-                } else if aResp.Error != "" {
-                    log.Printf("Warning: audio_embed_runner (clips) error: %s", aResp.Error)
-                } else if aResp.EmbeddingDim != 512 {
-                    log.Printf("Warning: CLAP embedding_dim=%d != 512; skipping", aResp.EmbeddingDim)
-                } else {
-                    savedAudio := 0
-                    for _, v := range aResp.Vectors {
-                        clipID := uint(v.SceneIndex)
-                        if err := vp.db.UpdateClipAudioEmbedding(clipID, v.Vector); err != nil {
-                            log.Printf("Warning: failed to persist audio embedding for clip %d: %v", clipID, err)
-                            continue
-                        }
-                        savedAudio++
-                    }
-                    log.Printf("[clips] video_id=%d: persisted %d/%d audio embeddings", video.ID, savedAudio, len(aResp.Vectors))
-                }
-            }
-        }
-    } else {
-        log.Printf("[clips] video_id=%d: skipping audio embeddings (ENABLE_AUDIO_EMBEDDINGS disabled)", video.ID)
-    }
-
-    log.Printf("[clips] video_id=%d: clip generation and embedding complete", video.ID)
+    log.Printf("[clips] video_id=%d: clip generation complete (embeddings will run in embedding_generation job)", video.ID)
     return nil
 }

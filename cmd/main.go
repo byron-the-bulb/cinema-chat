@@ -349,6 +349,7 @@ func searchClips(c *gin.Context) {
     type laneScores struct {
         DialogScore float64
         ClipScore   float64
+        TextScore   float64 // Lane 3: e5 on IV2 descriptions (visual clips)
         BestResult  database.ClipSearchResult
         BestLane    string
     }
@@ -427,9 +428,48 @@ func searchClips(c *gin.Context) {
         log.Printf("Warning: CLIP text embedding failed (lane 2 skipped): %v", clipErr)
     }
 
-    // Lane 3: visual embedding search (uses e5 vector against visual_embedding)
-    // TODO: this lane will search a text_embedding column on visual clips
-    // once IV2 description embeddings are stored per clip. Skipping for now.
+    // Lane 3: text embedding search on IV2 descriptions of visual clips
+    if visualWeight > 0 && e5Err == nil {
+        // Reuse e5 vector (same model encodes both dialog queries and visual description queries)
+        textVec := e5Vec
+        if req.VisualQuery != "" {
+            // If a separate visual query was provided, re-embed it with e5
+            textVec, _ = embedTextQuery(req.VisualQuery)
+        }
+        if textVec != nil {
+            results, err := db.SearchClipsByTextVector(textVec, fetchLimit, req.VideoIDs)
+            if err != nil {
+                log.Printf("Warning: text lane (Lane 3) search failed: %v", err)
+            } else {
+                maxDist := 0.0
+                for _, r := range results {
+                    if r.Distance > maxDist {
+                        maxDist = r.Distance
+                    }
+                }
+                if maxDist <= 0 {
+                    maxDist = 1.0
+                }
+                for _, r := range results {
+                    score := 1.0 - (r.Distance / maxDist)
+                    if existing, ok := clips[r.Clip.ID]; ok {
+                        existing.TextScore = score
+                        // Lane 3 runs last — beat both previous lanes to become BestLane
+                        if score > existing.DialogScore && score > existing.ClipScore {
+                            existing.BestResult = r
+                            existing.BestLane = "text"
+                        }
+                    } else {
+                        clips[r.Clip.ID] = &laneScores{
+                            TextScore:  score,
+                            BestResult: r,
+                            BestLane:   "text",
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Compute weighted combined score per clip
     type scored struct {
@@ -443,7 +483,12 @@ func searchClips(c *gin.Context) {
     }
     sorted := make([]scored, 0, len(clips))
     for _, ls := range clips {
-        combinedScore := (dialogWeight*ls.DialogScore + visualWeight*ls.ClipScore) / totalWeight
+        // Lanes 2 (CLIP) and 3 (text/IV2) both use visualWeight — take the best of the two
+        bestVisualScore := ls.ClipScore
+        if ls.TextScore > bestVisualScore {
+            bestVisualScore = ls.TextScore
+        }
+        combinedScore := (dialogWeight*ls.DialogScore + visualWeight*bestVisualScore) / totalWeight
         sorted = append(sorted, scored{
             Result: ls.BestResult,
             Score:  combinedScore,

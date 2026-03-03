@@ -158,6 +158,7 @@ type Clip struct {
 	SalienceScore   float64          `json:"salience_score" gorm:"default:0.5"`
 
 	DialogEmbedding *pgvector.Vector `json:"dialog_embedding,omitempty" gorm:"type:vector(768)"`
+	TextEmbedding   *pgvector.Vector `json:"text_embedding,omitempty" gorm:"type:vector(768)"`
 	VisualEmbedding *pgvector.Vector `json:"visual_embedding,omitempty" gorm:"type:vector(1024)"`
 	ClipEmbedding   *pgvector.Vector `json:"clip_embedding,omitempty" gorm:"type:vector(512)"`
 	AudioEmbedding  *pgvector.Vector `json:"audio_embedding,omitempty" gorm:"type:vector(512)"`

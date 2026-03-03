@@ -95,6 +95,22 @@ func (db *DB) UpdateClipVisualEmbedding(clipID uint, vec []float32) error {
 	return db.Model(&models.Clip{}).Where("id = ?", clipID).Update("visual_embedding", v).Error
 }
 
+// UpdateClipTextEmbedding sets the text_embedding (e5 of IV2 description) for a clip by ID.
+func (db *DB) UpdateClipTextEmbedding(clipID uint, vec []float32) error {
+	v := pgvector.NewVector(vec)
+	return db.Model(&models.Clip{}).Where("id = ?", clipID).Update("text_embedding", v).Error
+}
+
+// UpdateClipLabel updates the label text for a clip by ID.
+func (db *DB) UpdateClipLabel(clipID uint, label string) error {
+	return db.Model(&models.Clip{}).Where("id = ?", clipID).Update("label", label).Error
+}
+
+// SearchClipsByTextVector searches text_embedding (e5 of IV2 descriptions) on visual clips.
+func (db *DB) SearchClipsByTextVector(vec []float32, k int, filterVideoIDs []uint) ([]ClipSearchResult, error) {
+	return db.searchClipsByVector("text_embedding", vec, k, filterVideoIDs, []string{"visual"}, "text")
+}
+
 // searchClipsByVector is the shared implementation for all clip vector searches.
 func (db *DB) searchClipsByVector(embeddingCol string, vec []float32, k int, filterVideoIDs []uint, clipTypes []string, lane string) ([]ClipSearchResult, error) {
 	v := pgvector.NewVector(vec)
