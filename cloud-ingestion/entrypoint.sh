@@ -92,16 +92,18 @@ EOF
         echo "Running fresh migrations..."
         PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -f /root/migrations/init.sql
     fi
-    # Always run clips migration (idempotent — uses IF NOT EXISTS)
-    if [ -f /root/migrations/002_clips.sql ]; then
-        echo "Running clips migration..."
-        PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -f /root/migrations/002_clips.sql
-    fi
     echo "Database initialized"
 elif [ -f "${PG_BACKUP}" ]; then
     # Existing DB but check if we need to restore backup (e.g., after pod restart)
     echo "Checking for backup restore..."
 fi
+
+# Always run incremental migrations (idempotent — all use IF NOT EXISTS / IF NOT EXISTS)
+for mig in /root/migrations/0*.sql; do
+    [ -f "$mig" ] || continue
+    echo "Running migration: $(basename "$mig")..."
+    PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -f "$mig"
+done
 
 # ============================================
 # Redis Setup

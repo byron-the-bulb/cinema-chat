@@ -147,8 +147,8 @@ func (q *Queue) DequeueAny(jobTypes []JobType) (*Job, error) {
             fmt.Sprintf("jobs:%s", JobTypeVideoIngestion),
             fmt.Sprintf("jobs:%s", JobTypeSceneDetection),
             fmt.Sprintf("jobs:%s", JobTypeCaptionExtraction),
-            fmt.Sprintf("jobs:%s", JobTypeEmbeddingGeneration),
             fmt.Sprintf("jobs:%s", JobTypeClipGeneration),
+            fmt.Sprintf("jobs:%s", JobTypeEmbeddingGeneration),
             fmt.Sprintf("jobs:%s", JobTypeVideoAnalysis),
         }
     }

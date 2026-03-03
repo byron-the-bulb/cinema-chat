@@ -57,6 +57,7 @@ logs/
 *.sqlite
 *.sqlite3
 *.sql
+!migrations/*.sql
 
 # Videos (large files)
 data/videos/*.mp4
