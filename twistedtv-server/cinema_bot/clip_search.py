@@ -133,41 +133,41 @@ def _parse_clip_results(results: list[dict], limit: int) -> list[dict]:
 
 
 async def _search_clips_legacy(query: str, fetch_limit: int, limit: int) -> list[dict]:
-    """Fallback: search via /search/semantic (scene-based, pre-clips architecture)."""
+    """Fallback: search via /search/text (dialog-based, pre-clips architecture).
+
+    Uses the dialog search endpoint which returns clip_start/clip_end (tight
+    boundaries around spoken text) and dialog_text.  Individual caption lines
+    are fetched from the database for timed subtitle display.
+    """
     try:
         resp = await _http_client.post(
-            f"{GOODCLIPS_API_URL}/api/v1/search/semantic",
+            f"{GOODCLIPS_API_URL}/api/v1/search/text",
             json={"query": query, "limit": fetch_limit},
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
     except Exception as e:
-        logger.error(f"GoodCLIPS search failed: {e}")
+        logger.error(f"GoodCLIPS dialog search failed: {e}")
         return []
 
     if not results:
         return []
 
-    filtered = []
+    clips = []
     for result in results:
-        scene = result.get("scene", {})
-        duration = scene.get("end_time", 0) - scene.get("start_time", 0)
-        if MIN_CLIP_SECS <= duration <= MAX_CLIP_SECS:
-            filtered.append(result)
-        if len(filtered) >= limit:
+        clip_start = result.get("clip_start", 0)
+        clip_end = result.get("clip_end", 0)
+        duration = clip_end - clip_start
+        if not (MIN_CLIP_SECS <= duration <= MAX_CLIP_SECS):
+            continue
+        if len(clips) >= limit:
             break
 
-    if not filtered:
-        logger.warning(f"No clips in {MIN_CLIP_SECS}-{MAX_CLIP_SECS}s range, using shortest available")
-        results.sort(key=lambda r: abs(r.get("scene", {}).get("end_time", 0) - r.get("scene", {}).get("start_time", 0)))
-        filtered = results[:limit]
-
-    clips = []
-    for i, result in enumerate(filtered, 1):
         scene = result.get("scene", {})
         distance = result.get("distance", 0)
         similarity = (1 - distance) * 100 if distance else 0
         video_id = scene.get("video_id")
+        dialog_text = result.get("dialog_text", "")
 
         video_url = ""
         title = "Unknown"
@@ -180,17 +180,17 @@ async def _search_clips_legacy(query: str, fetch_limit: int, limit: int) -> list
         except Exception as e:
             logger.warning(f"Failed to get video info for {video_id}: {e}")
 
-        caption = ""
+        # Fetch individual caption lines for timed subtitles
         timed_captions = []
-        scene_id = scene.get("id")
-        if scene_id and _db_pool:
+        if video_id and _db_pool:
             try:
                 async with _db_pool.acquire() as conn:
                     rows = await conn.fetch(
                         """SELECT text, start_time, end_time FROM captions
-                           WHERE scene_id = $1 AND language = 'en'
+                           WHERE video_id = $1 AND language = 'en'
+                             AND start_time < $3 AND end_time > $2
                            ORDER BY start_time""",
-                        scene_id,
+                        video_id, clip_start, clip_end,
                     )
                     for row in rows:
                         timed_captions.append({
@@ -198,21 +198,19 @@ async def _search_clips_legacy(query: str, fetch_limit: int, limit: int) -> list
                             "start": row["start_time"],
                             "end": row["end_time"],
                         })
-                    if timed_captions:
-                        caption = timed_captions[0]["text"]
             except Exception as e:
-                logger.warning(f"Failed to get captions for scene {scene_id}: {e}")
+                logger.warning(f"Failed to get timed captions: {e}")
 
         clips.append({
-            "rank": i,
+            "rank": len(clips) + 1,
             "video_id": video_id,
             "file": video_url,
-            "start": scene.get("start_time", 0),
-            "end": scene.get("end_time", 0),
-            "duration": round(scene.get("end_time", 0) - scene.get("start_time", 0), 1),
+            "start": clip_start,
+            "end": clip_end,
+            "duration": round(duration, 1),
             "similarity": f"{similarity:.0f}%",
             "title": title,
-            "caption": caption,
+            "caption": dialog_text,
             "captions": timed_captions,
         })
 
