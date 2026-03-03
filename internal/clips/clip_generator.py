@@ -65,6 +65,16 @@ def get_lighthouse_model(device="cuda"):
 
     print(f"  Loading Lighthouse model (features={feature_name})...",
           file=sys.stderr, flush=True)
+
+    # PyTorch 2.6+ defaults torch.load to weights_only=True, but Lighthouse
+    # checkpoints contain easydict.EasyDict which isn't in the safe globals list.
+    import torch
+    try:
+        import easydict
+        torch.serialization.add_safe_globals([easydict.EasyDict])
+    except (ImportError, AttributeError):
+        pass  # older torch or missing easydict — Lighthouse will handle it
+
     _lighthouse_model = CGDETRPredictor(
         weights,
         device=device,
