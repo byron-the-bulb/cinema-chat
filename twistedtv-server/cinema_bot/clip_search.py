@@ -60,11 +60,80 @@ MAX_CLIP_SECS = float(os.getenv("MAX_CLIP_SECS", "20"))
 async def search_clips(query: str, limit: int = 5) -> list[dict]:
     """
     Search for video clips matching a semantic description.
+    Uses /search/clips endpoint (three-lane merge: dialog + CLIP + visual).
+    Falls back to /search/semantic if /search/clips is not available.
     Returns a list of clip dicts with all metadata the LLM needs to pick one.
-    Filters to clips between MIN_CLIP_SECS and MAX_CLIP_SECS.
     """
-    # Request extra results so we still have enough after duration filtering
     fetch_limit = limit * 4
+
+    # Try the new clips endpoint first
+    try:
+        resp = await _http_client.post(
+            f"{GOODCLIPS_API_URL}/api/v1/search/clips",
+            json={"query": query, "limit": fetch_limit},
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return _parse_clip_results(results, limit)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            logger.info("clips endpoint not available, falling back to /search/semantic")
+        else:
+            logger.error(f"clips search failed: {e}")
+            return []
+    except Exception as e:
+        logger.warning(f"clips search failed, falling back to /search/semantic: {e}")
+
+    # Fallback to legacy scene-based search
+    return await _search_clips_legacy(query, fetch_limit, limit)
+
+
+def _parse_clip_results(results: list[dict], limit: int) -> list[dict]:
+    """Parse results from the /search/clips endpoint."""
+    clips = []
+    for i, result in enumerate(results, 1):
+        clip_data = result.get("clip", {})
+        video_data = result.get("video", {})
+        score = result.get("score", 0)
+        duration = clip_data.get("duration", 0)
+
+        if not (MIN_CLIP_SECS <= duration <= MAX_CLIP_SECS):
+            continue
+        if len(clips) >= limit:
+            break
+
+        video_url = ""
+        filepath = video_data.get("filepath", "")
+        if filepath:
+            video_url = _build_video_url(filepath)
+
+        title_val = video_data.get("title")
+        if isinstance(title_val, str):
+            title = title_val
+        elif title_val is None:
+            title = "Unknown"
+        else:
+            title = str(title_val)
+
+        clips.append({
+            "rank": len(clips) + 1,
+            "video_id": clip_data.get("video_id"),
+            "file": video_url,
+            "start": clip_data.get("start_time", 0),
+            "end": clip_data.get("end_time", 0),
+            "duration": round(duration, 1),
+            "similarity": f"{score * 100:.0f}%",
+            "title": title,
+            "caption": clip_data.get("label", ""),
+            "clip_type": clip_data.get("clip_type", ""),
+            "captions": [],
+        })
+
+    return clips
+
+
+async def _search_clips_legacy(query: str, fetch_limit: int, limit: int) -> list[dict]:
+    """Fallback: search via /search/semantic (scene-based, pre-clips architecture)."""
     try:
         resp = await _http_client.post(
             f"{GOODCLIPS_API_URL}/api/v1/search/semantic",
@@ -79,7 +148,6 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
     if not results:
         return []
 
-    # Pre-filter by duration before doing expensive lookups
     filtered = []
     for result in results:
         scene = result.get("scene", {})
@@ -91,7 +159,6 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
 
     if not filtered:
         logger.warning(f"No clips in {MIN_CLIP_SECS}-{MAX_CLIP_SECS}s range, using shortest available")
-        # Fallback: sort by duration and take shortest ones
         results.sort(key=lambda r: abs(r.get("scene", {}).get("end_time", 0) - r.get("scene", {}).get("start_time", 0)))
         filtered = results[:limit]
 
@@ -102,7 +169,6 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
         similarity = (1 - distance) * 100 if distance else 0
         video_id = scene.get("video_id")
 
-        # Get video info for file path
         video_url = ""
         title = "Unknown"
         try:
@@ -114,7 +180,6 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
         except Exception as e:
             logger.warning(f"Failed to get video info for {video_id}: {e}")
 
-        # Get dialogue captions from database (WhisperX audio transcriptions)
         caption = ""
         timed_captions = []
         scene_id = scene.get("id")
@@ -162,7 +227,9 @@ def format_clips_for_llm(clips: list[dict]) -> str:
     lines = []
     for c in clips:
         caption_short = c["caption"][:120] + "..." if len(c["caption"]) > 120 else c["caption"]
+        clip_type = c.get("clip_type", "")
+        type_tag = f" [{clip_type}]" if clip_type else ""
         lines.append(
-            f'{c["rank"]}. [{c["title"]}] {c["duration"]}s | {c["similarity"]} | "{caption_short}"'
+            f'{c["rank"]}. [{c["title"]}]{type_tag} {c["duration"]}s | {c["similarity"]} | "{caption_short}"'
         )
     return "\n".join(lines)

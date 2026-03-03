@@ -142,6 +142,35 @@ type Caption struct {
 	Scene *Scene `json:"scene,omitempty" gorm:"foreignKey:SceneID"`
 }
 
+// Clip represents a curated playable moment (dialog or visual).
+// Dialog clips reference captions; visual clips come from Lighthouse highlight detection.
+type Clip struct {
+	ID              uint             `json:"id" gorm:"primaryKey"`
+	UUID            string           `json:"uuid" gorm:"type:uuid;default:uuid_generate_v4();unique;not null"`
+	VideoID         uint             `json:"video_id" gorm:"not null"`
+	ClipType        string           `json:"clip_type" gorm:"size:16;not null"`
+	SourceSceneID   *uint            `json:"source_scene_id"`
+	SourceCaptionID *uint            `json:"source_caption_id"`
+	StartTime       float64          `json:"start_time" gorm:"not null"`
+	EndTime         float64          `json:"end_time" gorm:"not null"`
+	Duration        float64          `json:"duration" gorm:"<-:false;computed:end_time - start_time"`
+	Label           string           `json:"label" gorm:"default:''"`
+	SalienceScore   float64          `json:"salience_score" gorm:"default:0.5"`
+
+	DialogEmbedding *pgvector.Vector `json:"dialog_embedding,omitempty" gorm:"type:vector(768)"`
+	VisualEmbedding *pgvector.Vector `json:"visual_embedding,omitempty" gorm:"type:vector(1024)"`
+	ClipEmbedding   *pgvector.Vector `json:"clip_embedding,omitempty" gorm:"type:vector(512)"`
+	AudioEmbedding  *pgvector.Vector `json:"audio_embedding,omitempty" gorm:"type:vector(512)"`
+
+	Metadata  JSONObject `json:"metadata" gorm:"type:jsonb;default:'{}'"`
+	CreatedAt time.Time  `json:"created_at"`
+
+	// Relationships
+	Video   Video    `json:"video,omitempty" gorm:"foreignKey:VideoID"`
+	Scene   *Scene   `json:"scene,omitempty" gorm:"foreignKey:SourceSceneID"`
+	Caption *Caption `json:"caption,omitempty" gorm:"foreignKey:SourceCaptionID"`
+}
+
 // ProcessingJob represents background processing tasks
 type ProcessingJob struct {
 	ID          uint            `json:"id" gorm:"primaryKey"`
@@ -168,6 +197,7 @@ const (
 	JobTypeSceneDetection      JobType = "scene_detection"
 	JobTypeCaptionExtraction   JobType = "caption_extraction"
 	JobTypeEmbeddingGeneration JobType = "embedding_generation"
+	JobTypeClipGeneration      JobType = "clip_generation"
 )
 
 // JobStatus represents the processing status of a job
@@ -250,6 +280,10 @@ func (Scene) TableName() string {
 
 func (Caption) TableName() string {
 	return "captions"
+}
+
+func (Clip) TableName() string {
+	return "clips"
 }
 
 func (ProcessingJob) TableName() string {

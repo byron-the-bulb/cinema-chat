@@ -144,6 +144,27 @@ export KEYFRAME_TIMEOUT_SECS="${KEYFRAME_TIMEOUT_SECS:-60}"
 export HF_HOME="${WORKSPACE}/huggingface"
 mkdir -p "${HF_HOME}"
 
+# ============================================
+# Lighthouse weights (cached in /workspace)
+# ============================================
+LIGHTHOUSE_DIR="${WORKSPACE}/lighthouse_weights"
+mkdir -p "${LIGHTHOUSE_DIR}"
+
+if [ ! -f "${LIGHTHOUSE_DIR}/clip_slowfast_cg_detr_qvhighlight.ckpt" ]; then
+    echo "Downloading Lighthouse CG-DETR weights..."
+    wget -q --show-progress -O "${LIGHTHOUSE_DIR}/clip_slowfast_cg_detr_qvhighlight.ckpt" \
+        https://zenodo.org/records/13960580/files/clip_slowfast_cg_detr_qvhighlight.ckpt
+fi
+if [ ! -f "${LIGHTHOUSE_DIR}/SLOWFAST_8x8_R50.pkl" ]; then
+    echo "Downloading SlowFast R50 weights..."
+    wget -q --show-progress -O "${LIGHTHOUSE_DIR}/SLOWFAST_8x8_R50.pkl" \
+        https://dl.fbaipublicfiles.com/pyslowfast/model_zoo/kinetics400/SLOWFAST_8x8_R50.pkl
+fi
+
+export LIGHTHOUSE_WEIGHTS="${LIGHTHOUSE_DIR}/clip_slowfast_cg_detr_qvhighlight.ckpt"
+export SLOWFAST_WEIGHTS="${LIGHTHOUSE_DIR}/SLOWFAST_8x8_R50.pkl"
+export LIGHTHOUSE_FEATURES="${LIGHTHOUSE_FEATURES:-clip_slowfast}"
+
 ln -sfn "${VIDEOS_DIR}" /data/videos 2>/dev/null || mkdir -p /data/videos
 
 echo ""

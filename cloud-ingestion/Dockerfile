@@ -53,7 +53,13 @@ RUN python3 -m pip install --upgrade pip \
          decord av opencv-python-headless timm huggingface-hub \
          transformers==4.52.1 einops accelerate scenedetect \
          open-clip-torch pillow safetensors librosa audioread \
-         faster-whisper whisperx
+         faster-whisper whisperx \
+    && pip install --no-cache-dir --no-deps \
+         'git+https://github.com/openai/CLIP.git' \
+         'git+https://github.com/line/lighthouse.git' \
+    && pip install --no-cache-dir \
+         easydict pandas tqdm pyyaml scikit-learn ffmpeg-python \
+         ftfy regex fvcore torchlibrosa msclap
 
 WORKDIR /root/
 
@@ -63,11 +69,12 @@ COPY --from=builder /app/goodclips .
 # Copy Python scripts
 COPY --from=builder /app/internal/scenedetect/ ./internal/scenedetect/
 COPY --from=builder /app/internal/embeddings/ ./internal/embeddings/
+COPY --from=builder /app/internal/clips/ ./internal/clips/
 
 # Copy database migrations
 COPY --from=builder /app/migrations/ ./migrations/
 
-RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py
+RUN chmod +x ./internal/scenedetect/*.py ./internal/embeddings/*.py ./internal/clips/*.py
 
 # Copy scripts (from cloud-ingestion subdirectory)
 COPY cloud-ingestion/entrypoint.sh /entrypoint.sh

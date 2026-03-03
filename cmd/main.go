@@ -102,6 +102,7 @@ func main() {
         v1.POST("/search/scenes", searchScenesByAnchor)
         v1.POST("/search/semantic", searchSemantic)
         v1.POST("/search/text", searchText)
+        v1.POST("/search/clips", searchClips)
 
         // File transfer — GET lets process-movie.sh pull SRT sidecars from
         // the RunPod instance; PUT lets it upload local video files to the pod.
@@ -276,6 +277,204 @@ func searchText(c *gin.Context) {
         "count":   len(items),
         "results": items,
     })
+}
+
+// searchClips searches the clips table using three parallel lanes:
+// 1. Dialog: e5-base-v2(query) → dialog_embedding on dialog clips
+// 2. CLIP cross-modal: CLIP-text(query) → clip_embedding on all clips
+// 3. Visual description: e5-base-v2(query) → visual_embedding on visual clips (TODO: needs text_embedding column)
+// Results are merged by normalized distance, deduplicated, and returned as top K.
+func searchClips(c *gin.Context) {
+    var req struct {
+        Query    string   `json:"query"`
+        VideoIDs []uint   `json:"video_ids"`
+        Limit    int      `json:"limit"`
+        ClipTypes []string `json:"clip_types"` // optional filter: ["dialog"], ["visual"], or both
+    }
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid search request", "details": err.Error()})
+        return
+    }
+    if req.Query == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "query is required"})
+        return
+    }
+    limit := req.Limit
+    if limit <= 0 {
+        limit = 10
+    }
+    if limit > 100 {
+        limit = 100
+    }
+
+    // Lane 1: embed query with e5-base-v2 for dialog search
+    e5Vec, e5Err := embedTextQuery(req.Query)
+
+    // Lane 2: embed query with CLIP text encoder for cross-modal search
+    clipVec, clipErr := embedClipTextQuery(req.Query)
+
+    // Collect results from each lane
+    type scored struct {
+        Result database.ClipSearchResult
+        Score  float64
+    }
+    seen := make(map[uint]scored)    // clip ID → best result
+    fetchLimit := limit * 3          // fetch more per lane, merge later
+
+    // Lane 1: dialog embedding search
+    if e5Err == nil {
+        results, err := db.SearchClipsByDialogVector(e5Vec, fetchLimit, req.VideoIDs)
+        if err != nil {
+            log.Printf("Warning: dialog lane search failed: %v", err)
+        } else {
+            maxDist := 0.0
+            for _, r := range results {
+                if r.Distance > maxDist {
+                    maxDist = r.Distance
+                }
+            }
+            if maxDist <= 0 {
+                maxDist = 1.0
+            }
+            for _, r := range results {
+                score := 1.0 - (r.Distance / maxDist)
+                if existing, ok := seen[r.Clip.ID]; !ok || score > existing.Score {
+                    seen[r.Clip.ID] = scored{Result: r, Score: score}
+                }
+            }
+        }
+    } else {
+        log.Printf("Warning: e5 embedding failed: %v", e5Err)
+    }
+
+    // Lane 2: CLIP cross-modal search
+    if clipErr == nil {
+        results, err := db.SearchClipsByClipVector(clipVec, fetchLimit, req.VideoIDs)
+        if err != nil {
+            log.Printf("Warning: CLIP lane search failed: %v", err)
+        } else {
+            maxDist := 0.0
+            for _, r := range results {
+                if r.Distance > maxDist {
+                    maxDist = r.Distance
+                }
+            }
+            if maxDist <= 0 {
+                maxDist = 1.0
+            }
+            for _, r := range results {
+                score := 1.0 - (r.Distance / maxDist)
+                if existing, ok := seen[r.Clip.ID]; !ok || score > existing.Score {
+                    seen[r.Clip.ID] = scored{Result: r, Score: score}
+                }
+            }
+        }
+    } else {
+        log.Printf("Warning: CLIP text embedding failed (lane 2 skipped): %v", clipErr)
+    }
+
+    // Lane 3: visual embedding search (uses e5 vector against visual_embedding)
+    // TODO: this lane will search a text_embedding column on visual clips
+    // once IV2 description embeddings are stored per clip. Skipping for now.
+
+    // Sort by score descending, take top K
+    sorted := make([]scored, 0, len(seen))
+    for _, s := range seen {
+        sorted = append(sorted, s)
+    }
+    // Sort descending by score
+    for i := 0; i < len(sorted); i++ {
+        for j := i + 1; j < len(sorted); j++ {
+            if sorted[j].Score > sorted[i].Score {
+                sorted[i], sorted[j] = sorted[j], sorted[i]
+            }
+        }
+    }
+    if len(sorted) > limit {
+        sorted = sorted[:limit]
+    }
+
+    // Build response
+    items := make([]gin.H, 0, len(sorted))
+    for _, s := range sorted {
+        clip := s.Result.Clip
+
+        // Fetch video info
+        videoInfo := gin.H{}
+        if v, err := db.GetVideoByID(clip.VideoID); err == nil {
+            videoInfo = gin.H{
+                "id":       v.ID,
+                "filename": v.Filename,
+                "filepath": v.Filepath,
+                "title":    v.Title,
+            }
+        }
+
+        items = append(items, gin.H{
+            "clip": gin.H{
+                "id":               clip.ID,
+                "uuid":             clip.UUID,
+                "video_id":         clip.VideoID,
+                "clip_type":        clip.ClipType,
+                "start_time":       clip.StartTime,
+                "end_time":         clip.EndTime,
+                "duration":         clip.Duration,
+                "label":            clip.Label,
+                "salience_score":   clip.SalienceScore,
+                "source_scene_id":  clip.SourceSceneID,
+                "source_caption_id": clip.SourceCaptionID,
+            },
+            "video":        videoInfo,
+            "score":        s.Score,
+            "matched_lane": s.Result.Lane,
+        })
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "query":   req.Query,
+        "limit":   limit,
+        "count":   len(items),
+        "results": items,
+    })
+}
+
+// embedClipTextQuery encodes a text query using CLIP's text encoder (ViT-B/32)
+// for cross-modal text→image search. Returns a 512-D vector.
+func embedClipTextQuery(query string) ([]float32, error) {
+    clipURL := os.Getenv("CLIP_EMBEDDING_URL")
+    if clipURL == "" {
+        clipURL = "http://localhost:8091"
+    }
+
+    payload := map[string]any{
+        "text": query,
+        "mode": "text",
+    }
+    b, _ := json.Marshal(payload)
+
+    resp, err := http.Post(clipURL+"/embed", "application/json", bytes.NewReader(b))
+    if err != nil {
+        return nil, fmt.Errorf("CLIP embedding service request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    body, _ := io.ReadAll(resp.Body)
+    if resp.StatusCode != 200 {
+        return nil, fmt.Errorf("CLIP embedding service returned %d: %s", resp.StatusCode, string(body))
+    }
+
+    var result struct {
+        Model        string    `json:"model"`
+        EmbeddingDim int       `json:"embedding_dim"`
+        Vector       []float32 `json:"vector"`
+    }
+    if err := json.Unmarshal(body, &result); err != nil {
+        return nil, fmt.Errorf("failed to parse CLIP embedding response: %v", err)
+    }
+    if len(result.Vector) == 0 {
+        return nil, fmt.Errorf("empty CLIP embedding returned")
+    }
+    return result.Vector, nil
 }
 
 // uploadFile accepts a raw PUT body and saves it to the videos directory.
@@ -523,6 +722,8 @@ func runWorker() {
             err = processCaptionExtractionJob(job)
         case queue.JobTypeEmbeddingGeneration:
             err = processEmbeddingGenerationJob(job)
+        case queue.JobTypeClipGeneration:
+            err = processClipGenerationJob(job)
         default:
             errMsg := fmt.Sprintf("Unknown job type: %s", job.Type)
             jobQueue.UpdateJobStatus(job.ID, queue.JobStatusFailed, 0, &errMsg)
@@ -557,6 +758,10 @@ func processCaptionExtractionJob(job *queue.Job) error {
 
 func processEmbeddingGenerationJob(job *queue.Job) error {
     return videoProcessor.ProcessEmbeddingGeneration(job.Payload)
+}
+
+func processClipGenerationJob(job *queue.Job) error {
+    return videoProcessor.ProcessClipGeneration(job.Payload)
 }
 
 // Middleware

@@ -30,6 +30,7 @@ const (
 	JobTypeSceneDetection      JobType = "scene_detection"
 	JobTypeCaptionExtraction   JobType = "caption_extraction"
 	JobTypeEmbeddingGeneration JobType = "embedding_generation"
+	JobTypeClipGeneration      JobType = "clip_generation"
 	JobTypeVideoAnalysis       JobType = "video_analysis"
 )
 
@@ -147,6 +148,7 @@ func (q *Queue) DequeueAny(jobTypes []JobType) (*Job, error) {
             fmt.Sprintf("jobs:%s", JobTypeSceneDetection),
             fmt.Sprintf("jobs:%s", JobTypeCaptionExtraction),
             fmt.Sprintf("jobs:%s", JobTypeEmbeddingGeneration),
+            fmt.Sprintf("jobs:%s", JobTypeClipGeneration),
             fmt.Sprintf("jobs:%s", JobTypeVideoAnalysis),
         }
     }

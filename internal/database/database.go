@@ -244,6 +244,10 @@ func (db *DB) GetStats() (models.DatabaseStats, error) {
     if err := db.Model(&models.Scene{}).Where("visual_embedding IS NOT NULL").Count(&n).Error; err == nil {
         stats.ScenesWithEmbeddings = int(n)
     }
+    n = 0
+    if err := db.Model(&models.Caption{}).Count(&n).Error; err == nil {
+        stats.TotalCaptions = int(n)
+    }
     f = 0
     if err := db.Model(&models.Video{}).Select("COALESCE(SUM(duration), 0)").Scan(&f).Error; err == nil {
         stats.TotalDurationSeconds = f
