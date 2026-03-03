@@ -41,8 +41,19 @@ if [ ! -f "${INIT_MARKER}" ]; then
     # Initialize as postgres user
     cd /tmp && su postgres -c "/usr/lib/postgresql/14/bin/initdb -D ${PGDATA}"
 
-    # Configure for remote access
-    echo "listen_addresses = '*'" >> "${PGDATA}/postgresql.conf"
+    # Configure for remote access + heavy vector write workload
+    cat >> "${PGDATA}/postgresql.conf" <<PGCONF
+listen_addresses = '*'
+shared_buffers = 512MB
+work_mem = 16MB
+maintenance_work_mem = 256MB
+max_wal_size = 4GB
+min_wal_size = 1GB
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9
+wal_buffers = 64MB
+effective_cache_size = 1GB
+PGCONF
     echo "host all all 0.0.0.0/0 md5" >> "${PGDATA}/pg_hba.conf"
     touch "${INIT_MARKER}"
     INIT_DB=true
@@ -52,6 +63,16 @@ else
     chown -R postgres:postgres /var/lib/postgresql 2>/dev/null || true
     INIT_DB=false
 fi
+
+# Always ensure PostgreSQL is tuned for heavy vector writes (idempotent)
+for param in "shared_buffers = 512MB" "work_mem = 16MB" "maintenance_work_mem = 256MB" \
+             "max_wal_size = 4GB" "min_wal_size = 1GB" "checkpoint_timeout = 15min" \
+             "checkpoint_completion_target = 0.9" "wal_buffers = 64MB" "effective_cache_size = 1GB"; do
+    key="${param%% =*}"
+    if ! grep -q "^${key} " "${PGDATA}/postgresql.conf" 2>/dev/null; then
+        echo "${param}" >> "${PGDATA}/postgresql.conf"
+    fi
+done
 
 # Start PostgreSQL as postgres user
 echo "Starting PostgreSQL..."
