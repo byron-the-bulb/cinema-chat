@@ -286,10 +286,14 @@ func searchText(c *gin.Context) {
 // Results are merged by normalized distance, deduplicated, and returned as top K.
 func searchClips(c *gin.Context) {
     var req struct {
-        Query    string   `json:"query"`
-        VideoIDs []uint   `json:"video_ids"`
-        Limit    int      `json:"limit"`
-        ClipTypes []string `json:"clip_types"` // optional filter: ["dialog"], ["visual"], or both
+        Query        string   `json:"query"`
+        DialogQuery  string   `json:"dialog_query"`  // optional: separate query for dialog lane
+        VisualQuery  string   `json:"visual_query"`  // optional: separate query for CLIP/visual lane
+        VideoIDs     []uint   `json:"video_ids"`
+        Limit        int      `json:"limit"`
+        ClipTypes    []string `json:"clip_types"`     // optional filter: ["dialog"], ["visual"], or both
+        DialogWeight *float64 `json:"dialog_weight"`  // weight for dialog lane (default 1.0)
+        VisualWeight *float64 `json:"visual_weight"`  // weight for CLIP/visual lane (default 1.0)
     }
     if err := c.ShouldBindJSON(&req); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid search request", "details": err.Error()})
@@ -307,22 +311,52 @@ func searchClips(c *gin.Context) {
         limit = 100
     }
 
+    // Lane weights (default 1.0 each)
+    dialogWeight := 1.0
+    visualWeight := 1.0
+    if req.DialogWeight != nil {
+        dialogWeight = *req.DialogWeight
+    }
+    if req.VisualWeight != nil {
+        visualWeight = *req.VisualWeight
+    }
+
+    // Per-lane queries (fall back to main query)
+    dialogQuery := req.Query
+    if req.DialogQuery != "" {
+        dialogQuery = req.DialogQuery
+    }
+    visualQuery := req.Query
+    if req.VisualQuery != "" {
+        visualQuery = req.VisualQuery
+    }
+
     // Lane 1: embed query with e5-base-v2 for dialog search
-    e5Vec, e5Err := embedTextQuery(req.Query)
+    var e5Vec []float32
+    var e5Err error
+    if dialogWeight > 0 {
+        e5Vec, e5Err = embedTextQuery(dialogQuery)
+    }
 
     // Lane 2: embed query with CLIP text encoder for cross-modal search
-    clipVec, clipErr := embedClipTextQuery(req.Query)
-
-    // Collect results from each lane
-    type scored struct {
-        Result database.ClipSearchResult
-        Score  float64
+    var clipVec []float32
+    var clipErr error
+    if visualWeight > 0 {
+        clipVec, clipErr = embedClipTextQuery(visualQuery)
     }
-    seen := make(map[uint]scored)    // clip ID → best result
-    fetchLimit := limit * 3          // fetch more per lane, merge later
+
+    // Collect per-lane scores for weighted merging
+    type laneScores struct {
+        DialogScore float64
+        ClipScore   float64
+        BestResult  database.ClipSearchResult
+        BestLane    string
+    }
+    clips := make(map[uint]*laneScores) // clip ID → scores
+    fetchLimit := limit * 3              // fetch more per lane, merge later
 
     // Lane 1: dialog embedding search
-    if e5Err == nil {
+    if dialogWeight > 0 && e5Err == nil {
         results, err := db.SearchClipsByDialogVector(e5Vec, fetchLimit, req.VideoIDs)
         if err != nil {
             log.Printf("Warning: dialog lane search failed: %v", err)
@@ -338,17 +372,27 @@ func searchClips(c *gin.Context) {
             }
             for _, r := range results {
                 score := 1.0 - (r.Distance / maxDist)
-                if existing, ok := seen[r.Clip.ID]; !ok || score > existing.Score {
-                    seen[r.Clip.ID] = scored{Result: r, Score: score}
+                if existing, ok := clips[r.Clip.ID]; ok {
+                    existing.DialogScore = score
+                    if score > existing.ClipScore {
+                        existing.BestResult = r
+                        existing.BestLane = "dialog"
+                    }
+                } else {
+                    clips[r.Clip.ID] = &laneScores{
+                        DialogScore: score,
+                        BestResult:  r,
+                        BestLane:    "dialog",
+                    }
                 }
             }
         }
-    } else {
+    } else if dialogWeight > 0 {
         log.Printf("Warning: e5 embedding failed: %v", e5Err)
     }
 
     // Lane 2: CLIP cross-modal search
-    if clipErr == nil {
+    if visualWeight > 0 && clipErr == nil {
         results, err := db.SearchClipsByClipVector(clipVec, fetchLimit, req.VideoIDs)
         if err != nil {
             log.Printf("Warning: CLIP lane search failed: %v", err)
@@ -364,12 +408,22 @@ func searchClips(c *gin.Context) {
             }
             for _, r := range results {
                 score := 1.0 - (r.Distance / maxDist)
-                if existing, ok := seen[r.Clip.ID]; !ok || score > existing.Score {
-                    seen[r.Clip.ID] = scored{Result: r, Score: score}
+                if existing, ok := clips[r.Clip.ID]; ok {
+                    existing.ClipScore = score
+                    if score > existing.DialogScore {
+                        existing.BestResult = r
+                        existing.BestLane = "clip"
+                    }
+                } else {
+                    clips[r.Clip.ID] = &laneScores{
+                        ClipScore:  score,
+                        BestResult: r,
+                        BestLane:   "clip",
+                    }
                 }
             }
         }
-    } else {
+    } else if visualWeight > 0 {
         log.Printf("Warning: CLIP text embedding failed (lane 2 skipped): %v", clipErr)
     }
 
@@ -377,10 +431,24 @@ func searchClips(c *gin.Context) {
     // TODO: this lane will search a text_embedding column on visual clips
     // once IV2 description embeddings are stored per clip. Skipping for now.
 
-    // Sort by score descending, take top K
-    sorted := make([]scored, 0, len(seen))
-    for _, s := range seen {
-        sorted = append(sorted, s)
+    // Compute weighted combined score per clip
+    type scored struct {
+        Result database.ClipSearchResult
+        Score  float64
+        Lane   string
+    }
+    totalWeight := dialogWeight + visualWeight
+    if totalWeight <= 0 {
+        totalWeight = 1.0
+    }
+    sorted := make([]scored, 0, len(clips))
+    for _, ls := range clips {
+        combinedScore := (dialogWeight*ls.DialogScore + visualWeight*ls.ClipScore) / totalWeight
+        sorted = append(sorted, scored{
+            Result: ls.BestResult,
+            Score:  combinedScore,
+            Lane:   ls.BestLane,
+        })
     }
     // Sort descending by score
     for i := 0; i < len(sorted); i++ {
@@ -426,7 +494,7 @@ func searchClips(c *gin.Context) {
             },
             "video":        videoInfo,
             "score":        s.Score,
-            "matched_lane": s.Result.Lane,
+            "matched_lane": s.Lane,
         })
     }
 

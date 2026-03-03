@@ -108,11 +108,22 @@ async def search_video_clips_handler(args: FlowArgs, flow_manager: FlowManager) 
         return FlowResult(error="No description provided")
 
     try:
+        # Build MCP call arguments with optional weight/query overrides
+        mcp_args = {"description": description, "limit": limit}
+        if "dialog_weight" in args:
+            mcp_args["dialog_weight"] = args["dialog_weight"]
+        if "visual_weight" in args:
+            mcp_args["visual_weight"] = args["visual_weight"]
+        if "dialog_query" in args:
+            mcp_args["dialog_query"] = args["dialog_query"]
+        if "visual_query" in args:
+            mcp_args["visual_query"] = args["visual_query"]
+
         # Get the MCP client and call the search tool
         mcp_client = await get_mcp_client()
         result_json = await mcp_client.call_tool(
             "search_video_clips",
-            {"description": description, "limit": limit}
+            mcp_args
         )
 
         # Parse JSON response
@@ -315,7 +326,7 @@ def get_flow_config() -> FlowConfig:
                 functions=[
                     FlowsFunctionSchema(
                         name="search_video_clips",
-                        description="Search for video clips matching a description. Returns multiple options for you to choose from. This does NOT play anything.",
+                        description="Search for video clips matching a description. Returns multiple options for you to choose from. This does NOT play anything. Use dialog_weight/visual_weight to control the balance between dialog (spoken words) and visual (scene content) matching.",
                         handler=search_video_clips_handler,
                         properties={
                             "description": {
@@ -325,8 +336,24 @@ def get_flow_config() -> FlowConfig:
                             "limit": {
                                 "type": "number",
                                 "description": "Number of video options to return (default: 5)",
-                                "default": 5
-                            }
+                                "default": 5,
+                            },
+                            "dialog_weight": {
+                                "type": "number",
+                                "description": "Weight for dialog/speech matching (0-2, default 1.0). Set higher when searching for specific spoken lines.",
+                            },
+                            "visual_weight": {
+                                "type": "number",
+                                "description": "Weight for visual/scene content matching (0-2, default 1.0). Set higher when searching for visual actions or scenery.",
+                            },
+                            "dialog_query": {
+                                "type": "string",
+                                "description": "Optional separate query for dialog search. Use when the spoken words you want differ from the visual scene.",
+                            },
+                            "visual_query": {
+                                "type": "string",
+                                "description": "Optional separate query for visual search. Use when the visual scene differs from the dialog.",
+                            },
                         },
                         required=["description"],
                     ),
@@ -376,7 +403,7 @@ def create_initial_node() -> NodeConfig:
         "functions": [
             FlowsFunctionSchema(
                 name="search_video_clips",
-                description="Search for video clips matching a description. Returns multiple options with captions for you to choose from. This does NOT play anything.",
+                description="Search for video clips matching a description. Returns multiple options with captions for you to choose from. This does NOT play anything. Use dialog_weight/visual_weight to control the balance between dialog (spoken words) and visual (scene content) matching.",
                 handler=search_video_clips_handler,
                 properties={
                     "description": {
@@ -386,8 +413,24 @@ def create_initial_node() -> NodeConfig:
                     "limit": {
                         "type": "number",
                         "description": "Number of video options to return (default: 5)",
-                        "default": 5
-                    }
+                        "default": 5,
+                    },
+                    "dialog_weight": {
+                        "type": "number",
+                        "description": "Weight for dialog/speech matching (0-2, default 1.0). Set higher when searching for specific spoken lines.",
+                    },
+                    "visual_weight": {
+                        "type": "number",
+                        "description": "Weight for visual/scene content matching (0-2, default 1.0). Set higher when searching for visual actions or scenery.",
+                    },
+                    "dialog_query": {
+                        "type": "string",
+                        "description": "Optional separate query for dialog search. Use when the spoken words you want differ from the visual scene.",
+                    },
+                    "visual_query": {
+                        "type": "string",
+                        "description": "Optional separate query for visual search. Use when the visual scene differs from the dialog.",
+                    },
                 },
                 required=["description"],
             ),

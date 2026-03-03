@@ -57,20 +57,45 @@ MIN_CLIP_SECS = float(os.getenv("MIN_CLIP_SECS", "2"))
 MAX_CLIP_SECS = float(os.getenv("MAX_CLIP_SECS", "20"))
 
 
-async def search_clips(query: str, limit: int = 5) -> list[dict]:
+async def search_clips(
+    query: str,
+    limit: int = 5,
+    dialog_weight: Optional[float] = None,
+    visual_weight: Optional[float] = None,
+    dialog_query: Optional[str] = None,
+    visual_query: Optional[str] = None,
+) -> list[dict]:
     """
     Search for video clips matching a semantic description.
     Uses /search/clips endpoint (three-lane merge: dialog + CLIP + visual).
-    Falls back to /search/semantic if /search/clips is not available.
-    Returns a list of clip dicts with all metadata the LLM needs to pick one.
+    Falls back to /search/text if /search/clips is not available.
+
+    Args:
+        query: Main search query (used for all lanes unless overridden).
+        limit: Max results to return.
+        dialog_weight: Weight for dialog lane (0-2, default 1.0). Higher = prefer dialog matches.
+        visual_weight: Weight for visual/CLIP lane (0-2, default 1.0). Higher = prefer visual matches.
+        dialog_query: Optional separate query for dialog search lane.
+        visual_query: Optional separate query for visual/CLIP search lane.
     """
     fetch_limit = limit * 4
+
+    # Build request payload with optional weight/query overrides
+    payload = {"query": query, "limit": fetch_limit}
+    if dialog_weight is not None:
+        payload["dialog_weight"] = dialog_weight
+    if visual_weight is not None:
+        payload["visual_weight"] = visual_weight
+    if dialog_query:
+        payload["dialog_query"] = dialog_query
+    if visual_query:
+        payload["visual_query"] = visual_query
 
     # Try the new clips endpoint first
     try:
         resp = await _http_client.post(
             f"{GOODCLIPS_API_URL}/api/v1/search/clips",
-            json={"query": query, "limit": fetch_limit},
+            json=payload,
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])

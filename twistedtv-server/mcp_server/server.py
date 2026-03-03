@@ -163,7 +163,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_video_clips",
-            description="Search for video clips matching a description WITHOUT playing them. Returns multiple options for the LLM to choose from.",
+            description="Search for video clips matching a description WITHOUT playing them. Returns multiple options for the LLM to choose from. Supports weighted search: use dialog_weight/visual_weight to control the balance between dialog (spoken words) and visual (scene content) matching.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -175,6 +175,22 @@ async def list_tools() -> list[Tool]:
                         "type": "number",
                         "description": f"Maximum number of results (default: {settings.default_search_limit})",
                         "default": settings.default_search_limit,
+                    },
+                    "dialog_weight": {
+                        "type": "number",
+                        "description": "Weight for dialog/speech matching (0-2, default 1.0). Set higher when searching for specific spoken lines.",
+                    },
+                    "visual_weight": {
+                        "type": "number",
+                        "description": "Weight for visual/scene content matching (0-2, default 1.0). Set higher when searching for visual actions or scenery.",
+                    },
+                    "dialog_query": {
+                        "type": "string",
+                        "description": "Optional separate query for dialog search. Use when the spoken words you want differ from the visual scene description.",
+                    },
+                    "visual_query": {
+                        "type": "string",
+                        "description": "Optional separate query for visual search. Use when the visual scene you want differs from the dialog.",
                     },
                 },
                 "required": ["description"],
@@ -316,9 +332,34 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     elif name == "search_video_clips":
         description = arguments.get("description")
         limit = arguments.get("limit", settings.default_search_limit)
+        dialog_weight = arguments.get("dialog_weight")
+        visual_weight = arguments.get("visual_weight")
+        dialog_query = arguments.get("dialog_query")
+        visual_query = arguments.get("visual_query")
 
-        # Search GoodCLIPS for matching scenes
-        results = await search_goodclips(description, limit)
+        # Build /search/clips request with optional weights
+        payload = {"query": description, "limit": limit}
+        if dialog_weight is not None:
+            payload["dialog_weight"] = dialog_weight
+        if visual_weight is not None:
+            payload["visual_weight"] = visual_weight
+        if dialog_query:
+            payload["dialog_query"] = dialog_query
+        if visual_query:
+            payload["visual_query"] = visual_query
+
+        # Search via /search/clips (multi-lane: dialog + CLIP + visual)
+        try:
+            response = await http_client.post(
+                f"{GOODCLIPS_API_URL}/api/v1/search/clips",
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+        except Exception as e:
+            print(f"Error searching clips: {e}", file=__import__('sys').stderr)
+            results = []
 
         if not results:
             return [
@@ -333,32 +374,31 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 )
             ]
 
-        # Build response with video details
+        # Build response from clip results
         videos = []
         for i, result in enumerate(results, 1):
-            scene = result.get("scene", {})
-            distance = result.get("distance", 0)
-            similarity = (1 - distance) * 100 if distance else 0
+            clip = result.get("clip", {})
+            video = result.get("video", {})
+            score = result.get("score", 0)
 
-            # Get video info
-            video_info = await get_video_info(scene.get("video_id"))
-            video_url = build_video_url(video_info.get("filepath", "")) if video_info else ""
+            video_url = ""
+            filepath = video.get("filepath", "")
+            if filepath:
+                video_url = build_video_url(filepath)
 
-            # Fetch caption (visual description) directly from database
-            scene_id = scene.get("id")
-            caption = await get_caption_for_scene(scene_id) if scene_id else ""
             videos.append({
                 "rank": i,
-                "video_id": scene.get("video_id"),
-                "scene_index": scene.get("scene_index"),
+                "video_id": clip.get("video_id"),
                 "file": video_url,
-                "start": scene.get("start_time", 0),
-                "end": scene.get("end_time", 0),
-                "duration": scene.get("end_time", 0) - scene.get("start_time", 0),
-                "similarity": f"{similarity:.1f}%",
-                "title": video_info.get("title", "Unknown") if video_info else "Unknown",
-                "caption": caption,
-                "description": caption  # Include as 'description' for handler compatibility
+                "start": clip.get("start_time", 0),
+                "end": clip.get("end_time", 0),
+                "duration": clip.get("duration", 0),
+                "similarity": f"{score * 100:.0f}%",
+                "title": video.get("title", "Unknown"),
+                "caption": clip.get("label", ""),
+                "clip_type": clip.get("clip_type", ""),
+                "matched_lane": result.get("matched_lane", ""),
+                "description": clip.get("label", ""),
             })
 
         response_data = {

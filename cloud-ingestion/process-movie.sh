@@ -172,7 +172,7 @@ if [ -z "$RUNPOD_API_KEY" ]; then
 fi
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 GPU_TYPE="${GPU_TYPE:-NVIDIA GeForce RTX 3090}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-va55/goodclips-runpod:whisper-transcription}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-va55/goodclips-runpod:clips}"
 VIDEO_DIR="${PROJECT_DIR}/data/videos"
 
 # Colors for output

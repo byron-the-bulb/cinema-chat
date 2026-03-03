@@ -142,9 +142,15 @@ PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips 
 PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
     -c "\copy (SELECT uuid, scene_id, start_time, end_time, text, language, confidence, created_at FROM captions WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/captions.tsv'"
 
+# Export clips (if clips table exists on the pod)
+PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
+    -c "\copy (SELECT id, uuid, clip_type, source_scene_id, source_caption_id, start_time, end_time, label, salience_score, dialog_embedding, visual_embedding, clip_embedding, audio_embedding, metadata, created_at FROM clips WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/clips.tsv'" 2>/dev/null || true
+
 EXPORT_SCENES=$(wc -l < "${EXPORT_DIR}/scenes.tsv")
 EXPORT_CAPTIONS=$(wc -l < "${EXPORT_DIR}/captions.tsv")
-log "Exported: ${EXPORT_SCENES} scenes, ${EXPORT_CAPTIONS} captions"
+EXPORT_CLIPS=0
+[ -f "${EXPORT_DIR}/clips.tsv" ] && EXPORT_CLIPS=$(wc -l < "${EXPORT_DIR}/clips.tsv")
+log "Exported: ${EXPORT_SCENES} scenes, ${EXPORT_CAPTIONS} captions, ${EXPORT_CLIPS} clips"
 
 # ============================================
 # Step 4: Import into local database
@@ -154,6 +160,9 @@ log "Importing into local PostgreSQL..."
 # Remove any previous import of this movie (CASCADE clears scenes + captions)
 PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips \
     -c "DELETE FROM videos WHERE filename = '${MOVIE_FILENAME}';" 2>/dev/null || true
+
+# Ensure clips.tsv exists (empty if pod didn't have clips table)
+[ -f "${EXPORT_DIR}/clips.tsv" ] || touch "${EXPORT_DIR}/clips.tsv"
 
 PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips << IMPORT_SQL
 CREATE TEMP TABLE _stg_video (
@@ -173,12 +182,21 @@ CREATE TEMP TABLE _stg_captions (
     uuid uuid, remote_scene_id int, start_time real, end_time real,
     text text, language varchar(10), confidence real, created_at timestamptz
 );
+CREATE TEMP TABLE _stg_clips (
+    remote_id int, uuid uuid, clip_type varchar(16),
+    remote_scene_id int, remote_caption_id int,
+    start_time real, end_time real, label text, salience_score real,
+    dialog_embedding vector(768), visual_embedding vector(1024),
+    clip_embedding vector(512), audio_embedding vector(512),
+    metadata jsonb, created_at timestamptz
+);
 
-\copy _stg_video   FROM '${EXPORT_DIR}/video.tsv'
-\copy _stg_scenes  FROM '${EXPORT_DIR}/scenes.tsv'
+\copy _stg_video    FROM '${EXPORT_DIR}/video.tsv'
+\copy _stg_scenes   FROM '${EXPORT_DIR}/scenes.tsv'
 \copy _stg_captions FROM '${EXPORT_DIR}/captions.tsv'
+\copy _stg_clips    FROM '${EXPORT_DIR}/clips.tsv'
 
--- Remove any existing video with the same title (CASCADE clears scenes + captions)
+-- Remove any existing video with the same title (CASCADE clears scenes + captions + clips)
 DELETE FROM videos
 WHERE title = (SELECT title FROM _stg_video LIMIT 1)
   AND title <> '';
@@ -213,6 +231,20 @@ SELECT uuid_generate_v4(), :new_vid_id, m.local_id,
     c.start_time, c.end_time, c.text, c.language, c.confidence, c.created_at
 FROM _stg_captions c
 LEFT JOIN _scene_map m ON c.remote_scene_id = m.remote_id;
+
+-- Import clips (if any were exported)
+INSERT INTO clips (uuid, video_id, clip_type, source_scene_id, source_caption_id,
+    start_time, end_time, label, salience_score,
+    dialog_embedding, visual_embedding, clip_embedding, audio_embedding,
+    metadata, created_at)
+SELECT uuid_generate_v4(), :new_vid_id, cl.clip_type,
+    sm.local_id, NULL,
+    cl.start_time, cl.end_time, cl.label, cl.salience_score,
+    cl.dialog_embedding, cl.visual_embedding, cl.clip_embedding, cl.audio_embedding,
+    cl.metadata, cl.created_at
+FROM _stg_clips cl
+LEFT JOIN _scene_map sm ON cl.remote_scene_id = sm.remote_id
+ON CONFLICT (video_id, clip_type, start_time, end_time) DO NOTHING;
 IMPORT_SQL
 
 LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
@@ -221,7 +253,10 @@ LOCAL_SCENES=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips 
 LOCAL_CAPTIONS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
     -c "SELECT COUNT(*) FROM captions c JOIN videos v ON c.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" \
     | tr -d '[:space:]')
-log "Import complete: ${LOCAL_SCENES} scenes, ${LOCAL_CAPTIONS} captions"
+LOCAL_CLIPS=$(PGPASSWORD=goodclips_dev_password psql -h localhost -U goodclips -d goodclips -tA \
+    -c "SELECT COUNT(*) FROM clips cl JOIN videos v ON cl.video_id = v.id WHERE v.filename = '${MOVIE_FILENAME}'" \
+    | tr -d '[:space:]' 2>/dev/null || echo "0")
+log "Import complete: ${LOCAL_SCENES} scenes, ${LOCAL_CAPTIONS} captions, ${LOCAL_CLIPS} clips"
 
 # ============================================
 # Step 5: Download SRT sidecar via HTTP API
