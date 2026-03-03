@@ -535,10 +535,10 @@ except:
         STALL_COUNT=0
     fi
 
-    # Safety: 360 min (6 hours) covers long movies with 1000+ scenes
+    # Safety: 600 min (10 hours) covers long movies with clips + embeddings
     ELAPSED=$(($(date +%s) - START_TIME))
-    if [ "$ELAPSED" -gt 21600 ]; then
-        error "Processing timed out after 360 minutes"
+    if [ "$ELAPSED" -gt 36000 ]; then
+        error "Processing timed out after 600 minutes"
     fi
 done
 
