@@ -177,8 +177,11 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
             "content": f'[VIDEO: {caption_short}]',
         })
 
-        # Track for dashboard — include timing
-        session.add_status(f"[REASONING] Top match ({total_time:.1f}s)")
+        # Track for dashboard — include search details + timing
+        session.add_status(
+            f"[SEARCH] \"{text}\" → #{chosen['rank']} {chosen['similarity']} "
+            f"[{chosen['title']}] {chosen['duration']}s"
+        )
         session.add_status(f"[VIDEO: {caption_short}]")
 
         await ws.send_json({
