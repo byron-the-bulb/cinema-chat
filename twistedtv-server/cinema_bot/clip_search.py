@@ -74,7 +74,7 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
-        return _parse_clip_results(results, limit)
+        return await _parse_clip_results(results, limit)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             logger.info("clips endpoint not available, falling back to /search/semantic")
@@ -88,7 +88,7 @@ async def search_clips(query: str, limit: int = 5) -> list[dict]:
     return await _search_clips_legacy(query, fetch_limit, limit)
 
 
-def _parse_clip_results(results: list[dict], limit: int) -> list[dict]:
+async def _parse_clip_results(results: list[dict], limit: int) -> list[dict]:
     """Parse results from the /search/clips endpoint."""
     clips = []
     for i, result in enumerate(results, 1):
@@ -115,18 +115,42 @@ def _parse_clip_results(results: list[dict], limit: int) -> list[dict]:
         else:
             title = str(title_val)
 
+        # Fetch timed caption lines for subtitle overlay
+        video_id = clip_data.get("video_id")
+        clip_start = clip_data.get("start_time", 0)
+        clip_end = clip_data.get("end_time", 0)
+        timed_captions = []
+        if video_id and _db_pool:
+            try:
+                async with _db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """SELECT text, start_time, end_time FROM captions
+                           WHERE video_id = $1 AND language = 'en'
+                             AND start_time < $3 AND end_time > $2
+                           ORDER BY start_time""",
+                        video_id, clip_start, clip_end,
+                    )
+                    for row in rows:
+                        timed_captions.append({
+                            "text": row["text"],
+                            "start": row["start_time"],
+                            "end": row["end_time"],
+                        })
+            except Exception as e:
+                logger.warning(f"Failed to get timed captions: {e}")
+
         clips.append({
             "rank": len(clips) + 1,
-            "video_id": clip_data.get("video_id"),
+            "video_id": video_id,
             "file": video_url,
-            "start": clip_data.get("start_time", 0),
-            "end": clip_data.get("end_time", 0),
+            "start": clip_start,
+            "end": clip_end,
             "duration": round(duration, 1),
             "similarity": f"{score * 100:.0f}%",
             "title": title,
             "caption": clip_data.get("label", ""),
             "clip_type": clip_data.get("clip_type", ""),
-            "captions": [],
+            "captions": timed_captions,
         })
 
     return clips
