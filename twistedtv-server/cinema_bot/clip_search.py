@@ -99,15 +99,18 @@ async def search_clips(
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
-        return await _parse_clip_results(results, limit)
+        parsed = await _parse_clip_results(results, limit)
+        if parsed:
+            return parsed
+        logger.info("clips search returned no usable results, falling back to /search/text")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
-            logger.info("clips endpoint not available, falling back to /search/semantic")
+            logger.info("clips endpoint not available, falling back to /search/text")
         else:
             logger.error(f"clips search failed: {e}")
             return []
     except Exception as e:
-        logger.warning(f"clips search failed, falling back to /search/semantic: {e}")
+        logger.warning(f"clips search failed, falling back to /search/text: {e}")
 
     # Fallback to legacy scene-based search
     return await _search_clips_legacy(query, fetch_limit, limit)
