@@ -486,41 +486,40 @@ except:
     print('(no jobs)')
 " 2>/dev/null || echo "(error)")
 
-    EMBED_STATUS=$(echo "$JOBS" | python3 -c "
+    # Check if ALL jobs are done (completed or failed) — not just embedding_generation.
+    # This ensures clip_generation finishes before we pull data and kill the pod.
+    ALL_JOBS_STATUS=$(echo "$JOBS" | python3 -c "
 import sys, json
 try:
-    for j in json.load(sys.stdin).get('jobs', []):
-        if j.get('type') == 'embedding_generation':
-            print(j.get('status',''))
-            break
+    jobs = json.load(sys.stdin).get('jobs', [])
+    if not jobs:
+        print('no_jobs')
+    else:
+        statuses = [j.get('status','') for j in jobs]
+        failed = [j for j in jobs if j.get('status') == 'failed']
+        if failed:
+            err = failed[0].get('error') or failed[0].get('error_message') or '(no details)'
+            print(f\"failed:{failed[0].get('type','?')}:{err}\")
+        elif all(s == 'completed' for s in statuses):
+            print('all_done')
+        else:
+            print('running')
 except:
-    pass
-" 2>/dev/null || true)
-
-    FAILED_JOB=$(echo "$JOBS" | python3 -c "
-import sys, json
-try:
-    for j in json.load(sys.stdin).get('jobs', []):
-        if j.get('status') == 'failed':
-            err = j.get('error') or j.get('error_message') or '(no error message)'
-            print(f\"{j.get('type','?')}: {err}\")
-            break
-except:
-    pass
-" 2>/dev/null || true)
+    print('error')
+" 2>/dev/null || echo "error")
 
     info "  scenes: ${TOTAL_SCENES} | embeds: ${EMBED_COUNT} | captions: ${CAPTIONS} | ${GPU_INFO}"
     info "  jobs: ${JOB_SUMMARY}"
 
     # Abort immediately on any failed job (cleanup trap will dump pod logs)
-    if [ -n "$FAILED_JOB" ]; then
+    if [[ "$ALL_JOBS_STATUS" == failed:* ]]; then
         echo ""
-        warn "=== FAILED JOB: ${FAILED_JOB} ==="
+        warn "=== FAILED JOB: ${ALL_JOBS_STATUS#failed:} ==="
         error "A job failed — pod logs below. Set KEEP_POD=true to keep the pod running."
     fi
 
-    # Check completion
-    if [ "$EMBED_STATUS" = "completed" ]; then
+    # Check completion — ALL jobs must be completed (embedding + clip generation)
+    if [ "$ALL_JOBS_STATUS" = "all_done" ]; then
         echo ""
         log "All processing complete!"
         break
@@ -529,17 +528,17 @@ except:
     # Stall detection: if GPU is at 0% for too long after initial startup
     if echo "$GPU_INFO" | grep -q "GPU:0%" 2>/dev/null; then
         STALL_COUNT=$((STALL_COUNT + 1))
-        if [ "$STALL_COUNT" -ge 10 ] && [ "$EMBED_STATUS" = "running" ]; then
-            warn "GPU has been idle for 5+ minutes while job is 'running' - possible stall"
+        if [ "$STALL_COUNT" -ge 10 ] && [ "$ALL_JOBS_STATUS" = "running" ]; then
+            warn "GPU has been idle for 5+ minutes while jobs are still running - possible stall"
         fi
     else
         STALL_COUNT=0
     fi
 
-    # Safety: 300 min covers download + transcription + full ingestion for long movies
+    # Safety: 360 min (6 hours) covers long movies with 1000+ scenes
     ELAPSED=$(($(date +%s) - START_TIME))
-    if [ "$ELAPSED" -gt 18000 ]; then
-        error "Processing timed out after 300 minutes"
+    if [ "$ELAPSED" -gt 21600 ]; then
+        error "Processing timed out after 360 minutes"
     fi
 done
 
