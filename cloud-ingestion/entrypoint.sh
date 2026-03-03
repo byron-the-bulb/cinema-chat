@@ -64,12 +64,17 @@ else
     INIT_DB=false
 fi
 
-# Always ensure PostgreSQL is tuned for heavy vector writes (idempotent)
+# Always ensure PostgreSQL is tuned for heavy vector writes
+# Uses sed to replace existing values (initdb writes defaults like shared_buffers = 128MB)
 for param in "shared_buffers = 512MB" "work_mem = 16MB" "maintenance_work_mem = 256MB" \
              "max_wal_size = 4GB" "min_wal_size = 1GB" "checkpoint_timeout = 15min" \
              "checkpoint_completion_target = 0.9" "wal_buffers = 64MB" "effective_cache_size = 1GB"; do
     key="${param%% =*}"
-    if ! grep -q "^${key} " "${PGDATA}/postgresql.conf" 2>/dev/null; then
+    if grep -q "^${key}" "${PGDATA}/postgresql.conf" 2>/dev/null; then
+        sed -i "s|^${key}.*|${param}|" "${PGDATA}/postgresql.conf"
+    elif grep -q "^#${key}" "${PGDATA}/postgresql.conf" 2>/dev/null; then
+        sed -i "s|^#${key}.*|${param}|" "${PGDATA}/postgresql.conf"
+    else
         echo "${param}" >> "${PGDATA}/postgresql.conf"
     fi
 done
