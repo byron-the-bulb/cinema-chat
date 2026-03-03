@@ -250,8 +250,9 @@ def play_clip(video_path, start_time, end_time):
         return False, f"Video file not found: {video_path}", None
 
     # Load the clip with start/end options
+    # MPV 0.40+: loadfile args are (url, flags, index, options)
     opts = f"start={start_time},end={end_time}"
-    mpv_command("loadfile", video_path, "replace", opts)
+    mpv_command("loadfile", video_path, "replace", -1, opts)
     mpv_set_property("loop-file", "no")
     _playing_content = True
 
