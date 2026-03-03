@@ -144,7 +144,7 @@ PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips 
 
 # Export clips (if clips table exists on the pod)
 PGPASSWORD=goodclips_dev_password psql -h "$PG_HOST" -p "$PG_PORT" -U goodclips -d goodclips \
-    -c "\copy (SELECT id, uuid, clip_type, source_scene_id, source_caption_id, start_time, end_time, label, salience_score, dialog_embedding, visual_embedding, clip_embedding, audio_embedding, metadata, created_at FROM clips WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/clips.tsv'" 2>/dev/null || true
+    -c "\copy (SELECT id, uuid, clip_type, source_scene_id, source_caption_id, start_time, end_time, label, salience_score, dialog_embedding, visual_embedding, clip_embedding, audio_embedding, text_embedding, metadata, created_at FROM clips WHERE video_id = ${REMOTE_VID} ORDER BY id) TO '${EXPORT_DIR}/clips.tsv'" 2>/dev/null || true
 
 EXPORT_SCENES=$(wc -l < "${EXPORT_DIR}/scenes.tsv")
 EXPORT_CAPTIONS=$(wc -l < "${EXPORT_DIR}/captions.tsv")
@@ -188,6 +188,7 @@ CREATE TEMP TABLE _stg_clips (
     start_time real, end_time real, label text, salience_score real,
     dialog_embedding vector(768), visual_embedding vector(1024),
     clip_embedding vector(512), audio_embedding vector(512),
+    text_embedding vector(768),
     metadata jsonb, created_at timestamptz
 );
 
@@ -235,12 +236,12 @@ LEFT JOIN _scene_map m ON c.remote_scene_id = m.remote_id;
 -- Import clips (if any were exported)
 INSERT INTO clips (uuid, video_id, clip_type, source_scene_id, source_caption_id,
     start_time, end_time, label, salience_score,
-    dialog_embedding, visual_embedding, clip_embedding, audio_embedding,
+    dialog_embedding, visual_embedding, clip_embedding, audio_embedding, text_embedding,
     metadata, created_at)
 SELECT uuid_generate_v4(), :new_vid_id, cl.clip_type,
     sm.local_id, NULL,
     cl.start_time, cl.end_time, cl.label, cl.salience_score,
-    cl.dialog_embedding, cl.visual_embedding, cl.clip_embedding, cl.audio_embedding,
+    cl.dialog_embedding, cl.visual_embedding, cl.clip_embedding, cl.audio_embedding, cl.text_embedding,
     cl.metadata, cl.created_at
 FROM _stg_clips cl
 LEFT JOIN _scene_map sm ON cl.remote_scene_id = sm.remote_id
