@@ -9,7 +9,7 @@ User=twistedtv
 WorkingDirectory=/home/twistedtv/cinema-chat/twistedtv-server/cinema_bot
 Environment="PATH=/home/twistedtv/cinema-chat/twistedtv-server/venv/bin:/usr/bin:/usr/local/bin"
 ExecStartPre=/bin/bash -c 'lsof -ti:8765 | xargs -r kill -9 || true'
-ExecStart=/home/twistedtv/cinema-chat/twistedtv-server/venv/bin/python server.py
+ExecStart=/bin/bash -c '/home/twistedtv/cinema-chat/twistedtv-server/venv/bin/python server.py'
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/tmp/twistedtv-server.log
