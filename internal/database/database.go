@@ -200,6 +200,16 @@ func NewConnection(cfg Config) (*DB, error) {
     if err != nil {
         return nil, err
     }
+
+    // Configure connection pool to avoid exhausting PostgreSQL connections
+    sqlDB, err := gdb.DB()
+    if err != nil {
+        return nil, err
+    }
+    sqlDB.SetMaxOpenConns(20)
+    sqlDB.SetMaxIdleConns(5)
+    sqlDB.SetConnMaxLifetime(5 * time.Minute)
+
     return &DB{gdb}, nil
 }
 
