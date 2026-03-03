@@ -136,6 +136,11 @@ sudo dnf install -y postgresql
 
 # lsof (used by systemd services)
 sudo dnf install -y lsof
+
+# Ollama (local LLM — the bot uses it for creative clip selection)
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl enable --now ollama
+ollama pull qwen2.5:7b
 ```
 
 ### Step 2: Clone the Repository
@@ -171,6 +176,9 @@ cat > /home/twistedtv/cinema-chat/twistedtv-server/cinema_bot/.env << 'EOF'
 OPENAI_API_KEY=<your-openai-key>
 DAILY_API_KEY=<your-daily-key>
 DAILY_API_URL=https://api.daily.co/v1
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5:7b
+LLM_API_KEY=ollama
 WHISPER_DEVICE=cpu
 REPO_ID=Systran/faster-distil-whisper-medium.en
 HOST=0.0.0.0
@@ -217,7 +225,8 @@ Create `/tmp/twistedtv-server.service`:
 ```ini
 [Unit]
 Description=TwistedTV Server (Cinema Bot)
-After=network.target
+After=network.target ollama.service
+Requires=ollama.service
 
 [Service]
 Type=exec

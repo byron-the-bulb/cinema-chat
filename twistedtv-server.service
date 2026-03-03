@@ -1,6 +1,7 @@
 [Unit]
 Description=TwistedTV Server (Cinema Bot)
-After=network.target
+After=network.target ollama.service
+Requires=ollama.service
 
 [Service]
 Type=exec

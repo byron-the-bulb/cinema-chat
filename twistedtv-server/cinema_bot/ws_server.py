@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
+from openai import AsyncOpenAI  # Also works with Ollama's OpenAI-compat API
 
 # Support both package and direct execution
 try:
@@ -30,7 +31,81 @@ except ImportError:
 
 load_dotenv(override=True)
 
-# ── System prompt ──────────────────────────────────────────────────────────
+# ── System prompt & tools ──────────────────────────────────────────────────
+
+# When LLM_PICK_LOOP=1, the LLM gets a second round-trip to review results
+# and pick the best clip.  When off (default), the top search result is played
+# immediately after the LLM's tool call — one fewer round-trip, lower latency.
+LLM_PICK_LOOP = os.getenv("LLM_PICK_LOOP", "0") == "1"
+
+_PERSONA = """\
+You are Cinema Chat — a quirky, snarky art installation inside an old TV set. \
+Visitors speak into a vintage rotary telephone and you respond ONLY through \
+vintage movie and educational film clips from the 1930s-1970s.
+
+You are NOT a helpful assistant. You're a conversational character — witty, \
+playful, sometimes sarcastic, and often FUNNY. Your goal is to entertain."""
+
+SYSTEM_PROMPT = _PERSONA + """
+
+Use the search_clips tool to find a video clip. Be CREATIVE with your \
+search query — don't just echo what the user said. Think about what would \
+make a FUNNY or WITTY video response.
+
+   Bad: User says "I went to the supermarket" → searching "person shopping"
+   Good: User says "I went to the supermarket" → searching "fancy restaurant \
+dining" or "housewife excited about groceries"
+
+The top result will be played automatically — make your search query count!"""
+
+SYSTEM_PROMPT_PICK = _PERSONA + """
+
+HOW TO RESPOND:
+1. Use the search_clips tool to find a video clip. Be CREATIVE with your \
+search query — don't just echo what the user said. Think about what would \
+make a FUNNY or WITTY video response.
+
+   Bad: User says "I went to the supermarket" → searching "person shopping"
+   Good: User says "I went to the supermarket" → searching "fancy restaurant \
+dining" or "housewife excited about groceries"
+
+2. After seeing the search results, pick the SINGLE BEST clip and respond \
+with ONLY valid JSON (no markdown, no explanation):
+   {"pick": <rank_number>, "reasoning": "<brief witty explanation>"}
+
+SELECTION CRITERIA (in order of priority):
+- Humor — BE FUNNY above all else
+- Caption — what words are SPOKEN in the clip (perfect for witty retorts)
+- Visual — what's shown on screen
+- Duration — prefer 5-15 second clips
+- Tone — does it match your snarky/playful vibe?"""
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_clips",
+            "description": (
+                "Search the movie clip database for clips matching a semantic "
+                "description. Returns ranked results with spoken dialog captions "
+                "and visual descriptions. Use creative, witty queries!"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "A creative semantic description of the scene, "
+                            "emotion, dialog, or action to search for."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
 
 # ── Session tracking ───────────────────────────────────────────────────────
 
@@ -74,6 +149,106 @@ class Session:
 
 # ── Core pipeline ──────────────────────────────────────────────────────────
 
+openai_client: AsyncOpenAI = None
+
+
+async def llm_pick_clip(session: Session, text: str) -> tuple[dict | None, str, float, float]:
+    """Use LLM with search_clips tool to find and pick the best clip response.
+
+    Returns (chosen_clip, reasoning, search_secs, llm_secs).
+
+    Two modes controlled by LLM_PICK_LOOP env var:
+      OFF (default): LLM calls search tool → play top result immediately (1 LLM call)
+      ON:            LLM calls search tool → reviews results → picks best (2 LLM calls)
+    """
+    llm_model = os.getenv("LLM_MODEL", "qwen2.5:7b")
+    prompt = SYSTEM_PROMPT_PICK if LLM_PICK_LOOP else SYSTEM_PROMPT
+    llm_start = time.monotonic()
+
+    messages = [{"role": "system", "content": prompt}]
+    messages.extend(session.history[-6:])
+    messages.append({"role": "user", "content": text})
+
+    # Step 1: LLM decides what to search for (tool call)
+    response = await openai_client.chat.completions.create(
+        model=llm_model,
+        messages=messages,
+        tools=TOOLS,
+        temperature=0.9,
+        max_tokens=200,
+    )
+
+    choice = response.choices[0]
+    search_secs = 0.0
+
+    if not choice.message.tool_calls:
+        # Model didn't call the tool — fall back to direct search
+        logger.warning("LLM did not call search tool — falling back to direct search")
+        t0 = time.monotonic()
+        clips = await clip_search.search_clips(text, limit=5)
+        search_secs = time.monotonic() - t0
+        llm_secs = time.monotonic() - llm_start
+        if not clips:
+            return None, "", search_secs, llm_secs
+        return clips[0], "direct search (LLM skipped tool)", search_secs, llm_secs
+
+    # Execute the tool call
+    tool_call = choice.message.tool_calls[0]
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except json.JSONDecodeError:
+        args = {"query": text}
+    query = args.get("query", text)
+    logger.info(f"LLM search query: \"{query}\"")
+
+    t0 = time.monotonic()
+    clips = await clip_search.search_clips(query, limit=5)
+    search_secs = time.monotonic() - t0
+
+    if not clips:
+        return None, "", search_secs, time.monotonic() - llm_start
+
+    # ── Fast mode (default): play top result, skip second LLM call ─────
+    if not LLM_PICK_LOOP:
+        llm_secs = time.monotonic() - llm_start
+        logger.info(f"LLM query ({llm_secs:.2f}s): \"{query}\" → playing #1")
+        return clips[0], f"search: {query}", search_secs, llm_secs
+
+    # ── Pick mode: second LLM call to review and choose ────────────────
+    clips_text = clip_search.format_clips_for_llm(clips)
+
+    messages.append(choice.message)
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "content": clips_text,
+    })
+
+    response2 = await openai_client.chat.completions.create(
+        model=llm_model,
+        messages=messages,
+        temperature=0.9,
+        max_tokens=150,
+    )
+
+    llm_secs = time.monotonic() - llm_start
+    llm_text = response2.choices[0].message.content or ""
+    llm_text = llm_text.strip()
+    logger.info(f"LLM pick ({llm_secs:.2f}s): {llm_text}")
+
+    # Parse LLM response
+    try:
+        result = json.loads(llm_text)
+        pick_rank = int(result.get("pick", 1))
+        reasoning = result.get("reasoning", "")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        logger.warning(f"Failed to parse LLM response, using top result: {llm_text}")
+        pick_rank = 1
+        reasoning = "top search result"
+
+    chosen = next((c for c in clips if c["rank"] == pick_rank), clips[0])
+    return chosen, reasoning, search_secs, llm_secs
+
 
 async def handle_greeting(ws: WebSocket, session: Session):
     """Play an opening greeting clip when a new session starts."""
@@ -116,7 +291,7 @@ async def handle_greeting(ws: WebSocket, session: Session):
 
 
 async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
-    """Fast pipeline: STT → Search → Play top result. No LLM step."""
+    """Full pipeline: STT → LLM (with search tool) → Play chosen clip."""
     if session.processing:
         logger.warning("Already processing — dropping overlapping speech")
         return
@@ -135,28 +310,27 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
             return
 
         await ws.send_json({"type": "transcript", "text": text})
-        session.add_status(f"User: {text}")
+        session.add_status(f"[USER] {text}")
         logger.info(f"[{session.session_id[:8]}] User: \"{text}\"")
 
-        # ── 2. Search + Play ───────────────────────────────────────────
-        t0 = time.monotonic()
-        clips = await clip_search.search_clips(text, limit=5)
-        search_time = time.monotonic() - t0
+        # ── 2. LLM picks a clip (via search tool) ─────────────────────
+        await ws.send_json({"type": "status", "message": "Thinking..."})
+        chosen, reasoning, search_time, llm_time = await llm_pick_clip(session, text)
 
-        if not clips:
+        if not chosen:
             await ws.send_json({"type": "status", "message": "No clips found"})
             session.add_status("[SYSTEM] No clips found — database may be empty")
             return
 
-        # Play the top search result directly — no LLM needed
-        chosen = clips[0]
+        # ── 3. Play the chosen clip ────────────────────────────────────
         total_time = time.monotonic() - pipeline_start
         clip_duration = chosen["end"] - chosen["start"]
         session.mute_for_playback(clip_duration)
 
         logger.info(
-            f"Pipeline ({total_time:.2f}s | stt={stt_time:.2f} search={search_time:.2f}): "
-            f"playing {chosen['file']} [{chosen['start']}-{chosen['end']}s]"
+            f"Pipeline ({total_time:.2f}s | stt={stt_time:.2f} search={search_time:.2f} "
+            f"llm={llm_time:.2f}): playing {chosen['file']} "
+            f"[{chosen['start']}-{chosen['end']}s] — {reasoning}"
         )
 
         await ws.send_json({
@@ -174,12 +348,13 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
         session.history.append({"role": "user", "content": text})
         session.history.append({
             "role": "assistant",
-            "content": f'[VIDEO: {caption_short}]',
+            "content": f'[VIDEO: {caption_short}] (reasoning: {reasoning})',
         })
 
-        # Track for dashboard — include search details + timing
+        # Track for dashboard
+        session.add_status(f"[REASONING] {reasoning}")
         session.add_status(
-            f"[SEARCH] \"{text}\" → #{chosen['rank']} {chosen['similarity']} "
+            f"[SEARCH] #{chosen['rank']} {chosen['similarity']} "
             f"[{chosen['title']}] {chosen['duration']}s"
         )
         session.add_status(f"[VIDEO: {caption_short}]")
@@ -189,6 +364,7 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
             "total_secs": round(total_time, 2),
             "stt_secs": round(stt_time, 2),
             "search_secs": round(search_time, 2),
+            "llm_secs": round(llm_time, 2),
         })
 
     except Exception as e:
@@ -202,6 +378,7 @@ async def handle_speech(ws: WebSocket, session: Session, pcm_audio: bytes):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global openai_client
     logger.info("Starting TwistedTV WebSocket server...")
 
     # Initialize audio pipeline (VAD + Whisper)
@@ -210,7 +387,14 @@ async def lifespan(app: FastAPI):
     # Initialize clip search (HTTP client + DB pool)
     await clip_search.init()
 
-    logger.info("All services initialized — ready for connections (no-LLM fast mode)")
+    # Initialize LLM client (Ollama local by default)
+    llm_base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or "ollama"
+    openai_client = AsyncOpenAI(base_url=llm_base_url, api_key=llm_api_key)
+    llm_model = os.getenv("LLM_MODEL", "qwen2.5:7b")
+    logger.info(f"LLM client: {llm_base_url} model={llm_model}")
+
+    logger.info("All services initialized — ready for connections")
     yield
 
     logger.info("Shutting down...")
@@ -304,9 +488,10 @@ async def audio_websocket(ws: WebSocket):
                         # Direct text input (for testing without audio)
                         text = msg.get("text", "")
                         if text:
-                            clips = await clip_search.search_clips(text, limit=5)
-                            if clips:
-                                chosen = clips[0]
+                            await ws.send_json({"type": "transcript", "text": text})
+                            session.add_status(f"[USER] {text}")
+                            chosen, reasoning, _, _ = await llm_pick_clip(session, text)
+                            if chosen:
                                 clip_duration = chosen["end"] - chosen["start"]
                                 session.mute_for_playback(clip_duration)
                                 await ws.send_json({
@@ -318,6 +503,9 @@ async def audio_websocket(ws: WebSocket):
                                     "transcript": text,
                                     "captions": chosen.get("captions", []),
                                 })
+                                caption_short = chosen["caption"][:80] if chosen.get("caption") else ""
+                                session.add_status(f"[REASONING] {reasoning}")
+                                session.add_status(f"[VIDEO: {caption_short}]")
 
                 except json.JSONDecodeError:
                     pass
