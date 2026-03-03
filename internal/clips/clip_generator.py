@@ -214,105 +214,48 @@ def generate_dialog_clips(captions, scenes):
 # Visual clip generation — Lighthouse on full movie
 # ---------------------------------------------------------------------------
 
-def chunk_by_scene_boundaries(scenes, video_duration, max_chunk=150.0):
-    """
-    Split the full movie timeline into chunks at scene boundaries,
-    each under max_chunk seconds (Lighthouse's input limit).
-    Returns list of (start, end, scene_id) tuples.
-    """
-    sorted_scenes = sorted(scenes, key=lambda s: s["start_time"])
 
-    if not sorted_scenes:
-        # No scenes — chunk the entire video by max_chunk
-        chunks = []
-        pos = 0.0
-        while pos < video_duration:
-            chunk_end = min(pos + max_chunk, video_duration)
-            if chunk_end - pos >= MIN_CHUNK_DURATION:
-                chunks.append((round(pos, 3), round(chunk_end, 3), None))
-            pos = chunk_end
-        return chunks
-
-    # Collect all scene boundaries as potential chunk split points
-    boundaries = [0.0]
-    for s in sorted_scenes:
-        boundaries.append(s["start_time"])
-        boundaries.append(s["end_time"])
-    boundaries.append(video_duration)
-    boundaries = sorted(set(boundaries))
-
-    # Walk through boundaries, accumulating into chunks up to max_chunk
-    chunks = []
-    chunk_start = boundaries[0]
-
-    for i in range(1, len(boundaries)):
-        boundary = boundaries[i]
-        chunk_duration = boundary - chunk_start
-
-        if chunk_duration >= max_chunk:
-            # This chunk would be too long — finalize at the previous boundary
-            # or split the current segment if it's a single long scene
-            prev_boundary = boundaries[i - 1] if i > 1 else chunk_start
-            if prev_boundary > chunk_start:
-                # Finalize up to previous boundary
-                if prev_boundary - chunk_start >= MIN_CHUNK_DURATION:
-                    scene_id = _find_scene_id(sorted_scenes, chunk_start, prev_boundary)
-                    chunks.append((round(chunk_start, 3), round(prev_boundary, 3), scene_id))
-                chunk_start = prev_boundary
-
-            # Handle the remaining segment (may still be >max_chunk for very long scenes)
-            remaining = boundary - chunk_start
-            if remaining > max_chunk:
-                # Split long scene into sequential sub-chunks
-                n_splits = int(remaining / max_chunk) + 1
-                split_dur = remaining / n_splits
-                for j in range(n_splits):
-                    s = chunk_start + j * split_dur
-                    e = chunk_start + (j + 1) * split_dur
-                    if e - s >= MIN_CHUNK_DURATION:
-                        scene_id = _find_scene_id(sorted_scenes, s, e)
-                        chunks.append((round(s, 3), round(e, 3), scene_id))
-                chunk_start = boundary
-            # else: let it accumulate more
-
-    # Finalize the last chunk
-    if video_duration - chunk_start >= MIN_CHUNK_DURATION:
-        scene_id = _find_scene_id(sorted_scenes, chunk_start, video_duration)
-        chunks.append((round(chunk_start, 3), round(video_duration, 3), scene_id))
-
-    return chunks
-
-
-def _find_scene_id(sorted_scenes, start, end):
-    """Find the scene that best contains the given time range."""
-    mid = (start + end) / 2
-    for s in sorted_scenes:
-        if s["start_time"] <= mid <= s["end_time"]:
-            return s["id"]
-    # Fallback: find closest scene
-    for s in sorted_scenes:
-        if s["start_time"] < end and s["end_time"] > start:
-            return s["id"]
-    return None
+MIN_SCENE_FOR_LIGHTHOUSE = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "5.0"))
+MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "150.0"))
 
 
 def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
     """
-    Run Lighthouse on the entire movie (chunked by scene boundaries) to detect
-    clip boundaries. Each Lighthouse-detected highlight becomes a visual clip.
+    Run Lighthouse on each scene individually to detect highlights.
+    This ensures detected clips never cross scene boundaries (visual cuts).
+    Short scenes (< MIN_SCENE_FOR_LIGHTHOUSE) are skipped since they're
+    already clip-sized. Long scenes (> 150s) are split into sub-segments.
     """
-    chunks = chunk_by_scene_boundaries(scenes, video_duration)
-    print(f"  Split movie into {len(chunks)} chunks for Lighthouse",
+    sorted_scenes = sorted(scenes, key=lambda s: s["start_time"])
+
+    # Build per-scene segments (split long scenes for Lighthouse's 150s limit)
+    segments = []
+    for s in sorted_scenes:
+        dur = s["end_time"] - s["start_time"]
+        if dur < MIN_SCENE_FOR_LIGHTHOUSE:
+            continue
+        if dur <= MAX_LIGHTHOUSE_INPUT:
+            segments.append((s["start_time"], s["end_time"], s["id"]))
+        else:
+            # Split long scene into sub-segments at the limit
+            pos = s["start_time"]
+            while pos < s["end_time"]:
+                seg_end = min(pos + MAX_LIGHTHOUSE_INPUT, s["end_time"])
+                if seg_end - pos >= MIN_SCENE_FOR_LIGHTHOUSE:
+                    segments.append((pos, seg_end, s["id"]))
+                pos = seg_end
+
+    print(f"  {len(segments)} scenes >= {MIN_SCENE_FOR_LIGHTHOUSE}s for Lighthouse "
+          f"(skipped {len(sorted_scenes) - len(segments)} short scenes)",
           file=sys.stderr, flush=True)
 
     if not check_lighthouse():
-        # Without Lighthouse, create one clip per chunk (fallback)
         clips = []
-        for c_start, c_end, scene_id in chunks:
+        for s_start, s_end, scene_id in segments:
             clips.append({
                 "clip_type": "visual",
-                "start_time": c_start,
-                "end_time": c_end,
+                "start_time": round(s_start, 3),
+                "end_time": round(s_end, 3),
                 "label": "",
                 "salience_score": 0.5,
                 "source_scene_id": scene_id,
@@ -320,20 +263,20 @@ def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
             })
         return clips
 
-    # Run Lighthouse on each chunk to detect clip boundaries
+    # Run Lighthouse on each scene individually
     clips = []
-    for i, (c_start, c_end, scene_id) in enumerate(chunks):
-        print(f"  Lighthouse chunk {i+1}/{len(chunks)}: {c_start:.1f}s - {c_end:.1f}s",
+    for i, (s_start, s_end, scene_id) in enumerate(segments):
+        print(f"  Lighthouse scene {i+1}/{len(segments)}: "
+              f"{s_start:.1f}s - {s_end:.1f}s ({s_end - s_start:.1f}s)",
               file=sys.stderr, flush=True)
 
-        highlights = detect_with_lighthouse(video_path, c_start, c_end, device=device)
+        highlights = detect_with_lighthouse(video_path, s_start, s_end, device=device)
 
         if not highlights:
-            # No highlights detected — create one fallback clip for the whole chunk
             clips.append({
                 "clip_type": "visual",
-                "start_time": c_start,
-                "end_time": c_end,
+                "start_time": round(s_start, 3),
+                "end_time": round(s_end, 3),
                 "label": "",
                 "salience_score": 0.5,
                 "source_scene_id": scene_id,

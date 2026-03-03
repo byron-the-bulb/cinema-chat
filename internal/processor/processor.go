@@ -479,93 +479,101 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         }
     }
 
-    // --- 1. IV2 captioning on visual clips (generates label text) ---
-    if len(visualClips) > 0 {
-        log.Printf("[embeddings] video_id=%d: generating IV2 captions for %d visual clips (backend=%s, model=%s)",
-            video.ID, len(visualClips), backend, modelID)
+    // --- 1. IV2 captioning on ALL clips (visual description of what's on screen) ---
+    // For visual clips this becomes the label; for dialog clips it's used for text_embedding
+    // but doesn't overwrite the spoken-text label.
+    log.Printf("[embeddings] video_id=%d: generating IV2 captions for %d clips (backend=%s, model=%s)",
+        video.ID, len(clips), backend, modelID)
 
-        captionReq := map[string]interface{}{
-            "video_path": video.Filepath,
-            "scenes":     visualClipRanges,
-            "prompt":     os.Getenv("IV2_CAPTION_PROMPT"),
-            "sampling": map[string]int{
-                "frames":     frames,
-                "stride":     stride,
-                "resolution": res,
-            },
-            "device":   device,
-            "model_id": modelID,
-        }
-        captionPayload, _ := json.Marshal(captionReq)
-        captionCmd := exec.Command("python3", "/root/internal/embeddings/iv2_caption_runner.py")
-        captionCmd.Stdin = bytes.NewReader(captionPayload)
-        captionStdout, _ := captionCmd.StdoutPipe()
-        captionStderr, _ := captionCmd.StderrPipe()
-        if err := captionCmd.Start(); err != nil {
-            log.Printf("Warning: failed to start iv2_caption_runner for clips: %v", err)
-        } else {
-            go func() {
-                if _, err := io.Copy(os.Stderr, captionStderr); err != nil {
-                    log.Printf("Warning: failed to read iv2_caption_runner stderr: %v", err)
-                }
-            }()
-            captionOut, _ := io.ReadAll(captionStdout)
-            if err := captionCmd.Wait(); err != nil {
-                log.Printf("Warning: iv2_caption_runner (clips) failed: %v", err)
-            } else {
-                var captionResp struct {
-                    Model    string `json:"model"`
-                    Captions []struct {
-                        SceneIndex int    `json:"scene_index"`
-                        Text       string `json:"text"`
-                    } `json:"captions"`
-                    Error string `json:"error"`
-                }
-                if err := json.Unmarshal(captionOut, &captionResp); err != nil {
-                    log.Printf("Warning: failed to parse iv2_caption_runner output: %v", err)
-                } else if captionResp.Error != "" {
-                    log.Printf("Warning: iv2_caption_runner error: %s", captionResp.Error)
-                } else {
-                    savedCaptions := 0
-                    for _, cap := range captionResp.Captions {
-                        text := strings.TrimSpace(cap.Text)
-                        if text == "" {
-                            continue
-                        }
-                        clipID := uint(cap.SceneIndex) // we used clip.ID as scene_index
-                        if err := vp.db.UpdateClipLabel(clipID, text); err != nil {
-                            log.Printf("Warning: failed to update label for clip %d: %v", clipID, err)
-                            continue
-                        }
-                        savedCaptions++
-                    }
-                    log.Printf("[embeddings] video_id=%d: persisted %d/%d IV2 captions for visual clips",
-                        video.ID, savedCaptions, len(captionResp.Captions))
+    captionReq := map[string]interface{}{
+        "video_path": video.Filepath,
+        "scenes":     allClipRanges,
+        "prompt":     os.Getenv("IV2_CAPTION_PROMPT"),
+        "sampling": map[string]int{
+            "frames":     frames,
+            "stride":     stride,
+            "resolution": res,
+        },
+        "device":   device,
+        "model_id": modelID,
+    }
+    captionPayload, _ := json.Marshal(captionReq)
+    captionCmd := exec.Command("python3", "/root/internal/embeddings/iv2_caption_runner.py")
+    captionCmd.Stdin = bytes.NewReader(captionPayload)
+    captionStdout, _ := captionCmd.StdoutPipe()
+    captionStderr, _ := captionCmd.StderrPipe()
 
-                    // Reload clips to get updated labels for text embedding
-                    clips, err = vp.db.GetClipsByVideoID(video.ID)
-                    if err != nil {
-                        log.Printf("Warning: failed to reload clips after IV2 captioning: %v", err)
-                    } else {
-                        // Rebuild visual clip lists with updated labels
-                        visualClips = nil
-                        var visualTexts []string
-                        for _, c := range clips {
-                            if c.ClipType == "visual" && c.Label != "" {
-                                visualClips = append(visualClips, c)
-                                visualTexts = append(visualTexts, c.Label)
-                            }
-                        }
+    // Map clip ID → IV2 visual description (for text_embedding on all clips)
+    iv2Descriptions := map[uint]string{}
 
-                        // --- 2. Text embedding (e5) on visual clip labels → text_embedding ---
-                        if len(visualTexts) > 0 {
-                            log.Printf("[embeddings] video_id=%d: computing text embeddings for %d visual clip labels",
-                                video.ID, len(visualTexts))
-                            vp.embedTextsToClips(video.ID, visualTexts, visualClips, "text_embedding")
-                        }
-                    }
-                }
+    if err := captionCmd.Start(); err != nil {
+        log.Printf("Warning: failed to start iv2_caption_runner for clips: %v", err)
+    } else {
+        go func() {
+            if _, err := io.Copy(os.Stderr, captionStderr); err != nil {
+                log.Printf("Warning: failed to read iv2_caption_runner stderr: %v", err)
             }
+        }()
+        captionOut, _ := io.ReadAll(captionStdout)
+        if err := captionCmd.Wait(); err != nil {
+            log.Printf("Warning: iv2_caption_runner (clips) failed: %v", err)
+        } else {
+            var captionResp struct {
+                Model    string `json:"model"`
+                Captions []struct {
+                    SceneIndex int    `json:"scene_index"`
+                    Text       string `json:"text"`
+                } `json:"captions"`
+                Error string `json:"error"`
+            }
+            if err := json.Unmarshal(captionOut, &captionResp); err != nil {
+                log.Printf("Warning: failed to parse iv2_caption_runner output: %v", err)
+            } else if captionResp.Error != "" {
+                log.Printf("Warning: iv2_caption_runner error: %s", captionResp.Error)
+            } else {
+                savedCaptions := 0
+                for _, cap := range captionResp.Captions {
+                    text := strings.TrimSpace(cap.Text)
+                    if text == "" {
+                        continue
+                    }
+                    clipID := uint(cap.SceneIndex)
+                    iv2Descriptions[clipID] = text
+
+                    // Only update label for visual clips (dialog clips keep spoken text)
+                    for _, c := range clips {
+                        if c.ID == clipID && c.ClipType == "visual" {
+                            if err := vp.db.UpdateClipLabel(clipID, text); err != nil {
+                                log.Printf("Warning: failed to update label for clip %d: %v", clipID, err)
+                            } else {
+                                savedCaptions++
+                            }
+                            break
+                        }
+                    }
+                }
+                log.Printf("[embeddings] video_id=%d: IV2 captions: %d descriptions, %d visual labels updated",
+                    video.ID, len(iv2Descriptions), savedCaptions)
+            }
+        }
+    }
+
+    // --- 2. Text embedding (e5) on IV2 descriptions for ALL clips → text_embedding ---
+    // This embeds the visual description so Lane 3 can search by what's on screen.
+    {
+        var textClips []models.Clip
+        var textDescs []string
+        for _, c := range clips {
+            desc, ok := iv2Descriptions[c.ID]
+            if ok && desc != "" {
+                textClips = append(textClips, c)
+                textDescs = append(textDescs, desc)
+            }
+        }
+        if len(textDescs) > 0 {
+            log.Printf("[embeddings] video_id=%d: computing text embeddings for %d clip IV2 descriptions",
+                video.ID, len(textDescs))
+            vp.embedTextsToClips(video.ID, textDescs, textClips, "text_embedding")
         }
     }
 
