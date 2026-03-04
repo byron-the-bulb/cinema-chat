@@ -29,7 +29,7 @@
 #
 # Environment variables:
 #   RUNPOD_API_KEY  - Your RunPod API key (required; or in cinema_bot/.env)
-#   GPU_TYPE        - GPU type (default: NVIDIA RTX A4000)
+#   GPU_TYPE        - GPU type (default: NVIDIA RTX A6000)
 #   KEEP_POD        - Set to 'true' to keep pod running after completion
 #   MOVIE_TITLE     - Video title (default: filename without extension)
 #
@@ -171,7 +171,7 @@ if [ -z "$RUNPOD_API_KEY" ]; then
     fi
 fi
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
-GPU_TYPE="${GPU_TYPE:-NVIDIA GeForce RTX 3090}"
+GPU_TYPE="${GPU_TYPE:-NVIDIA RTX A6000}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-va55/goodclips-runpod:clips}"
 VIDEO_DIR="${PROJECT_DIR}/data/videos"
 
@@ -240,7 +240,7 @@ if [ -z "$SOURCE" ]; then
     echo ""
     echo "Environment variables:"
     echo "  RUNPOD_API_KEY  - Your RunPod API key (required)"
-    echo "  GPU_TYPE        - GPU type (default: NVIDIA RTX 3090)"
+    echo "  GPU_TYPE        - GPU type (default: NVIDIA RTX A6000)"
     echo "  KEEP_POD        - Set to 'true' to keep pod running after completion"
     echo "  MOVIE_TITLE     - Video title (default: filename without extension)"
     exit 1
