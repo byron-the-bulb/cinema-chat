@@ -20,26 +20,26 @@ import (
     "goodclips-server/internal/queue"
 )
 
-// retryDBOp retries a DB operation up to maxRetries times with exponential
-// backoff. This handles transient PostgreSQL failures such as "database system
-// is in recovery mode" caused by OOM during heavy model loading.
-func retryDBOp(op func() error, maxRetries int) error {
-    var err error
-    for attempt := 0; attempt <= maxRetries; attempt++ {
-        err = op()
-        if err == nil {
-            return nil
-        }
-        if attempt < maxRetries {
-            wait := time.Duration(1<<uint(attempt)) * 5 * time.Second // 5s, 10s, 20s, 40s...
-            if wait > 60*time.Second {
-                wait = 60 * time.Second
-            }
-            log.Printf("DB operation failed (attempt %d/%d), retrying in %v: %v", attempt+1, maxRetries+1, wait, err)
-            time.Sleep(wait)
-        }
+// waitForDB blocks until the database is reachable, retrying every 10s for up
+// to 5 minutes. This handles PostgreSQL crashes caused by OOM during heavy
+// model loading (InternVL etc.) — PG goes into recovery mode and takes 1-3
+// minutes to come back. We wait ONCE before a batch of writes rather than
+// retrying each individual write.
+func (vp *VideoProcessor) waitForDB(stage string) {
+    if err := vp.db.Health(); err == nil {
+        return // DB is fine
     }
-    return err
+    log.Printf("[%s] Database unreachable, waiting for recovery...", stage)
+    deadline := time.Now().Add(5 * time.Minute)
+    for time.Now().Before(deadline) {
+        time.Sleep(10 * time.Second)
+        if err := vp.db.Health(); err == nil {
+            log.Printf("[%s] Database recovered, proceeding with writes", stage)
+            return
+        }
+        log.Printf("[%s] Still waiting for database...", stage)
+    }
+    log.Printf("[%s] WARNING: database still unreachable after 5 min, attempting writes anyway", stage)
 }
 
 // VideoProcessor handles video processing tasks
@@ -543,11 +543,14 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             return nil
         }
 
+        // InternVL model loading can OOM-kill PostgreSQL; wait for recovery before writing.
+        vp.waitForDB("visual-embeddings")
+
         saved := 0
         for _, v := range resp.Vectors {
             clipID := uint(v.SceneIndex)
             vec := v.Vector
-            if err := retryDBOp(func() error { return vp.db.UpdateClipVisualEmbedding(clipID, vec) }, 5); err != nil {
+            if err := vp.db.UpdateClipVisualEmbedding(clipID, vec); err != nil {
                 log.Printf("Failed to persist visual embedding for clip %d: %v", clipID, err)
                 continue
             }
@@ -555,7 +558,7 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         }
         // Update video's embedding model
         video.EmbeddingModel = resp.Model
-        if err := retryDBOp(func() error { return vp.db.UpdateVideo(video) }, 5); err != nil {
+        if err := vp.db.UpdateVideo(video); err != nil {
             log.Printf("Warning: failed to update video embedding_model: %v", err)
         }
         log.Printf("Persisted %d/%d visual embeddings for video %d", saved, len(resp.Vectors), video.ID)
@@ -615,6 +618,9 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             clipByID[c.ID] = c
         }
 
+        // IV2 caption runner may also trigger OOM; wait for DB before writing.
+        vp.waitForDB("iv2-captions")
+
         // Store IV2 descriptions: update visual clip labels + collect all for text embedding
         iv2Descriptions := make(map[uint]string, len(captionResp.Captions))
         savedCaptions := 0
@@ -629,7 +635,7 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             // Only update label for clips without dialog (dialog clips keep their spoken text)
             c, ok := clipByID[clipID]
             if ok && c.Label == "" {
-                if err := retryDBOp(func() error { return vp.db.UpdateClipLabel(clipID, text) }, 5); err != nil {
+                if err := vp.db.UpdateClipLabel(clipID, text); err != nil {
                     log.Printf("Warning: Failed to update label for clip %d: %v", clipID, err)
                     continue
                 }
@@ -695,8 +701,7 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                 if i >= len(tVectors) || len(tVectors[i]) == 0 {
                     continue
                 }
-                vec := tVectors[i]
-                if err := retryDBOp(func() error { return vp.db.UpdateClipTextEmbedding(clipID, vec) }, 5); err != nil {
+                if err := vp.db.UpdateClipTextEmbedding(clipID, tVectors[i]); err != nil {
                     log.Printf("Failed to persist text embedding for clip %d: %v", clipID, err)
                     continue
                 }
@@ -761,8 +766,7 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                 if i >= len(dVectors) || len(dVectors[i]) == 0 {
                     continue
                 }
-                vec := dVectors[i]
-                if err := retryDBOp(func() error { return vp.db.UpdateClipDialogEmbedding(clipID, vec) }, 5); err != nil {
+                if err := vp.db.UpdateClipDialogEmbedding(clipID, dVectors[i]); err != nil {
                     log.Printf("Failed to persist dialog embedding for clip %d: %v", clipID, err)
                     continue
                 }
@@ -815,11 +819,11 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
             log.Printf("Warning: CLIP embedding_dim=%d != 512; skipping persistence", cResp.EmbeddingDim)
             return nil
         }
+        vp.waitForDB("clip-embeddings")
         savedClip := 0
         for _, v := range cResp.Vectors {
             clipID := uint(v.SceneIndex)
-            vec := v.Vector
-            if err := retryDBOp(func() error { return vp.db.UpdateClipClipEmbedding(clipID, vec) }, 5); err != nil {
+            if err := vp.db.UpdateClipClipEmbedding(clipID, v.Vector); err != nil {
                 log.Printf("Failed to persist CLIP embedding for clip %d: %v", clipID, err)
                 continue
             }
@@ -877,8 +881,7 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
         savedAudio := 0
         for _, v := range aResp.Vectors {
             clipID := uint(v.SceneIndex)
-            vec := v.Vector
-            if err := retryDBOp(func() error { return vp.db.UpdateClipAudioEmbedding(clipID, vec) }, 5); err != nil {
+            if err := vp.db.UpdateClipAudioEmbedding(clipID, v.Vector); err != nil {
                 log.Printf("Failed to persist audio embedding for clip %d: %v", clipID, err)
                 continue
             }
@@ -1032,7 +1035,7 @@ func (vp *VideoProcessor) ProcessClipGeneration(payload map[string]interface{}) 
             SourceSceneID:   c.SourceSceneID,
             SourceCaptionID: c.SourceCaptionID,
         }
-        if err := retryDBOp(func() error { return vp.db.CreateClip(clip) }, 5); err != nil {
+        if err := vp.db.CreateClip(clip); err != nil {
             log.Printf("Warning: failed to store clip: %v", err)
             continue
         }
