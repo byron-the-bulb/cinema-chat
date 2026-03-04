@@ -20,6 +20,34 @@ import (
     "goodclips-server/internal/queue"
 )
 
+// freeSystemMemory drops Linux page caches and clears the CUDA memory pool.
+// This is critical on RunPod pods where Lighthouse (clip_generation) and InternVL
+// (embedding_generation) run back-to-back on the same GPU with limited system RAM.
+// Without this, the kernel retains file-backed pages from model loading, and the
+// next model load can OOM-kill PostgreSQL.
+func freeSystemMemory(stage string) {
+    log.Printf("[%s] Freeing system memory (drop caches + clear CUDA)...", stage)
+
+    // 1. Drop Linux page caches (requires root, which RunPod containers run as)
+    syncCmd := exec.Command("sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches")
+    if out, err := syncCmd.CombinedOutput(); err != nil {
+        log.Printf("[%s] Warning: failed to drop page caches: %v (%s)", stage, err, string(out))
+    } else {
+        log.Printf("[%s] Page caches dropped", stage)
+    }
+
+    // 2. Clear CUDA memory pool via a tiny Python subprocess
+    cudaCmd := exec.Command("python3", "-c", "import torch,gc;gc.collect();torch.cuda.empty_cache();print('CUDA cache cleared')")
+    if out, err := cudaCmd.CombinedOutput(); err != nil {
+        log.Printf("[%s] Warning: CUDA cache clear failed: %v (%s)", stage, err, string(out))
+    } else {
+        log.Printf("[%s] %s", stage, strings.TrimSpace(string(out)))
+    }
+
+    // 3. Brief pause to let the kernel stabilize
+    time.Sleep(5 * time.Second)
+}
+
 // waitForDB blocks until the database is reachable, retrying every 10s for up
 // to 5 minutes. This handles PostgreSQL crashes caused by OOM during heavy
 // model loading (InternVL etc.) — PG goes into recovery mode and takes 1-3
@@ -432,6 +460,10 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
     if backend == "" {
         backend = "iv2"
     }
+
+    // Safety net: free residual memory from clip_generation (Lighthouse models)
+    // before loading InternVL.  This is the step that historically OOM-kills PG.
+    freeSystemMemory("pre-embedding-cleanup")
 
     log.Printf("[embeddings] video_id=%d: starting embedding generation with backend=%s for %d clips", video.ID, backend, len(clips))
 
@@ -1042,6 +1074,14 @@ func (vp *VideoProcessor) ProcessClipGeneration(payload map[string]interface{}) 
         saved++
     }
     log.Printf("[clips] video_id=%d: persisted %d/%d clips", video.ID, saved, len(resp.Clips))
+
+    // Free GPU memory and drop Linux page caches so the embedding step
+    // (InternVL) doesn't OOM-kill PostgreSQL.  Lighthouse loads heavy models
+    // (CG-DETR + SlowFast) and even though the subprocess exited, the kernel
+    // page cache retains gigabytes of file-backed pages.  Dropping caches here
+    // guarantees all reclaimable memory is available before InternVL loads.
+    freeSystemMemory("clip-generation-cleanup")
+
     log.Printf("[clips] video_id=%d: clip generation complete (embeddings will run in embedding_generation job)", video.ID)
     return nil
 }
