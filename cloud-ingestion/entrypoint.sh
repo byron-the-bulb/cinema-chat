@@ -18,6 +18,20 @@ echo "=== GoodCLIPS RunPod Entrypoint ==="
 echo "Workspace: ${WORKSPACE}"
 echo "Log file:  ${LOG_FILE}"
 
+# Create swap space to prevent OOM kills during heavy model loading.
+# RunPod pods typically have no swap, so PostgreSQL gets killed when
+# InternVL/Lighthouse load large models alongside the DB.
+SWAPFILE="${WORKSPACE}/.swapfile"
+if [ ! -f "${SWAPFILE}" ]; then
+    echo "Creating 4GB swap file..."
+    fallocate -l 4G "${SWAPFILE}" 2>/dev/null || dd if=/dev/zero of="${SWAPFILE}" bs=1M count=4096 status=none
+    chmod 600 "${SWAPFILE}"
+    mkswap "${SWAPFILE}" > /dev/null
+fi
+if ! swapon -s | grep -q "${SWAPFILE}"; then
+    swapon "${SWAPFILE}" 2>/dev/null && echo "Swap enabled (4GB)" || echo "Warning: could not enable swap"
+fi
+
 # Create directories
 mkdir -p "${REDIS_DIR}" "${VIDEOS_DIR}"
 
@@ -41,18 +55,19 @@ if [ ! -f "${INIT_MARKER}" ]; then
     # Initialize as postgres user
     cd /tmp && su postgres -c "/usr/lib/postgresql/14/bin/initdb -D ${PGDATA}"
 
-    # Configure for remote access + heavy vector write workload
+    # Configure for remote access. Keep memory low — heavy ML models
+    # run alongside PG and we must avoid OOM kills.
     cat >> "${PGDATA}/postgresql.conf" <<PGCONF
 listen_addresses = '*'
-shared_buffers = 512MB
-work_mem = 16MB
-maintenance_work_mem = 256MB
-max_wal_size = 4GB
-min_wal_size = 1GB
+shared_buffers = 128MB
+work_mem = 4MB
+maintenance_work_mem = 64MB
+max_wal_size = 2GB
+min_wal_size = 256MB
 checkpoint_timeout = 15min
 checkpoint_completion_target = 0.9
-wal_buffers = 64MB
-effective_cache_size = 1GB
+wal_buffers = 16MB
+effective_cache_size = 256MB
 PGCONF
     echo "host all all 0.0.0.0/0 md5" >> "${PGDATA}/pg_hba.conf"
     touch "${INIT_MARKER}"
@@ -64,11 +79,10 @@ else
     INIT_DB=false
 fi
 
-# Always ensure PostgreSQL is tuned for heavy vector writes
-# Uses sed to replace existing values (initdb writes defaults like shared_buffers = 128MB)
-for param in "shared_buffers = 512MB" "work_mem = 16MB" "maintenance_work_mem = 256MB" \
-             "max_wal_size = 4GB" "min_wal_size = 1GB" "checkpoint_timeout = 15min" \
-             "checkpoint_completion_target = 0.9" "wal_buffers = 64MB" "effective_cache_size = 1GB"; do
+# Always ensure PostgreSQL memory is kept low (ML models need the RAM)
+for param in "shared_buffers = 128MB" "work_mem = 4MB" "maintenance_work_mem = 64MB" \
+             "max_wal_size = 2GB" "min_wal_size = 256MB" "checkpoint_timeout = 15min" \
+             "checkpoint_completion_target = 0.9" "wal_buffers = 16MB" "effective_cache_size = 256MB"; do
     key="${param%% =*}"
     if grep -q "^${key}" "${PGDATA}/postgresql.conf" 2>/dev/null; then
         sed -i "s|^${key}.*|${param}|" "${PGDATA}/postgresql.conf"
@@ -82,6 +96,14 @@ done
 # Start PostgreSQL as postgres user
 echo "Starting PostgreSQL..."
 cd /tmp && su postgres -c "/usr/lib/postgresql/14/bin/pg_ctl -D ${PGDATA} -l /var/lib/postgresql/postgresql.log start"
+
+# Protect PostgreSQL from OOM killer (make it the last process to be killed)
+PG_PID=$(head -1 "${PGDATA}/postmaster.pid" 2>/dev/null || true)
+if [ -n "${PG_PID}" ] && [ -d "/proc/${PG_PID}" ]; then
+    echo -1000 > "/proc/${PG_PID}/oom_score_adj" 2>/dev/null && \
+        echo "PostgreSQL PID ${PG_PID} protected from OOM killer" || \
+        echo "Warning: could not set OOM protection for PostgreSQL"
+fi
 
 # Wait for PostgreSQL
 echo "Waiting for PostgreSQL..."
