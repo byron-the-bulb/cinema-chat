@@ -221,14 +221,20 @@ func (vp *VideoProcessor) createSubsequentJobs(video *models.Video) error {
         log.Printf("Enqueued clip generation job for video ID %d", video.ID)
     }
 
-    // Enqueue embedding generation (runs after clips, embeds clips not scenes)
-    embedPayload := map[string]interface{}{
-        "video_id": video.ID,
-    }
-    if _, err := vp.jobQueue.Enqueue(queue.JobTypeEmbeddingGeneration, embedPayload); err != nil {
-        log.Printf("Warning: Failed to enqueue embedding generation job for video %d: %v", video.ID, err)
+    // Enqueue embedding generation (runs after clips, embeds clips not scenes).
+    // Set SKIP_EMBEDDINGS=true to run embeddings on a separate pod (avoids OOM
+    // when Lighthouse and InternVL compete for the same system RAM).
+    if strings.EqualFold(os.Getenv("SKIP_EMBEDDINGS"), "true") || os.Getenv("SKIP_EMBEDDINGS") == "1" {
+        log.Printf("SKIP_EMBEDDINGS set — skipping embedding generation job for video %d", video.ID)
     } else {
-        log.Printf("Enqueued embedding generation job for video ID %d", video.ID)
+        embedPayload := map[string]interface{}{
+            "video_id": video.ID,
+        }
+        if _, err := vp.jobQueue.Enqueue(queue.JobTypeEmbeddingGeneration, embedPayload); err != nil {
+            log.Printf("Warning: Failed to enqueue embedding generation job for video %d: %v", video.ID, err)
+        } else {
+            log.Printf("Enqueued embedding generation job for video ID %d", video.ID)
+        }
     }
 
     return nil

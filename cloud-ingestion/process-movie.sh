@@ -286,7 +286,7 @@ POD_RESPONSE=$(curl -s --max-time 60 --request POST \
   --url "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
   --header 'content-type: application/json' \
   --data '{
-    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,9000/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}] }) { id machineId } }"
+    "query": "mutation { podFindAndDeployOnDemand(input: { cloudType: SECURE, gpuCount: 1, volumeInGb: 50, containerDiskInGb: 50, gpuTypeId: \"'"${GPU_TYPE}"'\", name: \"goodclips-processor\", imageName: \"'"${DOCKER_IMAGE}"'\", dockerArgs: \"\", ports: \"8080/http,9000/tcp,5432/tcp\", volumeMountPath: \"/workspace\", env: [{key: \"AUTO_DOWNLOAD_URL\", value: \"'"${MOVIE_URL}"'\"}, {key: \"AUTO_DOWNLOAD_FILENAME\", value: \"'"${MOVIE_FILENAME}"'\"}, {key: \"AUTO_TITLE\", value: \"'"${MOVIE_TITLE}"'\"}, {key: \"SKIP_EMBEDDINGS\", value: \"'"${SKIP_EMBEDDINGS:-}"'\"}] }) { id machineId } }"
   }')
 
 POD_ID=$(echo "$POD_RESPONSE" | python3 -c "
