@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-clip_generator.py — Generate dialog + visual clips from scenes and captions.
+clip_generator.py — Generate clips from PySceneDetect scenes using Lighthouse.
 
 Reads JSON from stdin with video metadata, scenes, and captions.
-Outputs JSON to stdout with generated clips (without embeddings — those are
-computed separately by the existing embedding runners).
+Outputs JSON to stdout with generated clips (embeddings computed separately).
 
-Dialog clips:  Each 'en' caption becomes a clip with padded boundaries.
-Visual clips:  PySceneDetect scenes are the primary boundaries. Short scenes
-               (< 5s) become clips directly. Longer scenes are fed individually
-               to Lighthouse for highlight detection (respects 150s input limit).
-               Clips that overlap >80% with dialog clips are deduplicated.
+Lighthouse runs on each scene (>= MIN_SCENE_DURATION) to detect highlight
+windows with salience scores. Results are sorted by salience and capped at
+MAX_CLIPS. Each clip gets any overlapping 'en' caption text attached as its
+label — clips with dialog get a dialog_embedding in the embedding step.
 
 Usage (called by processor.go):
     echo '{"video_id": 1, "video_path": "/data/videos/film.mp4", ...}' | \
@@ -39,7 +37,7 @@ def check_lighthouse():
             _lighthouse_available = True
         except ImportError:
             _lighthouse_available = False
-            print("WARNING: lighthouse not installed, visual clip detection disabled",
+            print("WARNING: lighthouse not installed, using scene fallback",
                   file=sys.stderr, flush=True)
     return _lighthouse_available
 
@@ -57,7 +55,7 @@ def get_lighthouse_model(device="cuda"):
 
     weights = os.environ.get("LIGHTHOUSE_WEIGHTS", "")
     if not weights:
-        print("WARNING: LIGHTHOUSE_WEIGHTS not set, skipping visual clip detection",
+        print("WARNING: LIGHTHOUSE_WEIGHTS not set, using scene fallback",
               file=sys.stderr, flush=True)
         return None
 
@@ -109,8 +107,8 @@ def extract_segment(video_path, start, end, output_path):
 def detect_with_lighthouse(video_path, start, end, device="cuda"):
     """
     Run Lighthouse on a video segment to detect clip boundaries.
-    Extracts the segment to a temp file (Lighthouse processes whole files),
-    runs CG-DETR, and maps returned windows back to absolute movie time.
+    Extracts the segment to a temp file, runs CG-DETR, and maps returned
+    windows back to absolute movie time.
     Returns list of (abs_start, abs_end, confidence) tuples.
     """
     model = get_lighthouse_model(device)
@@ -134,10 +132,8 @@ def detect_with_lighthouse(video_path, start, end, device="cuda"):
         for window in highlight_windows:
             if len(window) >= 3:
                 w_start, w_end, confidence = window[0], window[1], window[2]
-                # Window times are relative to the extracted segment → offset to absolute
                 abs_start = start + max(0, w_start)
                 abs_end = start + w_end
-                # Clamp to chunk boundaries
                 abs_start = max(abs_start, start)
                 abs_end = min(abs_end, end)
                 if abs_end > abs_start:
@@ -157,75 +153,23 @@ def detect_with_lighthouse(video_path, start, end, device="cuda"):
 # Configuration
 # ---------------------------------------------------------------------------
 
-DIALOG_PAD_SECS = float(os.environ.get("DIALOG_PAD_SECS", "0.3"))
 MIN_CLIP_DURATION = float(os.environ.get("MIN_CLIP_DURATION", "0.5"))
-MIN_CHUNK_DURATION = float(os.environ.get("MIN_CHUNK_DURATION", "1.0"))
-VISUAL_SALIENCE_THRESHOLD = float(os.environ.get("VISUAL_SALIENCE_THRESHOLD", "0.1"))
-DEDUP_OVERLAP_THRESHOLD = float(os.environ.get("DEDUP_OVERLAP_THRESHOLD", "0.8"))
-
-
-# ---------------------------------------------------------------------------
-# Dialog clip generation
-# ---------------------------------------------------------------------------
-
-def generate_dialog_clips(captions, scenes):
-    """
-    Each 'en' caption becomes a dialog clip with padded boundaries.
-    Links to the source caption and the overlapping scene.
-    """
-    clips = []
-    for cap in captions:
-        if cap.get("language") != "en":
-            continue
-
-        text = (cap.get("text") or "").strip()
-        if not text:
-            continue
-
-        start = cap["start_time"] - DIALOG_PAD_SECS
-        end = cap["end_time"] + DIALOG_PAD_SECS
-        if start < 0:
-            start = 0
-
-        duration = end - start
-        if duration < MIN_CLIP_DURATION:
-            continue
-
-        # Find overlapping scene
-        source_scene_id = None
-        for s in scenes:
-            if s["start_time"] < end and s["end_time"] > start:
-                source_scene_id = s["id"]
-                break
-
-        clips.append({
-            "clip_type": "dialog",
-            "start_time": round(start, 3),
-            "end_time": round(end, 3),
-            "label": text,
-            "salience_score": cap.get("confidence", 1.0),
-            "source_scene_id": source_scene_id,
-            "source_caption_id": cap["id"],
-        })
-
-    return clips
-
-
-# ---------------------------------------------------------------------------
-# Visual clip generation — Lighthouse on full movie
-# ---------------------------------------------------------------------------
-
-
-MIN_SCENE_FOR_LIGHTHOUSE = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "3.0"))
+MIN_SCENE_DURATION = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "3.0"))
 MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "150.0"))
+SALIENCE_THRESHOLD = float(os.environ.get("VISUAL_SALIENCE_THRESHOLD", "0.1"))
+MAX_CLIPS = int(os.environ.get("MAX_CLIPS", "0"))  # 0 = no limit
 
 
-def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
+# ---------------------------------------------------------------------------
+# Clip generation
+# ---------------------------------------------------------------------------
+
+def generate_clips(scenes, video_path, video_duration, captions, device="cuda"):
     """
-    Run Lighthouse on each PySceneDetect scene to detect highlights.
-    Scenes < MIN_SCENE_FOR_LIGHTHOUSE (3s) are discarded. All remaining
-    scenes go through Lighthouse. Long scenes (> 150s) are split into
-    sub-segments for Lighthouse's input limit.
+    Run Lighthouse on each PySceneDetect scene to find salient highlights.
+    Scenes < MIN_SCENE_DURATION are skipped. Long scenes (> 150s) are split.
+    Results sorted by salience, capped at MAX_CLIPS, then overlapping captions
+    are attached as labels.
     """
     sorted_scenes = sorted(scenes, key=lambda s: s["start_time"])
 
@@ -234,123 +178,111 @@ def generate_visual_clips(scenes, video_path, video_duration, device="cuda"):
     skipped = 0
     for s in sorted_scenes:
         dur = s["end_time"] - s["start_time"]
-        if dur < MIN_SCENE_FOR_LIGHTHOUSE:
+        if dur < MIN_SCENE_DURATION:
             skipped += 1
             continue
         if dur <= MAX_LIGHTHOUSE_INPUT:
             segments.append((s["start_time"], s["end_time"], s["id"]))
         else:
-            # Split long scene into sub-segments at the limit
             pos = s["start_time"]
             while pos < s["end_time"]:
                 seg_end = min(pos + MAX_LIGHTHOUSE_INPUT, s["end_time"])
-                if seg_end - pos >= MIN_SCENE_FOR_LIGHTHOUSE:
+                if seg_end - pos >= MIN_SCENE_DURATION:
                     segments.append((pos, seg_end, s["id"]))
                 pos = seg_end
 
-    print(f"  {len(segments)} scenes >= {MIN_SCENE_FOR_LIGHTHOUSE}s for Lighthouse "
+    print(f"  {len(segments)} scenes >= {MIN_SCENE_DURATION}s for Lighthouse "
           f"(skipped {skipped} short scenes)",
           file=sys.stderr, flush=True)
 
-    clips = []
+    raw_clips = []
 
-    if not check_lighthouse():
-        for s_start, s_end, scene_id in segments:
-            clips.append({
-                "clip_type": "visual",
-                "start_time": round(s_start, 3),
-                "end_time": round(s_end, 3),
-                "label": "",
-                "salience_score": 0.5,
-                "source_scene_id": scene_id,
-                "source_caption_id": None,
-            })
-        return clips
-
-    # Run Lighthouse on each scene individually
-    for i, (s_start, s_end, scene_id) in enumerate(segments):
-        print(f"  Lighthouse scene {i+1}/{len(segments)}: "
-              f"{s_start:.1f}s - {s_end:.1f}s ({s_end - s_start:.1f}s)",
+    if not check_lighthouse() or get_lighthouse_model(device) is None:
+        # Fallback: each qualifying scene becomes a clip with default salience
+        print("  Lighthouse unavailable — using scene boundaries as clips",
               file=sys.stderr, flush=True)
-
-        highlights = detect_with_lighthouse(video_path, s_start, s_end, device=device)
-
-        if not highlights:
-            clips.append({
-                "clip_type": "visual",
+        for s_start, s_end, scene_id in segments:
+            raw_clips.append({
                 "start_time": round(s_start, 3),
                 "end_time": round(s_end, 3),
-                "label": "",
                 "salience_score": 0.5,
                 "source_scene_id": scene_id,
-                "source_caption_id": None,
             })
-            continue
+    else:
+        # Run Lighthouse on each scene
+        for i, (s_start, s_end, scene_id) in enumerate(segments):
+            print(f"  Lighthouse scene {i+1}/{len(segments)}: "
+                  f"{s_start:.1f}s - {s_end:.1f}s ({s_end - s_start:.1f}s)",
+                  file=sys.stderr, flush=True)
 
-        for h_start, h_end, score in highlights:
-            if score < VISUAL_SALIENCE_THRESHOLD:
-                continue
-            if h_end - h_start < MIN_CLIP_DURATION:
+            highlights = detect_with_lighthouse(video_path, s_start, s_end, device=device)
+
+            if not highlights:
+                # No highlights — use the whole scene as a clip
+                raw_clips.append({
+                    "start_time": round(s_start, 3),
+                    "end_time": round(s_end, 3),
+                    "salience_score": 0.5,
+                    "source_scene_id": scene_id,
+                })
                 continue
 
-            clips.append({
-                "clip_type": "visual",
-                "start_time": round(h_start, 3),
-                "end_time": round(h_end, 3),
-                "label": "",
-                "salience_score": round(score, 4),
-                "source_scene_id": scene_id,
-                "source_caption_id": None,
-            })
+            for h_start, h_end, score in highlights:
+                if score < SALIENCE_THRESHOLD:
+                    continue
+                if h_end - h_start < MIN_CLIP_DURATION:
+                    continue
+                raw_clips.append({
+                    "start_time": round(h_start, 3),
+                    "end_time": round(h_end, 3),
+                    "salience_score": round(score, 4),
+                    "source_scene_id": scene_id,
+                })
+
+    print(f"  {len(raw_clips)} raw clips from Lighthouse", file=sys.stderr, flush=True)
+
+    # Sort by salience descending, cap at MAX_CLIPS
+    raw_clips.sort(key=lambda c: c["salience_score"], reverse=True)
+    if MAX_CLIPS > 0 and len(raw_clips) > MAX_CLIPS:
+        print(f"  Capping from {len(raw_clips)} to {MAX_CLIPS} clips by salience",
+              file=sys.stderr, flush=True)
+        raw_clips = raw_clips[:MAX_CLIPS]
+
+    # Sort back by time for output
+    raw_clips.sort(key=lambda c: c["start_time"])
+
+    # Attach overlapping 'en' captions as labels
+    en_captions = [c for c in captions if c.get("language") == "en"
+                   and (c.get("text") or "").strip()]
+
+    clips = []
+    for rc in raw_clips:
+        # Collect all overlapping caption texts
+        overlapping_texts = []
+        source_caption_id = None
+        for cap in en_captions:
+            if cap["start_time"] < rc["end_time"] and cap["end_time"] > rc["start_time"]:
+                overlapping_texts.append(cap["text"].strip())
+                if source_caption_id is None:
+                    source_caption_id = cap["id"]
+
+        label = " ".join(overlapping_texts) if overlapping_texts else ""
+
+        clips.append({
+            "clip_type": "clip",
+            "start_time": rc["start_time"],
+            "end_time": rc["end_time"],
+            "label": label,
+            "salience_score": rc["salience_score"],
+            "source_scene_id": rc["source_scene_id"],
+            "source_caption_id": source_caption_id,
+        })
+
+    with_dialog = sum(1 for c in clips if c["label"])
+    print(f"  {len(clips)} clips total ({with_dialog} with dialog)",
+          file=sys.stderr, flush=True)
 
     return clips
-
-
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
-
-def compute_overlap(clip_a, clip_b):
-    """
-    Compute temporal overlap ratio (IoU-style) between two clips.
-    Returns overlap_duration / min(duration_a, duration_b).
-    """
-    a_start, a_end = clip_a["start_time"], clip_a["end_time"]
-    b_start, b_end = clip_b["start_time"], clip_b["end_time"]
-
-    overlap_start = max(a_start, b_start)
-    overlap_end = min(a_end, b_end)
-    overlap_duration = max(0, overlap_end - overlap_start)
-
-    min_duration = min(a_end - a_start, b_end - b_start)
-    if min_duration <= 0:
-        return 0.0
-    return overlap_duration / min_duration
-
-
-def deduplicate_clips(dialog_clips, visual_clips):
-    """
-    Remove visual clips that overlap significantly with dialog clips.
-    A visual clip is removed if it overlaps >DEDUP_OVERLAP_THRESHOLD with
-    any dialog clip (same moment already covered by dialog).
-    """
-    deduped = []
-    removed = 0
-    for vc in visual_clips:
-        dominated = False
-        for dc in dialog_clips:
-            if compute_overlap(vc, dc) > DEDUP_OVERLAP_THRESHOLD:
-                dominated = True
-                break
-        if dominated:
-            removed += 1
-        else:
-            deduped.append(vc)
-
-    if removed > 0:
-        print(f"  Deduplication: removed {removed} visual clips overlapping with dialog",
-              file=sys.stderr, flush=True)
-    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -380,34 +312,18 @@ def main():
           f"{len(scenes)} scenes, {len(captions)} captions",
           file=sys.stderr, flush=True)
 
-    # Generate dialog clips from captions
-    dialog_clips = generate_dialog_clips(captions, scenes)
-    print(f"  Generated {len(dialog_clips)} dialog clips", file=sys.stderr, flush=True)
+    if not video_path or video_duration <= 0:
+        print(json.dumps({"error": "missing video_path or video_duration"}))
+        return
 
-    # Generate visual clips — Lighthouse on full movie
-    visual_clips = []
-    if video_path and video_duration > 0:
-        visual_clips = generate_visual_clips(
-            scenes, video_path, video_duration, device=device
-        )
-        print(f"  Generated {len(visual_clips)} visual clips (before dedup)",
-              file=sys.stderr, flush=True)
+    clips = generate_clips(scenes, video_path, video_duration, captions, device=device)
 
-        # Deduplicate visual clips that overlap with dialog clips
-        visual_clips = deduplicate_clips(dialog_clips, visual_clips)
-        print(f"  {len(visual_clips)} visual clips after dedup",
-              file=sys.stderr, flush=True)
-    else:
-        print("  Skipping visual clips (no video_path or duration)",
-              file=sys.stderr, flush=True)
-
-    all_clips = dialog_clips + visual_clips
-
+    with_dialog = sum(1 for c in clips if c["label"])
     print(json.dumps({
         "video_id": video_id,
-        "clips": all_clips,
-        "dialog_count": len(dialog_clips),
-        "visual_count": len(visual_clips),
+        "clips": clips,
+        "clip_count": len(clips),
+        "with_dialog": with_dialog,
     }))
 
 

@@ -58,7 +58,7 @@ type ClipSearchResult struct {
 
 // SearchClipsByDialogVector searches dialog_embedding (e5-base-v2 of spoken text).
 func (db *DB) SearchClipsByDialogVector(vec []float32, k int, filterVideoIDs []uint) ([]ClipSearchResult, error) {
-	return db.searchClipsByVector("dialog_embedding", vec, k, filterVideoIDs, []string{"dialog"}, "dialog")
+	return db.searchClipsByVector("dialog_embedding", vec, k, filterVideoIDs, nil, "dialog")
 }
 
 // SearchClipsByClipVector searches clip_embedding (CLIP ViT-B/32 keyframe) across all clip types.
@@ -66,9 +66,9 @@ func (db *DB) SearchClipsByClipVector(vec []float32, k int, filterVideoIDs []uin
 	return db.searchClipsByVector("clip_embedding", vec, k, filterVideoIDs, nil, "clip")
 }
 
-// SearchClipsByVisualVector searches visual_embedding (InternVL) on visual clips.
+// SearchClipsByVisualVector searches visual_embedding (InternVL) on all clips.
 func (db *DB) SearchClipsByVisualVector(vec []float32, k int, filterVideoIDs []uint) ([]ClipSearchResult, error) {
-	return db.searchClipsByVector("visual_embedding", vec, k, filterVideoIDs, []string{"visual"}, "visual")
+	return db.searchClipsByVector("visual_embedding", vec, k, filterVideoIDs, nil, "visual")
 }
 
 // UpdateClipDialogEmbedding sets the dialog_embedding for a clip by ID.
@@ -106,9 +106,9 @@ func (db *DB) UpdateClipLabel(clipID uint, label string) error {
 	return db.Model(&models.Clip{}).Where("id = ?", clipID).Update("label", label).Error
 }
 
-// SearchClipsByTextVector searches text_embedding (e5 of IV2 descriptions) on visual clips.
+// SearchClipsByTextVector searches text_embedding (e5 of IV2 descriptions) on all clips.
 func (db *DB) SearchClipsByTextVector(vec []float32, k int, filterVideoIDs []uint) ([]ClipSearchResult, error) {
-	return db.searchClipsByVector("text_embedding", vec, k, filterVideoIDs, []string{"visual"}, "text")
+	return db.searchClipsByVector("text_embedding", vec, k, filterVideoIDs, nil, "text")
 }
 
 // searchClipsByVector is the shared implementation for all clip vector searches.

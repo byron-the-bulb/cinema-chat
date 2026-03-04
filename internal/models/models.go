@@ -142,8 +142,8 @@ type Caption struct {
 	Scene *Scene `json:"scene,omitempty" gorm:"foreignKey:SceneID"`
 }
 
-// Clip represents a curated playable moment (dialog or visual).
-// Dialog clips reference captions; visual clips come from Lighthouse highlight detection.
+// Clip represents a salient playable moment found by Lighthouse highlight detection.
+// Clips with overlapping captions get dialog text as their label.
 type Clip struct {
 	ID              uint             `json:"id" gorm:"primaryKey"`
 	UUID            string           `json:"uuid" gorm:"type:uuid;default:uuid_generate_v4();unique;not null"`
