@@ -11,12 +11,19 @@ import (
     "path/filepath"
     "strconv"
     "strings"
+    "time"
 
     "goodclips-server/internal/database"
     "goodclips-server/internal/ffmpeg"
     "goodclips-server/internal/models"
     "goodclips-server/internal/scenedetect"
     "goodclips-server/internal/queue"
+)
+
+const (
+    // Batch size for vector embedding writes — pause between batches to let PG flush WAL.
+    embeddingBatchSize  = 50
+    embeddingBatchPause = 2 * time.Second
 )
 
 // VideoProcessor handles video processing tasks
@@ -540,6 +547,9 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                                 log.Printf("Warning: failed to update label for clip %d: %v", clipID, err)
                             } else {
                                 savedCaptions++
+                                if savedCaptions%embeddingBatchSize == 0 {
+                                    time.Sleep(embeddingBatchPause)
+                                }
                             }
                             break
                         }
@@ -628,13 +638,18 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                         log.Printf("Warning: IV2 embedding_dim=%d != %d; skipping", ivResp.EmbeddingDim, expectedDim)
                     } else {
                         savedIV := 0
-                        for _, v := range ivResp.Vectors {
+                        for i, v := range ivResp.Vectors {
                             clipID := uint(v.SceneIndex)
                             if err := vp.db.UpdateClipVisualEmbedding(clipID, v.Vector); err != nil {
                                 log.Printf("Warning: failed to persist visual embedding for clip %d: %v", clipID, err)
                                 continue
                             }
                             savedIV++
+                            if (i+1)%embeddingBatchSize == 0 {
+                                log.Printf("[embeddings] video_id=%d: visual embedding batch %d/%d persisted",
+                                    video.ID, i+1, len(ivResp.Vectors))
+                                time.Sleep(embeddingBatchPause)
+                            }
                         }
                         log.Printf("[embeddings] video_id=%d: persisted %d/%d InternVL visual embeddings",
                             video.ID, savedIV, len(ivResp.Vectors))
@@ -686,13 +701,18 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                 log.Printf("Warning: CLIP embedding_dim=%d != 512; skipping", clipResp.EmbeddingDim)
             } else {
                 savedCE := 0
-                for _, v := range clipResp.Vectors {
+                for i, v := range clipResp.Vectors {
                     clipID := uint(v.SceneIndex)
                     if err := vp.db.UpdateClipClipEmbedding(clipID, v.Vector); err != nil {
                         log.Printf("Warning: failed to persist CLIP embedding for clip %d: %v", clipID, err)
                         continue
                     }
                     savedCE++
+                    if (i+1)%embeddingBatchSize == 0 {
+                        log.Printf("[embeddings] video_id=%d: CLIP embedding batch %d/%d persisted",
+                            video.ID, i+1, len(clipResp.Vectors))
+                        time.Sleep(embeddingBatchPause)
+                    }
                 }
                 log.Printf("[embeddings] video_id=%d: persisted %d/%d CLIP embeddings", video.ID, savedCE, len(clipResp.Vectors))
             }
@@ -736,13 +756,18 @@ func (vp *VideoProcessor) ProcessEmbeddingGeneration(payload map[string]interfac
                     log.Printf("Warning: CLAP embedding_dim=%d != 512; skipping", audioResp.EmbeddingDim)
                 } else {
                     savedAudio := 0
-                    for _, v := range audioResp.Vectors {
+                    for i, v := range audioResp.Vectors {
                         clipID := uint(v.SceneIndex)
                         if err := vp.db.UpdateClipAudioEmbedding(clipID, v.Vector); err != nil {
                             log.Printf("Warning: failed to persist audio embedding for clip %d: %v", clipID, err)
                             continue
                         }
                         savedAudio++
+                        if (i+1)%embeddingBatchSize == 0 {
+                            log.Printf("[embeddings] video_id=%d: audio embedding batch %d/%d persisted",
+                                video.ID, i+1, len(audioResp.Vectors))
+                            time.Sleep(embeddingBatchPause)
+                        }
                     }
                     log.Printf("[embeddings] video_id=%d: persisted %d/%d audio embeddings", video.ID, savedAudio, len(audioResp.Vectors))
                 }
@@ -816,6 +841,10 @@ func (vp *VideoProcessor) embedTextsToClips(videoID uint, texts []string, target
             continue
         }
         saved++
+        if saved%embeddingBatchSize == 0 {
+            log.Printf("[embeddings] video_id=%d: %s batch %d persisted", videoID, embeddingType, saved)
+            time.Sleep(embeddingBatchPause)
+        }
     }
     log.Printf("[embeddings] video_id=%d: persisted %d/%d %s embeddings", videoID, saved, len(targetClips), embeddingType)
 }
