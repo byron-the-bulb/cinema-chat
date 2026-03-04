@@ -30,7 +30,14 @@ def read_payload() -> Dict[str, Any]:
 
 def main():
     payload = read_payload()
-    mode = payload.get("mode", "audio")  # "audio" or "text"
+    video_path = payload.get("video_path")
+    scenes = payload.get("scenes", [])
+    sample_rate = int(payload.get("sample_rate", 48000))
+
+    if not video_path or not isinstance(scenes, list) or len(scenes) == 0:
+        print(json.dumps({"error": "invalid input: video_path and scenes are required"}))
+        return
+
     model_id = os.environ.get("CLAP_MODEL_ID", "laion/clap-htsat-fused")
 
     try:
@@ -44,39 +51,6 @@ def main():
     device = os.environ.get("CLAP_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
-
-    if mode == "text":
-        # Text query embedding path
-        texts: List[str] = []
-        if "texts" in payload and isinstance(payload["texts"], list):
-            texts = [str(t) for t in payload["texts"]]
-        elif "text" in payload:
-            texts = [str(payload["text"])]
-        else:
-            print(json.dumps({"error": "missing 'text' or 'texts' in payload"}))
-            return
-        with torch.no_grad():
-            inputs = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            feats = model.get_text_features(**inputs)
-            feats = l2_normalize(feats)
-        D = int(feats.shape[1])
-        out = {"model": model_id, "embedding_dim": D}
-        if feats.shape[0] == 1:
-            out["vector"] = to_list(feats[0])
-        else:
-            out["vectors"] = [to_list(v) for v in feats]
-        print(json.dumps(out))
-        return
-
-    # Audio per‑scene mode
-    video_path = payload.get("video_path")
-    scenes = payload.get("scenes", [])
-    sample_rate = int(payload.get("sample_rate", 48000))
-
-    if not video_path or not isinstance(scenes, list) or len(scenes) == 0:
-        print(json.dumps({"error": "invalid input: video_path and scenes are required"}))
-        return
 
     results = []
     D = None

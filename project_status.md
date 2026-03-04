@@ -1,10 +1,5 @@
 # GoodCLIPS Project Status Journal
 
-## 2025-11-06T20:27:43-08:00
-
-- **Documentation**
-  - Created `README.md` with in-depth architecture overview, build/run instructions, API usage, troubleshooting, and current system status.
-
 ## 2025-11-03T03:50:17-08:00
 
 - **CLIP embeddings persisted for video 6**

@@ -1,0 +1,17 @@
+# Large video files
+videos/*.mp4
+videos/*.mkv
+videos/*.avi
+videos/*.mov
+videos/*.webm
+
+# Keep metadata
+!videos/*.json
+!videos/*.txt
+!videos/README.md
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
