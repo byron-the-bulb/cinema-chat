@@ -104,12 +104,82 @@ def extract_segment(video_path, start, end, output_path):
     return True
 
 
+def saliency_to_clips(scores, scene_start, scene_end, percentile, min_dur):
+    """
+    Convert per-frame saliency scores into clip boundaries.
+
+    Each score covers a ~2-second window.  We threshold at the given
+    percentile within this scene, group consecutive above-threshold frames
+    (merging across single-frame gaps), and return clips as
+    (abs_start, abs_end, avg_score) tuples.
+    """
+    n = len(scores)
+    if n == 0:
+        return []
+
+    duration = scene_end - scene_start
+    time_per_frame = duration / n
+
+    # Percentile threshold within this scene
+    sorted_scores = sorted(scores)
+    idx = int(n * percentile / 100.0)
+    idx = min(idx, n - 1)
+    threshold = sorted_scores[idx]
+
+    # Mark frames above threshold
+    above = [s >= threshold for s in scores]
+
+    # Merge single-frame gaps: if frame i-1 and i+1 are above but i is not,
+    # include frame i too (avoids fragmenting a moment)
+    merged = list(above)
+    for i in range(1, n - 1):
+        if not above[i] and above[i - 1] and above[i + 1]:
+            merged[i] = True
+
+    # Normalize scores to 0-1 (saliency can be negative; downstream
+    # SALIENCE_THRESHOLD expects values in 0-1 range)
+    s_min = min(scores)
+    s_max = max(scores)
+    s_range = s_max - s_min if s_max > s_min else 1.0
+    norm = [(s - s_min) / s_range for s in scores]
+
+    # Group consecutive True frames into clips
+    clips = []
+    clip_start_idx = None
+    clip_norm_scores = []
+
+    for i in range(n):
+        if merged[i]:
+            if clip_start_idx is None:
+                clip_start_idx = i
+                clip_norm_scores = []
+            clip_norm_scores.append(norm[i])
+        else:
+            if clip_start_idx is not None:
+                abs_start = scene_start + clip_start_idx * time_per_frame
+                abs_end = scene_start + i * time_per_frame
+                avg_score = sum(clip_norm_scores) / len(clip_norm_scores)
+                if abs_end - abs_start >= min_dur:
+                    clips.append((abs_start, abs_end, avg_score))
+                clip_start_idx = None
+
+    # Handle clip extending to end of scene
+    if clip_start_idx is not None:
+        abs_start = scene_start + clip_start_idx * time_per_frame
+        abs_end = scene_end
+        avg_score = sum(clip_norm_scores) / len(clip_norm_scores)
+        if abs_end - abs_start >= min_dur:
+            clips.append((abs_start, abs_end, avg_score))
+
+    return clips
+
+
 def detect_with_lighthouse(video_path, start, end, device="cuda"):
     """
-    Run Lighthouse on a video segment to detect clip boundaries.
-    Extracts the segment to a temp file, runs CG-DETR, and maps returned
-    windows back to absolute movie time.
-    Returns list of (abs_start, abs_end, confidence) tuples.
+    Run Lighthouse on a video segment and use per-frame saliency scores
+    to find clip boundaries.  Saliency is query-independent — it measures
+    visual importance without needing a text query.
+    Returns list of (abs_start, abs_end, avg_saliency) tuples.
     """
     model = get_lighthouse_model(device)
     if model is None:
@@ -126,18 +196,23 @@ def detect_with_lighthouse(video_path, start, end, device="cuda"):
         video = model.encode_video(tmp_path)
         prediction = model.predict("", video)
 
-        highlight_windows = prediction.get("pred_relevant_windows", [])
+        saliency = prediction.get("pred_saliency_scores", [])
 
-        results = []
-        for window in highlight_windows:
-            if len(window) >= 3:
-                w_start, w_end, confidence = window[0], window[1], window[2]
-                abs_start = start + max(0, w_start)
-                abs_end = start + w_end
-                abs_start = max(abs_start, start)
-                abs_end = min(abs_end, end)
-                if abs_end > abs_start:
-                    results.append((abs_start, abs_end, float(confidence)))
+        if not saliency:
+            print(f"    No saliency scores returned", file=sys.stderr, flush=True)
+            return []
+
+        # Log stats for debugging / tuning
+        s_min = min(saliency)
+        s_max = max(saliency)
+        s_mean = sum(saliency) / len(saliency)
+        print(f"    Saliency: {len(saliency)} frames, "
+              f"min={s_min:.2f} max={s_max:.2f} mean={s_mean:.2f}",
+              file=sys.stderr, flush=True)
+
+        results = saliency_to_clips(
+            saliency, start, end, SALIENCY_PERCENTILE, MIN_CLIP_DURATION,
+        )
 
         return results
 
@@ -157,6 +232,7 @@ MIN_CLIP_DURATION = float(os.environ.get("MIN_CLIP_DURATION", "0.5"))
 MIN_SCENE_DURATION = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "3.0"))
 MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "150.0"))
 SALIENCE_THRESHOLD = float(os.environ.get("VISUAL_SALIENCE_THRESHOLD", "0.1"))
+SALIENCY_PERCENTILE = float(os.environ.get("SALIENCY_PERCENTILE", "60"))  # top 40%
 MAX_CLIPS = int(os.environ.get("MAX_CLIPS", "0"))  # 0 = no limit
 
 
