@@ -230,7 +230,7 @@ def detect_with_lighthouse(video_path, start, end, device="cuda"):
 
 MIN_CLIP_DURATION = float(os.environ.get("MIN_CLIP_DURATION", "0.5"))
 MIN_SCENE_DURATION = float(os.environ.get("MIN_SCENE_FOR_LIGHTHOUSE", "3.0"))
-MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "150.0"))
+MAX_LIGHTHOUSE_INPUT = float(os.environ.get("MAX_LIGHTHOUSE_INPUT", "140.0"))
 SALIENCE_THRESHOLD = float(os.environ.get("VISUAL_SALIENCE_THRESHOLD", "0.1"))
 SALIENCY_PERCENTILE = float(os.environ.get("SALIENCY_PERCENTILE", "60"))  # top 40%
 MAX_CLIPS = int(os.environ.get("MAX_CLIPS", "0"))  # 0 = no limit
